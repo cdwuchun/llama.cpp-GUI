@@ -536,7 +536,7 @@ const chatDisabled = webuiDisabled(presetText, model.section);
 7. router（`tools/server/`）是否在某处把 `ignore_unknown_keys` 改成 `true`（本报告按默认 `false` 判断，与铁律 5 的既有实测现象一致，但未逐行确认）。
 8. **`canonical_tag` 未对齐**：llama.cpp 会把 `名字:tag` 里的 tag 大写化（`qwen3-4b:q4_k_m` → `qwen3-4b:Q4_K_M`），GUI 只做「不区分大小写」的比较（M10），不做同样的规范化。当前不构成故障（两边都不区分大小写），但导出/对外展示段名时需要留意。
 9. **值里含 `;` 或 `#` 会被 llama.cpp 当注释截断**（见 §9 的 PEG 语法），GUI 侧既不校验也不转义。用户手写这类值（例如路径里带 `#`）时，该值会被悄悄截断。
-10. **M1/M2/M14/M15 都没有实机验证**：托盘创建失败、`--minimized` 且无托盘、config 扫描移出 async、退出时 Strata 清理这四条都要真跑一次 GUI 才能确认（本轮只做了静态复核 + 单测）。另外 `npx vite build` 在本次沙箱内跑不起来（esbuild `spawn EPERM`），**本轮没有构建级验证**。
+10. **M1/M14 已于 2026-10-10 在便携版上真机验证通过**：托盘右键菜单的灰显随服务状态正确切换（都停时「启动服务」可点、「停止服务」灰；任一在跑时反过来）、托盘可用时关窗隐藏进托盘且能从托盘唤回、关掉「关窗时最小化到托盘」后关窗进程真正退出、带 `--minimized` 启动窗口不出现且只驻留托盘（`--minimized` **不读** `minimize_to_tray`，二者独立 —— 关掉该设置后带 `--minimized` 启动时窗口仍不该出现，属预期）。**仍未实机验证**：M1 的「托盘创建失败」兜底分支（正常机器上复现不了，需临时开关强制跳过建托盘后重编译）、M2（`strata_probe` 移出 async）、M15（退出时 Strata 清理）。构建级验证已在 CI 完成（`.github/workflows/ci.yml` 会跑 `npm run build`，自 `c28cc94` 起多次全绿）—— 仅本机沙箱内 `npx vite build` 因 esbuild `spawn EPERM` 跑不起来。
 11. **`models_scan` 里仍有同步磁盘操作**（`lib.rs:1023-1032`：`scan_models` + `save_scan_cache` 都在 async 命令里）。与 M2 同类，但只在「缓存缺失或用户点刷新」时才走，频率低得多，故未改。
 
 ---
