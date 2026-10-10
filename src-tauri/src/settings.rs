@@ -401,17 +401,11 @@ impl SettingsStore {
         }
     }
 
-    /// 本次加载是否遇到了问题（供启动时提示用户）。
-    pub fn load_issue(&self) -> Option<&LoadIssue> {
-        self.issue.as_ref()
-    }
-
-    /// 是否禁止落盘（读不出原文件时为真）。
-    pub fn read_only(&self) -> bool {
-        self.read_only
-    }
-
     /// 给人看的一句话说明；没有问题时返回 `None`。
+    ///
+    /// 这是 `issue` / `read_only` 唯一的对外出口（`lib.rs` 启动时把它写进日志）；
+    /// 测试以外没有再单独暴露访问器 —— 只给测试用的 getter 会在 release 构建里变成
+    /// dead_code 警告（`cargo test` 带 `cfg(test)` 看不到，打包时才冒出来）。
     pub fn load_issue_message(&self) -> Option<String> {
         match self.issue.as_ref()? {
             LoadIssue::Unreadable(err) => Some(format!(
@@ -816,7 +810,7 @@ mod tests {
 
         fs::write(&path, "{ 坏掉的 json").unwrap();
         let broken = SettingsStore::load(path.clone());
-        match broken.load_issue() {
+        match broken.issue.as_ref() {
             Some(LoadIssue::Corrupt {
                 quarantined,
                 recovered_from_backup,
@@ -831,7 +825,7 @@ mod tests {
         // 恢复出来的是 .bak 那一版（端口 9200，还没有 api_key）
         assert_eq!(broken.get().port, 9200);
         assert_eq!(broken.get().api_key, None);
-        assert!(!broken.read_only(), "内容损坏时应允许继续写盘");
+        assert!(!broken.read_only, "内容损坏时应允许继续写盘");
         // 解析失败的原文件不能还留在原地（否则下次启动又读到坏的）
         assert!(fs::read_to_string(&path).is_err());
         let _ = fs::remove_dir_all(&dir);
@@ -845,8 +839,8 @@ mod tests {
         fs::create_dir_all(dir.join("settings.json")).unwrap();
 
         let store = SettingsStore::load(dir.join("settings.json"));
-        assert!(store.read_only(), "读不出来时必须禁止落盘");
-        assert!(matches!(store.load_issue(), Some(LoadIssue::Unreadable(_))));
+        assert!(store.read_only, "读不出来时必须禁止落盘");
+        assert!(matches!(store.issue.as_ref(), Some(LoadIssue::Unreadable(_))));
         assert!(store.load_issue_message().is_some());
         assert_eq!(store.get().port, 8080, "内存里仍是默认值");
 
