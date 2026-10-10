@@ -10,11 +10,11 @@ Tauri 2 桌面外壳，用 **llama.cpp 原生 router mode** 管理多个模型�
 
 设计文档：
 
-- `REFACTORING_PLAN.md` —— 实施方案（v2.1，含 GPU 多卡与共享 CUDA 运行时）
-- `REFACTORING_REVIEW.md` —— 真机实测审查报告（含全部实测证据）
-- `REFACTORING_PLAN.v1-original.md` —— 最初的方案（历史留存）
 - `HANDOVER.md` —— **交接说明**：llama.cpp 行为约束、代码地图、验证手段、坑与未决项（接手先读这份）
+- `REFACTORING_PLAN.md` —— 整体实施方案（v2.1，含 GPU 多卡与共享 CUDA 运行时）
+- `REFACTORING_REVIEW.md` —— 方案的真机实测审查（含 v1 被否掉的理由与全部实测证据）
 - `STRATA_INTEGRATION_PLAN.md` —— **Strata 第二运行时通道**：调研、方案与逐轮实现记录（已全部落地，§11 起是实现记录）
+- `KVMEM_INTEGRATION_PLAN.md` —— **kvmem 第二运行时通道**：调研与方案（**未实施**；与 Strata 通道同构，落地时复用同一套骨架）
 - `CODE_REVIEW.md` —— 全仓代码审查报告：分级问题清单、修复记录与遗留项
 
 ---

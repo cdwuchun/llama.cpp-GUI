@@ -5,7 +5,7 @@
 >
 > **v2 修订要点**：v1 经本机真机实测（llama.cpp b10621/b10809 + 真实模型库）校正了三处硬伤与一处整体冗余，
 > 删除 Tauri 自建网关与 `/api/*` 层（前端直连 router），改为「应用递归扫描 → 生成 `presets.ini` → router 加载」。
-> 详见 `REFACTORING_REVIEW.md` 与本文 §3 实测基线。原始文档留存在 `REFACTORING_PLAN.v1-original.md`。
+> 详见 `REFACTORING_REVIEW.md` 与本文 §3 实测基线。v1 的原始方案已从仓库移除（它被本文 v2.1 取代，v1 被否掉的理由记在 `REFACTORING_REVIEW.md` 里）；要原文时从 git 历史取：`git show 660204d:REFACTORING_PLAN.v1-original.md`。
 >
 > **v2.1 补充（GPU 多卡 + 共享 CUDA 运行时）**：按真实环境实测补齐两项硬需求——
 > ① **多块显卡全部参与推理**：原生 `--fit`（默认开）会自动测量各设备空闲显存、用试位法分配每卡层数并自动生成 `--tensor-split`；

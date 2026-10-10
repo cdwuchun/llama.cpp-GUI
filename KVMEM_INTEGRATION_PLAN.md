@@ -1,5 +1,9 @@
 # kvmem-llama.cpp 整合方案
 
+> **状态：方案，未实施**（截至 2026-10）。本文只做了调研与设计 —— 代码里没有 `kvmem.rs`、没有 `KvmemPanel.tsx`、也没有 `kvmem_*` 命令；要落地就从 §7 落地顺序的 P0 开始。
+>
+> **与 Strata 通道的关系**：两份方案**结构同构**（都是「第二运行时通道」），而 Strata 那条通道**已经落地**（见 `STRATA_INTEGRATION_PLAN.md`）。真正开工时应当**先读它**：进程槽、端口顺延、日志采集、非 ASCII 修复、config 原子写与备份、显存互斥、托盘菜单灰显、崩溃监测这些基础设施，照着 `src-tauri/src/strata.rs` + `src-tauri/src/state.rs` 做比重新设计省事得多；`HANDOVER.md` §2.11 是那条通道踩出来的约束。
+
 > 调研对象：<https://github.com/kvmem/kvmem-llama.cpp>
 > 本文所有 GUI 侧结论都来自本仓库代码实测（文件:行号），kvmem 侧结论来自其 README.md、docs/architecture.md 与 GitHub release 资产。
 

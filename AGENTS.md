@@ -6,6 +6,8 @@
 
 - 接手 / 改代码前：`HANDOVER.md` —— §2 是 llama.cpp 行为约束（每条都有实测依据）、§1.1 代码地图、§8 未决项。
 - 能力清单与构建步骤：`README.md`；整体方案与实测基线：`REFACTORING_PLAN.md`、`REFACTORING_REVIEW.md`。
+- 第二条运行时通道（Strata，**已落地**）：方案与逐轮实现记录在 `STRATA_INTEGRATION_PLAN.md`，**约束**在 `HANDOVER.md` §2.11（config 校验+备份+原子写、WebUI 走系统浏览器、显存互斥、`no_throttle` 的脱离 Job 与失败回退）。
+- 第三条通道（kvmem，**未实施**）：`KVMEM_INTEGRATION_PLAN.md`；开工时复用 Strata 那套骨架。
 
 ## 铁律（违反即出 bug，不是"可能有问题"）
 
