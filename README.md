@@ -1,5 +1,10 @@
 # llama.cpp GUI
 
+> **本项目 fork 自 [llama.cpp-hub](https://github.com/IIIIIllllIIIIIlllll/llama.cpp-hub)**（作者 Mark）。
+> 上游是给 llama.cpp 套 Web 壳的图形化工具（PWA，Java 后端 + Web 前端），本项目把它做成 Windows 桌面应用
+> （Tauri 2 + Rust + React），并保留对其 `config/launch_config.json` 的迁移支持。
+> 上游以 **MIT** 许可发布，本项目的版权与许可声明见 [`LICENSE`](./LICENSE)。
+
 Tauri 2 桌面外壳，用 **llama.cpp 原生 router mode** 管理多个模型：不重复实现进程池 / LRU / 自动加载，
 只做「版本发现 + 进程管理 + 环境注入 + 日志 + 性能测试 + 托盘」。
 
