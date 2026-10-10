@@ -6,13 +6,15 @@
 
 import { renderToStaticMarkup } from "react-dom/server";
 
+import { ParamForm } from "../src/components/ParamForm";
+// 这几个是 schema 与状态换算的函数，按仓库铁律 7 放在 src/utils/ 下
+// （组件文件只导出组件，否则 Fast Refresh 失效）—— 别再从 ParamForm 里导入它们。
 import {
   initParamState,
   paramSchema,
   paramSchemaReady,
   paramStateToEntries,
-  ParamForm,
-} from "../src/components/ParamForm";
+} from "../src/utils/paramSchema";
 
 function render(label: string, current: Record<string, string>): void {
   const state = initParamState(current);
