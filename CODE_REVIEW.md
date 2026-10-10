@@ -459,7 +459,7 @@ const chatDisabled = webuiDisabled(presetText, model.section);
 - `lib.rs:1276-1283` `Resized` 直接写入尺寸，无下限校验（`persist_window_size` 有 480×360 兜底）。
 - `scripts/build-param-schema.mjs:94,96-97` 顶层 `const groups = new Map()`、`let missingLabel/missingDesc` 是死代码（`buildSchema` 内部重新声明，218-219 的赋值从未被读取）。
 - `src/types.ts` 手写 serde 契约（无代码生成），Rust 侧加字段前端不会报错；且 `Settings.api_key` 明文回传 WebView（Strata 侧用 `has_api_key` 不下沉密钥），两套策略不一致。
-- `scripts/smoke-paramform.mjs` 未被任何 npm script 引用（只在 HANDOVER.md:305 提到手动跑），且直接依赖 `node_modules/.bin/esbuild` —— esbuild 是 vite 的传递依赖，未在 `devDependencies` 中声明。
+- ~~`scripts/smoke-paramform.mjs` 未被任何 npm script 引用（只在 HANDOVER.md:305 提到手动跑），且直接依赖 `node_modules/.bin/esbuild` —— esbuild 是 vite 的传递依赖，未在 `devDependencies` 中声明。~~ ✅ 已修（2026-10-10）：`package.json` 补了 `test:smoke`（CI 会跑它），esbuild 升为显式 devDependency，打包改用 esbuild 的 JS API。
 - **前端组件层低危**（子代理 b4449d7a）：
   - `src/App.tsx:110-113` 多行 `error` 的 toast 正文取 `toastLines.slice(1)`，最具体的第一行被丢（`notice` 的多行路径正确）。当前 store 的 `set({ error })` 均为单行，能否复现取决于后端 `Err(String)` 是否含换行 —— 见「待确认」。
   - `src/components/Sheet.tsx:62-67` 弹窗 footer 不在 `ErrorBoundary` 内：footer 按钮逻辑同步抛错时，最近的边界是应用级边界（`src/main.tsx:32-37`）→ 整页变错误界面而不是只关弹窗。
@@ -500,7 +500,8 @@ const chatDisabled = webuiDisabled(presetText, model.section);
 3. **HANDOVER §7 与实现/测试不一致**（✅ 已修）：文档称 settings.json 的「未知字段会被保留（roundtrip_and_unknown_fields 测试）」，但该测试（`settings.rs:520-538`）只断言 `port` 与 `model_roots` 往返，从未写入未知字段；`Settings` 也没有 `#[serde(flatten)]` 捕获，全量重写会丢弃未知键。现已加 `Settings.extra`（`#[serde(flatten)]`）并补 `unknown_settings_fields_survive_a_patch` 测试 —— 文档与实现现在一致了。
 4. **无 git 仓库**（✅ 已修）：无法 diff/blame/回滚的问题已由 `git init` 解决（分支 `main`）。
 5. **`.gitignore` 遗漏**（✅ 已修）：根目录实际存在 `.tmp/`、`.tmp-strata/`、`.dsh-vision-toolkit/`、`.strata-help.txt`，原先只忽略了 `tmp/`。现已补齐，并明确注释 `.cargo/config.toml` **不能**忽略（它是本机构建的必需项）。
-6. **无 CI**（✅ 已修）：新增 `.github/workflows/ci.yml`（windows-latest：`npm ci` → `npm run build` → `npm run test:rs` → `npm run test:smoke`，且第一步删除 `.cargo/config.toml` 让它走官方 crates.io），并给 `package.json` 补了 `test` / `test:web` / `test:rs` / `test:smoke` 脚本。
+6. **无 CI**（✅ 已修）：新增 `.github/workflows/ci.yml`（windows-latest：`npm ci` → `npm run build` → `npm run test:rs` → `npm run test:smoke`，且第一步删除 `.cargo/config.toml` 让它走官方 crates.io），并给 `package.json` 补了 `test` / `test:web` / `test:rs` / `test:smoke` 脚本。CI 首次全绿在第 4 次运行（head_sha `c28cc94`，run 38032807766）；前三次全红在「参数表单渲染冒烟测试」这一步，原因见下一条。
+7. **参数表单冒烟测试从重构起就是坏的**（✅ 已修）：这个脚本从来没在 CI 里跑过（只在 HANDOVER 里写着"手动运行"），等真跑起来才逐层暴露三处失修 —— ① 入口仍从 `src/components/ParamForm` 导入 `initParamState` / `paramSchema` / `paramSchemaReady` / `paramStateToEntries`，而这四个函数按铁律 7 早已搬到 `src/utils/paramSchema.ts`（esbuild 报 `No matching export`）；② 打包用 `execFile` 执行 `node_modules/.bin/esbuild.cmd`，Node 20.12.2 / 22 起（CVE-2024-27980 的修复）不允许直接跑 `.cmd`/`.bat`，抛 `spawnSync … esbuild.cmd EINVAL`；③ 打包产物以子进程执行，而产物连带拉进的 `src/store.ts` 在**模块加载时**就调 `localStorage`（主题初始化），Node 下没有它 → `TypeError: localStorage.getItem is not a function`。三处均已修（`c28cc94`），本机与 CI 都通过。
 
 ---
 
