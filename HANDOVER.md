@@ -8,8 +8,8 @@
 > （上一份构建产物 `src-tauri\target\release\llamacpp-gui.exe`，9,328,640 B，SHA256 `04EBD9CA…EBE9` 是 2026-09-23 的；
 > 其后做过一轮代码审查与修复，结论与逐条改动见 `CODE_REVIEW.md`，**exe 需要重新打包才能反映这些改动**。）
 >
-> 注意：README 的「当前进度」停在 **P6**，其后这一批 UI / llama.cpp 兼容性迭代**没有**写进 README，
-> 记在本文 §4、§5。
+> 注意：README 的「当前进度」已补到 **P7**（Strata 第二运行时通道），但**每一轮 UI / llama.cpp
+> 兼容性迭代的细节没有**逐条写进 README —— 那部分记在本文 §4、§5。
 
 ---
 
@@ -32,6 +32,8 @@
 
 **重逻辑全部交给 llama.cpp 原生 Router Mode**：这个应用只做「版本发现 + 进程管理 + 环境注入 + 扫描生成 `presets.ini` + 日志 + 性能测试 + 托盘」。
 
+**另有第二条并列运行时**：Strata（引擎在 `E:\AI\Strata`，config 是 `strata-*.json`）通过一组独立的 `strata_*` 命令接入，与 router 互不依赖，共用同一套进程管理 / 端口顺延 / 日志采集 / 非 ASCII 修复 / 压测基础设施。它**不是** llama.cpp 的 router，两者不能混着做（见 §2.11）。
+
 - 后端 Rust / Tauri 2：只提供**系统能力**（进程、文件、设置、注册表、子进程）。
 - 前端 React 19 + TS + Vite：模型列表、加载/卸载、详情、聊天入口这些**管理数据由 webview 直连 router 的 HTTP + SSE**（没有自建网关，没有 `/api/*` 层）。
 - 推论：**前端出现 401 / Failed to fetch，多半是鉴权或 router 没起来**，不是后端命令的问题。
@@ -50,13 +52,17 @@
 | `src-tauri/src/bench.rs` | API 压测（Rust 侧并发）+ 记录落盘 + 硬件信息 | 压测放后端是为绕开 webview 同主机 6 连接限制；llama-bench 面板已于 2026-09-21 移除 |
 | `src-tauri/src/http.rs` | 极简本机 HTTP 客户端（裸 TcpStream，无第三方依赖） | bench 与 idle 共用；非 2xx 时把 JSON 里的 `error.message` 提成错误文本 |
 | `src-tauri/src/idle.rs` | 轮询 `GET /models`（有模型在跑时 1s，全 unloaded 时 5s），把 `status.value == "sleeping"` 的模型 `POST /models/unload` | 只在 `sleep_idle_seconds > 0` 时随 router 启动；见 §2.3 |
-| `src-tauri/src/winfix.rs` | 非 ASCII 路径的 `mklink /J` 链接、端口探测、`CREATE_NO_WINDOW` | 子进程一律走 `hide_console` |
+| `src-tauri/src/winfix.rs` | 非 ASCII 路径的 `mklink /J` 链接、端口探测、`CREATE_NO_WINDOW`、`no_throttle`（子进程脱离宿主 Job Object） | 子进程一律走 `hide_console` |
+| `src-tauri/src/strata.rs` | Strata 第二运行时通道：config 扫描 / 校验 / 原子写、引擎启停与崩溃监测、`/load`·`/unload` 转发 | 见 §2.11；方案与实现记录见 `STRATA_INTEGRATION_PLAN.md` |
+| `src-tauri/src/state.rs` | `AppState`：进程槽、日志环形缓冲、扫描与元数据缓存、启动互斥、托盘可用标志 | 缓存的 TTL 若与前端轮询同周期，命中率≈0 |
 | `src-tauri/src/tray.rs` / `tray_icon.rs` | 托盘菜单与 RGBA 图标常量（由 `scripts/make-icons.mjs` 生成） | 托盘不直接调后端，把命令转给前端 |
 | `src/store.ts` | zustand 全局状态：设置、模型、preset、router 状态、通知 | 1224 行，业务编排几乎都在这里 |
 | `src/api/router.ts` | 直连 router 的 HTTP + SSE 客户端（**唯一**带鉴权的地方） | §2.4 / §2.5 |
 | `src/utils/models.ts` | 扫描结果 ↔ router 运行态合并、段名/别名规则、过滤排序（纯逻辑） | 组件文件只导出组件（Fast Refresh 规则） |
 | `src/utils/paramSchema.ts` | 参数表 schema 与表单状态换算（纯数据） | |
 | `src/components/ParamForm.tsx` | 参数表单控件（下拉、路径选择、JSON 编辑） | §5.2 |
+| `src/components/StrataPanel.tsx` | Strata 页：卡片列表 + 配置 / 详情 Sheet | 972 行；参数表单复用 `ParamForm` |
+| `src/utils/strataParams.ts` | `strata-*.json` 的 `args` ↔ 表单状态换算与参数 schema（纯逻辑） | 与 `utils/paramSchema.ts` 并列 |
 | `src/components/ModelSheets.tsx` | 模型配置弹窗 + 详情弹窗 | 含多模态开关 |
 | `src/components/SettingsPanel.tsx` | 设置页（目录 / 服务 / 启动与托盘） | 端口/上限/空闲释放/API Key 改动都会触发「重启 router?」弹窗（§5.4） |
 | `src/styles/legacy/index.css` | 参照实现默认首页的 CSS 原样引用 | 4276 行；改样式优先加在 `src/styles/app.css` |
@@ -123,6 +129,15 @@ llama.cpp 以 ANSI 语义传递自身路径，路径含中文会让模型子实�
 ### 2.10 其它前端约束
 - CSP 是 `connect-src … http://127.0.0.1:* http://localhost:*`：要连新域名得改 `src-tauri/tauri.conf.json`。
 - webview 对同一主机的并发连接有上限（约 6），所以 API 压测的并发放在 Rust 侧。
+
+### 2.11 Strata 不是 llama.cpp 的 router（第二条运行时通道）
+Strata 的二进制不同名、没有 router mode、管理端点与 llama.cpp 完全不同，config 是 `strata-*.json`（数组形式的 `args`）而不是 `presets.ini`：
+- **不能塞进 router 流水线**：`versions.rs::scan_versions` 只认 `llama-server.exe`；`GET /models`、`POST /models/load|unload`、`GET /props`、`/models/sse` 在 Strata 上都不存在。
+- 所以它是**并列的独立通道**：后端 `strata_*` 命令 + `bench_strata`，前端 `StrataPanel.tsx`；router 那条线一行不改 —— 方案与逐轮实现见 `STRATA_INTEGRATION_PLAN.md`。
+- **config 写回必须「校验 → 备份 → 原子写」**，临时文件名要唯一（`strata.rs::temp_config_path`），整段写路径持 `strata_lock()`；只在 rename 那一步加锁没用。
+- **WebUI 用系统浏览器打开**（`ipc.openLocalUrl`），不内嵌 iframe —— 这样 Strata 自带界面升级时这个 GUI 不必跟着改 CSP。
+- 两条运行时的模型**显存互斥**：启动一边的模型前先卸掉另一边的（`settings.strata_router_mutex` 可关）。
+- 引擎与它 spawn 的子进程都加 `CREATE_BREAKAWAY_FROM_JOB`（`winfix::no_throttle`）：GUI 被后台化时，子进程若继承宿主 Job Object 会被 CPU 节流，推理速度掉到个位数 t/s；父 Job 未开 `BREAKAWAY_OK` 时必须去掉该 flag 重试（`strata.rs::spawn_strata` 里有回退）。
 
 ---
 

@@ -14,6 +14,8 @@ Tauri 2 桌面外壳，用 **llama.cpp 原生 router mode** 管理多个模型�
 - `REFACTORING_REVIEW.md` —— 真机实测审查报告（含全部实测证据）
 - `REFACTORING_PLAN.v1-original.md` —— 最初的方案（历史留存）
 - `HANDOVER.md` —— **交接说明**：llama.cpp 行为约束、代码地图、验证手段、坑与未决项（接手先读这份）
+- `STRATA_INTEGRATION_PLAN.md` —— **Strata 第二运行时通道**：调研、方案与逐轮实现记录（已全部落地，§11 起是实现记录）
+- `CODE_REVIEW.md` —— 全仓代码审查报告：分级问题清单、修复记录与遗留项
 
 ---
 
@@ -27,6 +29,7 @@ Tauri 2 桌面外壳，用 **llama.cpp 原生 router mode** 管理多个模型�
 | **P4** | 日志页增强（模型 id 映射、源过滤联动） | ✅ |
 | **P5** | API 压测（原 `llama-bench` 面板已移除，见下方说明） | ✅ |
 | **P6** | 托盘常驻 + 开机自启 + 打包 | ✅ |
+| **P7** | Strata 第二运行时通道（引擎启停、模型选择、参数编辑、显存互斥、压测） | ✅ |
 
 P2 已实现的能力：
 
@@ -94,9 +97,33 @@ P4–P6 已实现的能力：
 - **NSIS 安装包**：`npm run tauri build` 产出 `llama.cpp GUI_<version>_x64-setup.exe`
   （当前用户安装，免管理员）。
 
+P7 已实现的能力（Strata 第二运行时通道）：
+
+- **并列接入，而不是塞进 router 流水线**：Strata（<https://github.com/Niko1221/Strata>）的二进制、
+  管理端点、config 格式都与 llama.cpp router 不同，所以它作为**独立通道**与其并存，router 那条线不改。
+  后端注册了 11 个命令（`strata_status` / `strata_scan` / `strata_probe` / `strata_start` /
+  `strata_stop` / `strata_set_root` / `strata_pick` / `strata_config_read` / `strata_config_write` /
+  `strata_unload_model` / `strata_load_model`），外加压测命令 `bench_strata`。
+- **Strata 页**：卡片列表 + 搜索/刷新/排序/筛选/视图切换；「配置」Sheet 的上层是参数表单
+  （`strata-*.json` 里的 `args` ↔ 表单状态的换算在 `src/utils/strataParams.ts`），下层是原始 JSON 编辑；
+  写回走「校验 → 备份 → 原子写」，非法内容不会落盘。
+- **WebUI 交给系统浏览器**：用 `ipc.openLocalUrl` 打开，不接管、也不内嵌 iframe —— CSP 不必放宽，
+  Strata 之后升级自带的 WebUI 也不会牵动这个 GUI。
+- **显存互斥**：启动 router 模型前先卸掉 Strata 正在跑的模型，反之亦然（设置里可关 `strata_router_mutex`）；
+  另有空闲自动卸载（`strata_idle_unload_s`）与加载前的显存门槛（`strata_min_free_vram_mib`）。
+- **状态实时同步**：订阅 `strata://status`；`strata_probe` 负责端口探测（带缓存），
+  崩溃由监测线程发现后立刻刷新托盘菜单的可用性。
+- **托盘与自启**：托盘悬停显示两条运行时的状态，菜单项「启动服务 / 停止服务」按进程槽实时灰显；
+  `auto_start_strata` 可在开机时一并拉起 Strata。
+- **压测**：`bench_strata` 的端口、模型名、API Key 都在 Rust 侧从 config 读取，密钥不下发前端。
+- **脱离宿主节流**：拉起 Strata 引擎时给它加 `CREATE_BREAKAWAY_FROM_JOB`（`winfix::no_throttle`，
+  见 `src-tauri/src/winfix.rs:183`），避免 GUI 被后台化时推理进程跟着被 Job Object 限速；
+  父 Job 没开 `BREAKAWAY_OK` 时去掉该 flag 重试。
+
 界面细节（按实机反馈调整过）：
 
-- **侧栏**：`模型列表 / 性能测试 / 开始聊天 / 运行环境 / 系统日志 / 设置`；底部把 router 状态与
+- **侧栏**：`模型列表 / 性能测试 / 运行环境 / Strata / 系统日志 / 设置` 六个页面，外加一个
+  「开始聊天」按钮（不是页面，直接打开 llama.cpp 自带聊天界面）；底部把 router 状态与
   启停合成**一颗胶囊**（左边状态点、中间「router 运行中 · :8080」、右边启动/停止图标，
   配色沿用 hub 模型卡的状态胶囊），点一下即启停。
 - **模型列表顶栏只留五件事**：搜索、刷新、排序（名称 ↑↓ / 大小 ↑↓ / **运行中优先**）、

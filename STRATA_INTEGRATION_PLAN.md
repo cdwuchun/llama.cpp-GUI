@@ -1,4 +1,10 @@
-# Strata 整合方案
+# Strata 整合方案与实现记录
+
+> **状态：已全部落地并投入使用（2026-10 更新）。** 前 10 节是最初的调研与方案 —— 保留当时的实测结论与取舍依据（「为什么这样做」），不再逐条维护；**§11 起是逐轮实现记录**，每节对应一轮需求与落地结果，最新为 §21。
+>
+> 当前落点：后端 `src-tauri/src/strata.rs` + `src-tauri/src/lib.rs` 注册的 11 个命令（`strata_status` / `strata_scan` / `strata_probe` / `strata_start` / `strata_stop` / `strata_set_root` / `strata_pick` / `strata_config_read` / `strata_config_write` / `strata_unload_model` / `strata_load_model`）与压测命令 `bench_strata`；前端 `src/components/StrataPanel.tsx`、`src/utils/strataParams.ts`、`src/ipc.ts` 的包装与 `strata://status` 订阅。
+>
+> **仍未做的两处**（见 §11.2）：R7「升级前主动让路」、R8「回滚入口」—— GUI 里没有 Strata 自我升级的入口，用户自己跑 `UPDATE.bat`。另外 §9 的 iframe 内嵌最终没有采用，WebUI 用系统浏览器打开（`ipc.openLocalUrl`）。
 
 > 调研对象：<https://github.com/Niko1221/Strata>
 > 本机已安装：引擎 `E:\AI\Strata`，数据与模型 `E:\AI\Strata-data`（用户 m00192 / m00193）。
@@ -551,15 +557,17 @@ iframe 只依赖两样东西：**一个 URL** 和 **`/health` 可达**。上游�
 
 ## 10. 落地顺序建议
 
-1. **先做 §4 第 14 条（`no_throttle`）** —— 独立于整合的既有性能修复，`cargo test --lib` 可覆盖，收益对所有子进程。
-2. 再做 P0 的 1–4（Rust 侧启停 + `ipc.ts`），用本机已装的 9090 实例直接验证 `strata_status`。
-3. 然后 P0 的 5–6（前端面板），跑通「GUI 启停 Strata → 打开聊天页 → 出 token」。
-4. **§9 的 WebUI 内嵌**（CSP 一行 + iframe）—— 放在面板之后做，因为它只依赖端口，且能立刻把「GUI 只能启停」升级成「GUI 里直接聊天」，是投入产出比最高的一步。
-5. §8 的模型选择器（扫 `strata-*.json` + 互斥启动）。
-6. **§8.6 的参数编辑**：先做 L2（读 config → JSON textarea → 校验 → 备份 → 原子写），它最小且立刻解决用户 m00455 的痛点；再做 L1 表单（`argsToState`/`stateToArgs` 换算层 + `ParamForm schema={strataSchema}`）。写回路径必须先有 W3 备份 + W5 校验，才允许 GUI 落盘。
-7. 最后 P1 显存互斥（第 7 条）—— 这是双运行时共存的核心，需要 router 侧配合改动，单独一个 PR。
+> **完成情况（2026-10）**：下面 7 步已全部走完，逐条标了落点。第 4 步最终换了做法（见该条）。
 
-每步验证：`npx tsc --noEmit`（根）+ `cd src-tauri; cargo test --lib`（基线 78 passed / 5 ignored）。GUI 运行验证必须在沙箱外（esbuild `spawn EPERM`，AGENTS.md）。
+1. **先做 §4 第 14 条（`no_throttle`）** —— 独立于整合的既有性能修复，`cargo test --lib` 可覆盖，收益对所有子进程。**✅ 已落地**：`src-tauri/src/winfix.rs:183`，由 `src-tauri/src/strata.rs:534` 调用。
+2. 再做 P0 的 1–4（Rust 侧启停 + `ipc.ts`），用本机已装的 9090 实例直接验证 `strata_status`。**✅ 已落地**：`strata_status` / `strata_start` / `strata_stop` / `strata_set_root` 等命令注册在 `src-tauri/src/lib.rs` 的 `generate_handler!` 里，前端包装见 `src/ipc.ts`。
+3. 然后 P0 的 5–6（前端面板），跑通「GUI 启停 Strata → 打开聊天页 → 出 token」。**✅ 已落地**：`src/components/StrataPanel.tsx`（972 行）。
+4. **§9 的 WebUI 内嵌**（CSP 一行 + iframe）—— 放在面板之后做，因为它只依赖端口，且能立刻把「GUI 只能启停」升级成「GUI 里直接聊天」，是投入产出比最高的一步。**⚠️ 做法与当初设想不同：没有采用 iframe 内嵌**，最终按 §6 的结论用系统浏览器打开（`src/components/StrataPanel.tsx` 的 `onWebui={() => void ipc.openLocalUrl(webuiUrl)}`），因此 CSP 也不需要放宽。
+5. §8 的模型选择器（扫 `strata-*.json` + 互斥启动）。**✅ 已落地**：`strata_scan` / `strata_pick` + 面板里的 `ConfigCard`（`src/components/StrataPanel.tsx:148`）。
+6. **§8.6 的参数编辑**：先做 L2（读 config → JSON textarea → 校验 → 备份 → 原子写），它最小且立刻解决用户 m00455 的痛点；再做 L1 表单（`argsToState`/`stateToArgs` 换算层 + `ParamForm schema={strataSchema}`）。写回路径必须先有 W3 备份 + W5 校验，才允许 GUI 落盘。**✅ 已落地（L2 与 L1 都做了）**：`strata_config_read` / `strata_config_write` + `src/utils/strataParams.ts` 的 `argsToState` / `stateToArgs` + `ParamForm schema={strataParamSchema}`。
+7. 最后 P1 显存互斥（第 7 条）—— 这是双运行时共存的核心，需要 router 侧配合改动，单独一个 PR。**✅ 已落地**（见 §20）。
+
+每步验证：`npx tsc --noEmit`（根）+ `cd src-tauri; cargo test --lib`（当时的基线是 78 passed / 5 ignored；当前为 93 passed / 0 failed / 5 ignored）。GUI 运行验证必须在沙箱外（esbuild `spawn EPERM`，AGENTS.md）。
 
 ## 11. 实现进度（本轮代码落地，用户 m00552「现在开始代码开发」）
 
