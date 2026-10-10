@@ -21,6 +21,9 @@ tmp/
 # 工具产物
 .dsh-vision-toolkit/
 
+# 与项目无关的本地资料（DSH 插件 SDK 文档）：留在本地，不进版本库
+docs/dsh-*.md
+
 # 编辑器
 .vscode/
 .idea/
