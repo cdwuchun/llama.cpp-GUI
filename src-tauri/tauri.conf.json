@@ -1,0 +1,50 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "llama.cpp GUI",
+  "mainBinaryName": "llamacpp-gui",
+  "version": "0.1.0",
+  "identifier": "dev.llamacpp.gui",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "create": false,
+        "title": "llama.cpp GUI",
+        "width": 1280,
+        "height": 860,
+        "minWidth": 980,
+        "minHeight": 640,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* http://localhost:*; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/window-icon.png", "icons/icon.ico", "icons/32x32.png", "icons/128x128.png"],
+    "publisher": "llamacpp-gui",
+    "copyright": "llama.cpp GUI",
+    "category": "DeveloperTool",
+    "shortDescription": "llama.cpp 多模型服务管理器",
+    "longDescription": "基于 llama.cpp Router Mode 的桌面外壳：多版本 llama.cpp 管理、递归扫描模型生成 presets.ini、多卡自动显存分配（共享 CUDA 运行时）、实时日志、模型按需加载与性能测试。",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": false,
+        "compression": "lzma",
+        "installerIcon": "icons/icon.ico",
+        "installerHooks": "nsis/hooks.nsh"
+      }
+    }
+  }
+}

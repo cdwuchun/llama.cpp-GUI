@@ -1,0 +1,29 @@
+# 依赖与构建产物
+node_modules/
+dist/
+src-tauri/target/
+
+# 本机 cargo / npm 缓存（为避免写入用户目录，构建时指向仓库内）
+.cargo-home/
+.npm-cache/
+
+# 实测与临时文件。
+# tmp/ 是 §6.1 的验证资产（保留在本地，不进版本库）；.tmp/ 是单测临时目录
+# （TMP/TEMP 指到工作区时产生）；.tmp-strata/ 是 Strata 配置的实测样本。
+tmp/
+.tmp/
+.tmp-strata/
+*.log
+
+# 一次性验证产物（`strata generate --help` 的输出）
+.strata-help.txt
+
+# 工具产物
+.dsh-vision-toolkit/
+
+# 编辑器
+.vscode/
+.idea/
+
+# 注意：`.cargo/config.toml` 不要忽略 —— 它把 crates-io 指向本机代理（127.0.0.1:8787），
+# 是本机构建的必需项；CI 里则由流水线自行删除（见 .github/workflows/ci.yml）。

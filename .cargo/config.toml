@@ -1,0 +1,19 @@
+# 项目级 cargo 配置。
+#
+# 本机 Windows 原生 TLS（schannel）不可用：cargo 直连任何 HTTPS 源都会报
+# `SSL connect error (schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS)`。
+# 因此这里指向本机由 Node 起的**纯 HTTP** crates 代理（Node 使用 OpenSSL，可正常出站）：
+#
+#   终端 A: npm run cargo:proxy        # 或 node scripts/cargo-proxy.mjs
+#   终端 B: cargo build
+#
+# 若你的环境可以直连 crates.io，把下面的 replace-with 注释掉即可恢复官方源。
+
+[source.crates-io]
+replace-with = "localproxy"
+
+[source.localproxy]
+registry = "sparse+http://127.0.0.1:8787/index/"
+
+[net]
+git-fetch-with-cli = true

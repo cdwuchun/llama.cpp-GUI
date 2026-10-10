@@ -1,0 +1,1502 @@
+/*
+ * 只补充 hub `css/index.css`（旧版默认首页那一套）未覆盖的部分。
+ *
+ * 布局、侧栏、顶栏、卡片、按钮、表单、弹窗、参数分组全部使用 hub 的类名与尺寸，
+ * 这里只放 hub 没有的少量工具类。任何重复定义都算偏差。
+ */
+
+/* hub 的 body 是 flex + 100vh 容器；React 挂在 #root，让它接住同样的角色 */
+#root {
+  display: flex;
+  width: 100%;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* 窄屏要竖排：hub 是在 `body` 上写 `flex-direction: column` 的（legacy index.css 的
+   移动端段），我们把容器换成了 #root，不补这条的话汉堡条会变成左侧一条窄块、
+   主内容被挤到右边。 */
+@media (max-width: 900px) {
+  #root {
+    flex-direction: column;
+  }
+}
+
+/* 顶栏标题在窄窗口里会被 .top-actions 挤成竖排，这里固定不换行、不收缩
+   （让操作区按 hub 的 flex-wrap 折到下一行） */
+.top-bar .page-title {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* ---------- 加载弹窗：两栏的 min-content 底噪 ----------
+   hub 的 .load-model-layout / 参数网格用的是 `1fr`，其下限是 min-content；
+   而 `--flag · 默认 <很长的一串>` 这类不换行文本会把列撑出弹窗宽度。
+
+   注意关进 min-width：hub 自己在 `max-width: 900px` 把弹窗改成单列
+   （配合 `.load-model-mobile-tabs` 一次只显示一栏），这里是**同特异性**的规则且
+   加载更晚，不限定宽度就会把移动端又按回两列 —— 可见的那栏只占左半边。 */
+@media (min-width: 901px) {
+  #loadModelModal .load-model-layout {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}
+
+#loadModelModal .load-model-layout > * {
+  min-width: 0;
+}
+
+#loadModelModal .form-text {
+  overflow-wrap: anywhere;
+}
+
+/* ---------- hub 未定义的小工具类 ---------- */
+/* hub 的 `.param-group` 只在 #loadModelModal 内生效，其余页面的分块用 .panel */
+.panel {
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  margin-bottom: 1rem;
+  overflow: hidden;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.85rem 1rem;
+  background: var(--hover-bg);
+  border-bottom: 1px solid var(--border-color);
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.panel-body {
+  padding: 1rem;
+}
+
+.notice {
+  display: flex;
+  gap: 0.6rem;
+  align-items: flex-start;
+  border: 1px solid var(--border-color);
+  background: var(--hover-bg);
+  border-radius: var(--radius);
+  padding: 0.75rem 0.9rem;
+  font-size: 0.85rem;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  margin-bottom: 1rem;
+}
+
+.notice.warn {
+  border-color: var(--warning-color);
+}
+
+.notice.error {
+  border-color: var(--danger-color);
+  color: var(--danger-color);
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.83rem;
+}
+
+.data-table th,
+.data-table td {
+  text-align: left;
+  padding: 0.5rem 0.6rem;
+  border-bottom: 1px solid var(--border-color);
+  vertical-align: middle;
+}
+
+.data-table th {
+  color: var(--text-secondary);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.data-table tr:last-child td {
+  border-bottom: none;
+}
+
+/* 「未同步」等徽标已改用 hub 新版的 .mc-badges，这里不再单独定义 */
+
+.tag {  display: inline-flex;
+  align-items: center;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+
+.mono {
+  font-family: Consolas, "Cascadia Mono", monospace;
+  /* hub 的 .mono 带 min-height: 38px（它原本服务于日志行/代码块）。本应用把 .mono
+     当「等宽小字」用在提示行、表格单元格、侧栏版本号上，那个最小高度会把它们统统
+     撑到 38px 高、文字贴着顶部 —— 侧栏底部「胶囊下方一片白」就是这么来的。 */
+  min-height: 0;
+}
+
+.row {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.grid2 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 0.75rem;
+}
+
+.info-card {
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  padding: 0.9rem 1rem;
+}
+
+.info-card .k {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  margin-bottom: 0.3rem;
+}
+
+.code-block {
+  font-family: Consolas, monospace;
+  font-size: 0.8rem;
+  background: var(--disabled-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 0.5rem;
+  padding: 0.75rem 0.9rem;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
+}
+
+/* ---------- 侧栏：尺寸与配色对齐 hub 新版 ----------
+ * 标记仍是 legacy 的类名（.sidebar-header / .app-logo / .sidebar-nav / .nav-item），
+ * 数值一律取 newui.css 的：--sidebar-w 232 / --header-h 54 / .sb-logo / .sb-nav。
+ * legacy 的 300px 宽、64px 头、16px 内边距在桌面端都偏大。 */
+:root {
+  --sidebar-w: 232px;
+  --hub-header-h: 54px;
+  /* hub 新版侧栏选中态底色（legacy 的 --active-bg 是 #f0f0f0，观感几乎一致，这里取新版原值） */
+  --primary-soft: #ececf1;
+}
+
+[data-theme="dark"] {
+  --primary-soft: #262b36;
+}
+
+.sidebar {
+  width: var(--sidebar-w);
+}
+
+.sidebar-header {
+  height: var(--hub-header-h);
+  padding: 0 18px;
+}
+
+.app-logo {
+  gap: 10px;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.app-logo-image {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+}
+
+.sidebar-nav {
+  padding: 14px 10px;
+  gap: 4px;
+}
+
+.nav-item {
+  padding: 11px 14px;
+  gap: 12px;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.nav-item i {
+  width: 18px;
+}
+
+.nav-item:hover {
+  background: var(--hover-bg);
+}
+
+.nav-item.active {
+  background: var(--primary-soft);
+  color: var(--primary-color);
+}
+
+.nav-item.active i {
+  color: var(--primary-color);
+}
+
+.sidebar-footer {
+  padding: 12px 10px;
+}
+
+/* 侧栏胶囊下方的小字：router 与 Strata 共用同一规则，字号/字体/颜色必须一致。
+   不用 nowrap + ellipsis —— 侧栏窄，长文案会被截成半句。 */
+.sidebar-foot-note {
+  display: block;
+  margin-top: 0.45rem;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 0.68rem;
+  line-height: 1.35;
+  color: var(--text-secondary);
+  text-align: left;
+  overflow-wrap: break-word;
+}
+
+/* 顶栏高度与侧栏 logo 区共用 hub 新版的 --header-h（54px），否则两条底边线会错开。
+   legacy 的 #main-model-list .top-bar 自带 min-height:64px，这里一并压回。 */
+/* 固定顶栏高度只对桌面生效：hub 在窄屏把 .top-bar 设成 height:auto，
+   而移动端的 .top-actions 是 `overflow-x: auto`（同时按规范成为裁剪容器），
+   固定 54px 会把从按钮下方展开的下拉菜单整个裁掉。 */
+@media (min-width: 901px) {
+  .top-bar {
+    height: var(--hub-header-h);
+  }
+}
+
+#main-model-list .top-bar {
+  min-height: var(--hub-header-h);
+  padding: 0.4rem 2rem;
+}
+
+/* ---------- 圆角统一取 hub 新版的数值 ----------
+ * legacy 的圆角是混着来的（--radius 8px / 0.5rem / 1rem / 搜索框 9999px 胶囊），
+ * newui 只有一小组固定值，按元素类型对应如下：
+ *   容器卡片 --radius 14 · 按钮与表单控件 10 · 搜索框与下拉 12 · 小号按钮 8
+ *   图标块 9 · 弹层 18 · 参数分组 12 · 徽标/胶囊保持不变（999）
+ */
+:root {
+  --radius: 14px;
+}
+
+.btn,
+.btn-icon,
+.icon-btn {
+  border-radius: 10px;
+}
+
+.form-control,
+.field input[type="text"],
+.field input[type="url"],
+.field input[type="number"],
+.field input[type="password"],
+.field select,
+.field textarea {
+  border-radius: 10px;
+}
+
+.search-input,
+.search-wrap input,
+.select-inline {
+  border-radius: 12px;
+}
+
+.btn.mini {
+  border-radius: 8px;
+}
+
+.modal-content {
+  border-radius: 18px;
+}
+
+/* 路径类参数（投影文件 / 草稿模型）：输入框 + 浏览按钮 */
+.path-picker {
+  display: flex;
+  gap: 0.4rem;
+  align-items: stretch;
+}
+
+.path-picker .form-control {
+  min-width: 0;
+}
+
+.path-picker-browse {
+  flex: 0 0 auto;
+  padding: 0 0.7rem;
+}
+
+/* 常用档位下拉（上下文长度、设备名）：样式照抄 hub 旧版的 `.ctx-cb-*`。
+   用它而不是 `<datalist>`，是因为 WebView2 里 `input[list]` 不显示下拉箭头，
+   用户看不出有候选可点。 */
+.ctx-cb {
+  position: relative;
+}
+
+.ctx-cb-input-row {
+  display: flex;
+  align-items: stretch;
+  position: relative;
+}
+
+.ctx-cb-input {
+  flex: 1;
+  padding-right: 2.5rem !important;
+}
+
+.ctx-cb-btn {
+  position: absolute;
+  right: 1px;
+  top: 1px;
+  bottom: 1px;
+  width: 2.2rem;
+  border: none;
+  border-left: 1px solid var(--border-color);
+  background: transparent;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  font-size: 14px;
+  border-radius: 0 6px 6px 0;
+  transition: background 0.15s;
+  padding: 0;
+  font-family: inherit;
+}
+
+.ctx-cb-btn:hover {
+  background: rgba(128, 128, 128, 0.08);
+}
+
+.ctx-cb-menu {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  margin-top: 3px;
+  max-height: 220px;
+  overflow-y: auto;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.14);
+}
+
+.ctx-cb-menu.open {
+  display: block;
+}
+
+.ctx-cb-opt {
+  padding: 9px 12px;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  transition: background 0.1s;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.ctx-cb-opt:last-child {
+  border-bottom: none;
+}
+
+.ctx-cb-opt:hover {
+  background: rgba(99, 102, 241, 0.08);
+}
+
+.ctx-cb-opt-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.ctx-cb-opt-val {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-family: Consolas, monospace;
+}
+
+/* 「警告」确认框：内容只有一句话，任何窗口宽度下都保持紧凑。
+   窄窗口（≤900px）时 hub 的移动端规则会把所有弹窗拉成全屏
+   （`.modal .modal-content { width: 100vw; height: 100dvh }`），确认框不该跟着变，
+   所以这里把宽度、高度、圆角都按确认框的尺寸按住。 */
+#restartRouterModal .modal-content {
+  max-width: 500px;
+  height: auto;
+  max-height: 90vh;
+  border-radius: 18px;
+}
+
+/* 一句话的确认框不套用 hub 那套"标题 / 正文 / 按钮栏"的三段式：
+   去掉两条分隔线和按钮栏的灰底，改用留白分区（所以留白要给够） */
+#restartRouterModal .modal-header {
+  border-bottom: none;
+  padding: 1.5rem 1.5rem 1.25rem;
+}
+
+#restartRouterModal .modal-body {
+  padding: 0 1.5rem 1.5rem;
+}
+
+#restartRouterModal .modal-footer {
+  border-top: none;
+  background: transparent;
+  padding: 0.5rem 1.5rem 1.5rem;
+}
+
+.modal-footer {
+  border-radius: 0 0 18px 18px;
+}
+
+.model-item {
+  border-radius: var(--radius);
+}
+
+.model-icon-wrapper {
+  border-radius: 9px;
+}
+
+.toast {
+  border-radius: 10px;
+}
+
+/* toast 里的「重试」按钮（仅在初始化失败时出现）：与右侧圆形关闭按钮同一行 */
+.toast-retry {
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(15, 23, 42, 0.12);
+  border-radius: 9999px;
+  color: #0f172a;
+  cursor: pointer;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  height: 1.75rem;
+  padding: 0 0.75rem;
+  white-space: nowrap;
+  transition: background 0.2s ease;
+}
+
+.toast-retry:hover {
+  background: #fff;
+}
+
+.param-group {
+  border-radius: 12px;
+}
+
+/* 模型卡片：图标与徽标取 hub 新版的尺寸与排版
+   （.mc-icon 34px / .mc-badges 跟在名字后面，不再是独立一行） */
+.model-icon-wrapper {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+}
+
+/* 网格视图：图标与模型名同一行并垂直居中（legacy 原本是 align-items:flex-start，
+   名字贴着图标顶部，视觉上不居中）；meta 移出该行，另起一行平铺。
+   纵向留白比 hub 新版再大一点：卡片里有「名字行 / meta 行 / 底部操作行」三层，
+   hub 的 14px 内边距在我们这套字号下显得挤。
+   （legacy 的 min-height:180px 早已去掉——它配合底部行的 margin-top:auto，
+   会把操作行顶到底、中间空一块。） */
+#modelsList.grid-view .model-item {
+  padding: 17px;
+  min-height: 0;
+}
+
+#modelsList.grid-view .model-card-top {
+  align-items: center;
+  gap: 10px;
+}
+
+#modelsList.grid-view .model-name {
+  flex: 1;
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+#modelsList.grid-view .model-meta {
+  margin-top: 9px;
+}
+
+/* 底部操作行与上面内容之间的间距（legacy 是 0.75rem） */
+#modelsList.grid-view .model-card-bottom {
+  padding-top: 14px;
+}
+
+/* 列表视图：改成 hub 新版那种「一行一张卡片」的排法
+   （.model-grid.list-view 的 .model-card：圆角 + 阴影 + 行间距），
+   而不是 legacy 的「整块容器 + 每行底部分隔线」。 */
+#modelsList:not(.grid-view) {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0;
+}
+
+/* 去掉 legacy 那层白色外框面板（.model-list-container 原本是白底卡片，
+   卡片再放进去，卡片之间的空隙就是面板的白，而不是页面背景色 #f5f5f5）。
+   hub 新版没有这层容器，.model-grid 直接铺在页面上。 */
+.model-list-container {
+  background: none;
+  border: none;
+  box-shadow: none;
+}
+
+#modelsList.grid-view {
+  padding: 0;
+  gap: 10px;
+}
+
+#modelsList:not(.grid-view) .model-item {
+  padding: 10px 14px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  background: var(--card-bg);
+  box-shadow: var(--shadow-sm);
+}
+
+/* 左侧那道 3px 强调线是 legacy 的，新版列表卡片只有一圈描边 */
+#modelsList:not(.grid-view) .model-item,
+#modelsList:not(.grid-view) .model-item:last-child {
+  border-left: 1px solid var(--border-color);
+  border-bottom: 1px solid var(--border-color);
+}
+
+#modelsList:not(.grid-view) .model-icon-wrapper {
+  margin-right: 12px;
+}
+
+#modelsList:not(.grid-view) .model-details {
+  gap: 2px;
+}
+
+#modelsList:not(.grid-view) .model-name {
+  margin-bottom: 0;
+  padding-right: 0;
+  font-size: 0.9375rem;
+}
+
+/* 列表视图下名字下面那行（架构 / 量化 / 体积）缩小一号：
+   hub 新版的 .mc-meta 是 12.5px、内部图标 11px，legacy 是 14px/14px，
+   和 16px 的名字挨在一起层级不明显。 */
+#modelsList:not(.grid-view) .model-meta {
+  font-size: 0.78125rem;
+  gap: 0.75rem;
+  margin-top: 0;
+}
+
+#modelsList:not(.grid-view) .model-meta i {
+  font-size: 0.6875rem;
+}
+
+.model-name {
+  display: block;
+  word-break: break-all;
+  line-height: 1.35;
+}
+
+/* legacy 在网格视图下把模型名截成一行省略号（nowrap + ellipsis）；
+   hub 新版是允许换行的（.mc-name 用 word-break: break-all）。
+   这里覆盖掉截断，保留右侧内边距给绝对定位的收藏星标让位。 */
+#modelsList.grid-view .model-name {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  word-break: break-all;
+  line-height: 1.35;
+  padding-right: 2.5rem;
+}
+
+.mc-badges {
+  display: inline-flex;
+  gap: 4px;
+  margin-left: 4px;
+  vertical-align: 2px;
+}
+
+.mc-badges span {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  padding: 1px 5px;
+}
+
+/* 卡片底部的「配置 / 详情」两个按钮收小，与左侧状态徽标（实测 32px）同高；
+   legacy 的 .btn-icon 是 38px，比它旁边那个「已停止」胶囊高出一截。 */
+.model-actions .btn-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  font-size: 13px;
+}
+
+/* 启动/停止按钮：
+   - 已停止：灰底 + 黑色播放图标（与灰底对比强）
+   - 运行中：仍是灰底，图标转红（停止）
+   - 禁用：不再整块 opacity:.5 褪色（那样黑图标会变灰），改用更浅的底 + not-allowed
+   悬停/按下反馈与详情按钮一致。注意这里**不带 `:not(:disabled)`**：router 没启动时
+   整排按钮都是禁用的（disabled 属性），若加了守卫就会毫无反应，看起来像坏掉。
+   禁用态只做"底色轻微变化"的反馈，不上浮、光标 not-allowed，以免误以为可点。 */
+.btn-icon.soft {
+  background: #e5e7eb;
+  border-color: #d7dbe0;
+  color: #000000;
+}
+
+.btn-icon.soft:hover {
+  background: #d7dbe0;
+  border-color: var(--primary-color);
+  color: var(--primary-color);
+  transform: translateY(-1px);
+}
+
+.btn-icon.soft:active {
+  opacity: 0.6;
+  transform: none;
+}
+
+.btn-icon.soft.is-running {
+  color: #dc2626;
+}
+
+.btn-icon.soft.is-running:hover {
+  border-color: #dc2626;
+  color: #dc2626;
+}
+
+.btn-icon.soft:disabled {
+  opacity: 1;
+  background: var(--disabled-bg);
+  border-color: var(--border-color);
+  color: #000000;
+  cursor: not-allowed;
+}
+
+.btn-icon.soft:disabled:hover {
+  background: #e4e7ec;
+  border-color: var(--border-color);
+  color: #000000;
+  transform: none;
+}
+
+.btn-icon.soft:disabled:active {
+  opacity: 1;
+}
+
+/* 状态徽标三态用不同配色（legacy 的已停止/已加载都是灰，分不出来）：
+   已停止＝灰、加载中＝琥珀、已加载＝绿，取自 hub 新版的 .status-chip */
+.model-status-badge.status-stopped {
+  background: var(--hover-bg);
+  color: var(--text-secondary);
+}
+
+.model-status-badge.status-loading {
+  background: #fef4e2;
+  color: #d97706;
+  border: 1px solid #f6dfb4;
+}
+
+.model-status-badge.status-loaded {
+  background: #e7f6ec;
+  color: #16a34a;
+}
+
+/* 上面这几处（以及 .btn-icon.soft 的浅灰）用的是写死的浅色值，深色主题下会明显跳出来。
+   `.router-pill` 已经这么补过，这里保持一致。 */
+[data-theme="dark"] .btn-icon.soft {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--border-color);
+  color: var(--text-primary);
+}
+
+[data-theme="dark"] .btn-icon.soft:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+[data-theme="dark"] .btn-icon.soft:disabled,
+[data-theme="dark"] .btn-icon.soft:disabled:hover {
+  background: var(--disabled-bg);
+  color: var(--text-secondary);
+}
+
+[data-theme="dark"] .model-status-badge.status-loading {
+  background: rgba(217, 119, 6, 0.18);
+  color: #fbbf24;
+  border-color: rgba(217, 119, 6, 0.35);
+}
+
+[data-theme="dark"] .model-status-badge.status-loaded {
+  background: rgba(22, 163, 74, 0.18);
+  color: #4ade80;
+}
+
+/* ---------- 新版页面依赖的公共类（newui.css 有、legacy index.css 没有） ----------
+ * 性能测试页与日志页是照搬 hub 新版标记的，它们用 `.card` / `.chip` / `.search-wrap`
+ * / `.btn.primary` / `.btn.mini` 这类 newui 的类名；legacy 样式表里没有（legacy 用的是
+ * `.btn-primary` 带横线那套）。这里按 newui 的定义补齐，并换成 legacy 的变量名，
+ * 这样页面标记可以保持与 hub 一致。 */
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  padding: 14px;
+}
+
+.search-wrap {
+  flex: 1;
+  position: relative;
+  min-width: 0;
+  max-width: 480px;
+}
+
+.search-wrap i {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.search-wrap input {
+  width: 100%;
+  height: 40px;
+  border-radius: 12px;
+  border: 1px solid var(--border-color);
+  background: var(--card-bg);
+  color: var(--text-primary);
+  padding: 0 12px 0 34px;
+  outline: none;
+  font-size: 14px;
+}
+
+.chip-row {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  margin-bottom: 14px;
+}
+
+.chip-row::-webkit-scrollbar {
+  display: none;
+}
+
+.chip {
+  flex-shrink: 0;
+  padding: 7px 14px;
+  border-radius: 999px;
+  font-size: 13px;
+  cursor: pointer;
+  border: 1px solid var(--border-color);
+  background: var(--card-bg);
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chip.active {
+  background: var(--primary-color);
+  border-color: var(--primary-color);
+  color: #ffffff;
+}
+
+.select-inline {
+  height: 40px;
+  border-radius: 12px;
+  border: 1px solid var(--border-color);
+  background: var(--card-bg);
+  color: var(--text-primary);
+  padding: 0 10px;
+  font-size: 13.5px;
+}
+
+.row-gap {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.muted {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.empty {
+  text-align: center;
+  color: var(--text-secondary);
+  padding: 48px 20px;
+  font-size: 13.5px;
+}
+
+.empty i {
+  font-size: 34px;
+  display: block;
+  margin-bottom: 12px;
+  opacity: 0.4;
+}
+
+.device-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* hub 新版按钮是 `.btn primary` / `.btn.mini` / `.btn.danger-soft` 这种复合写法，
+   legacy 只有 `.btn-primary`；补上复合写法（组合选择器优先级更高，不会盖掉 legacy） */
+.btn.primary {
+  background-color: var(--primary-color);
+  border-color: var(--primary-color);
+  color: #ffffff;
+}
+
+.btn.primary:hover:not(:disabled) {
+  background-color: var(--primary-hover);
+}
+
+.btn.mini {
+  height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
+  border-radius: 8px;
+}
+
+.btn.danger-soft {
+  color: #dc2626;
+}
+
+/* ---------- 日志页（样式照搬 hub 新版 newui.css，变量换成 legacy 主题的） ---------- */
+/* 整页铺满型布局：顶栏之下由内容自己撑开并内部滚动。
+   内边距取 hub 新版的 `.page { padding: 16px }`——legacy 的左右 2rem 会让模型栏
+   与侧栏的间距（32px）明显大于两栏之间的间距（12px），看起来不对称。 */
+.page-fill {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 16px;
+}
+
+.logs-wrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 12px;
+}
+
+.log-sources {
+  width: 200px;
+  flex-shrink: 0;
+  overflow-y: auto;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  padding: 6px;
+}
+
+.log-src-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.log-src-item:hover {
+  background: var(--hover-bg);
+}
+
+.log-src-item.active {
+  background: var(--active-bg);
+  font-weight: 600;
+}
+
+.log-src-item.offline {
+  color: var(--text-secondary);
+}
+
+.log-src-item .ls-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #22c55e;
+  flex-shrink: 0;
+}
+
+.log-src-item .ls-name {
+  word-break: break-all;
+  line-height: 1.3;
+}
+
+.log-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.log-src-select {
+  display: none;
+}
+
+.log-view {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: #0f172a;
+  color: #e5e7eb;
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  font-size: 12.5px;
+  font-family: Consolas, "Courier New", monospace;
+}
+
+.log-view pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: break-word;
+  line-height: 1.55;
+}
+
+.log-status {
+  flex-shrink: 0;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+@media (max-width: 900px) {
+  .page-fill {
+    padding: 12px;
+  }
+
+  .log-sources {
+    display: none;
+  }
+
+  .log-src-select {
+    display: block;
+    width: 100%;
+    margin-bottom: 14px;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background: var(--card-bg);
+    color: var(--text-primary);
+    padding: 10px 12px;
+    outline: none;
+    font-size: 14px;
+  }
+}
+
+/* ---------- 性能测试页（样式照搬 hub 新版 newui.css，变量换成 legacy 主题的） ---------- */
+.bench-split {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 12px;
+}
+
+.bench-models {
+  width: 340px;
+  flex-shrink: 0;
+  min-height: 0;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+}
+
+.bench-models .search-wrap {
+  flex: none;
+}
+
+.bench-model-list {
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-height: 0;
+}
+
+.bench-model-empty {
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  text-align: center;
+  padding: 16px 8px;
+}
+
+.bm-item {
+  padding: 9px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.bm-item:hover {
+  background: var(--hover-bg);
+}
+
+.bm-item.active {
+  background: var(--active-bg);
+}
+
+.bm-name {
+  font-size: 13px;
+  font-weight: 600;
+  word-break: break-all;
+  line-height: 1.35;
+}
+
+.bm-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 10px;
+  margin-top: 3px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.bm-meta i {
+  margin-right: 3px;
+  font-size: 10px;
+}
+
+.bm-meta .bm-loaded {
+  color: #16a34a;
+  font-weight: 600;
+}
+
+/* 右栏不再整体滚动：三张卡片按列排布，「测试记录」占满剩余高度，
+   于是它的下沿与左栏模型列表卡片的下沿齐平（两栏同高）。 */
+.bench-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.bench-pane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* 记录卡撑满剩余高度，表格区域自己滚动 */
+.bench-records {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.bench-records .bench-table-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* 一条记录都没有时，表格不占高度，空状态提示才看得到 */
+.bench-records .bench-table-wrap.is-empty {
+  flex: none;
+}
+
+.bench-run-row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.bench-run-row .field {
+  margin-bottom: 0;
+  width: 140px;
+  flex-shrink: 0;
+}
+
+.bench-run-row .btn {
+  height: 40px;
+  margin-left: auto;
+}
+
+.bench-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.bench-card-head h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.bench-chart-wrap {
+  position: relative;
+  height: 180px;
+}
+
+.bench-chart-wrap canvas {
+  position: absolute;
+  inset: 0;
+}
+
+.bench-chart-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.bench-chart-empty i {
+  font-size: 26px;
+  opacity: 0.4;
+}
+
+.bench-table-wrap {
+  overflow-x: auto;
+}
+
+.bench-table th {
+  white-space: nowrap;
+}
+
+.bench-table td {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.bench-table .num {
+  text-align: right;
+}
+
+/* 速度分档用固定色：legacy 主题的 success/danger 是近黑色，分不出档 */
+.bench-table .sp-fast {
+  color: #16a34a;
+  font-weight: 600;
+}
+
+.bench-table .sp-mid {
+  color: #d97706;
+  font-weight: 600;
+}
+
+.bench-table .sp-slow {
+  color: #dc2626;
+  font-weight: 600;
+}
+
+.bench-table tr.stats-row td {
+  background: var(--hover-bg);
+  font-weight: 600;
+}
+
+.bench-table .icon-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+@media (max-width: 900px) {
+  .bench-split {
+    flex-direction: column;
+  }
+
+  .bench-models {
+    width: auto;
+    margin-bottom: 12px;
+  }
+
+  .bench-model-list {
+    max-height: 240px;
+  }
+
+  .bench-run-row .field {
+    width: calc(33.3% - 8px);
+    min-width: 96px;
+  }
+
+  .bench-run-row .btn {
+    margin-left: 0;
+    flex: 1;
+  }
+
+  /* 上下堆叠时高度由内容决定，撑满反而会把模型列表挤没 */
+  .bench-pane,
+  .bench-records {
+    flex: none;
+  }
+
+  .bench-records .bench-table-wrap {
+    max-height: 320px;
+  }
+}
+
+/* 提示（toast）沿用 hub 旧版的结构与样式：`.toast-icon + .toast-content(.toast-title
+   + .toast-message) + .toast-close`，样式全部在 legacy/index.css 里，这里不再覆盖，
+   只保留统一后的圆角。 */
+
+/* 有序多选里 hub 的按钮是原生 button，React 版沿用同一批类名即可；
+   这里只补一个「输入框 + 浏览按钮」这类行内组合的间距 */
+.hstack {
+  display: flex;
+  gap: 0.5rem;
+  align-items: stretch;
+}
+
+/* 表单行里的按钮不要被 flex 压扁：输入框用 flex:1 撑开时，旁边的「浏览」「保存」
+   会被 flex-shrink 压到文字换行甚至变形 —— 实测踩过的坑。 */
+.form-group .row > .btn,
+.form-group .row > .btn-icon {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* 设置页一排按钮统一宽度：同一列里「浏览 / 保存 / 添加目录」长短不一，对齐后整齐 */
+.btn-uniform {
+  flex: 0 0 auto;
+  width: 104px;
+  padding-left: 0.5rem;
+  padding-right: 0.5rem;
+  white-space: nowrap;
+}
+
+/* 配置弹窗底部的按钮文案更长（保存并加载 / 确认删除？），统一宽度放宽一档 */
+.modal-footer .btn-uniform {
+  width: 124px;
+}
+
+/* ---------------------------------------------------------------------------
+ * 下拉菜单：把顶栏里一堆次要按钮收进「更多」里
+ * ------------------------------------------------------------------------- */
+.dropdown {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.dropdown-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 40;
+  /* 宽度贴合内容（绝对定位元素默认 shrink-to-fit）：之前固定 min-width:200px，
+     像「名称 ↑」这种短选项右边会空一大截 */
+  min-width: 0;
+  padding: 4px;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+}
+
+.dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  width: 100%;
+  padding: 0.44rem 0.75rem;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.dropdown-item:hover:not(:disabled) {
+  background: var(--hover-bg);
+}
+
+.dropdown-item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.dropdown-item i {
+  width: 14px;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.dropdown-item .check {
+  margin-left: auto;
+  color: var(--text-secondary);
+}
+
+.dropdown-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--border-color);
+}
+
+/* 侧栏底部的 router 胶囊：状态点 + 状态文字 + 启停图标合在一颗胶囊里，
+   配色沿用 hub 模型卡的 .status-running / .status-stopped */
+.router-pill {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.25rem 0.75rem;
+  border: 1px solid transparent;
+  border-radius: 9999px;
+  font-size: 0.75rem;
+  /* 行高必须压到 1：字号只有 12px，继承来的 1.6 行高会让行框有 19px，
+     多出来的 7px 全变成胶囊里文字上下的空白（实测胶囊因此有 30px 高，
+     字形只占 12px）。压平后内容才是真正居中、饱满的。 */
+  line-height: 1;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter var(--transition-speed);
+}
+
+.router-pill.is-stopped {
+  background: #f4f4f4;
+  color: #4d4d4d;
+}
+
+.router-pill.is-running {
+  background: #dcfce7;
+  color: #166534;
+}
+
+[data-theme="dark"] .router-pill.is-stopped {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-secondary);
+}
+
+[data-theme="dark"] .router-pill.is-running {
+  background: rgba(16, 185, 129, 0.18);
+  color: #6ee7b7;
+}
+
+.router-pill:hover:not(:disabled) {
+  filter: brightness(0.96);
+}
+
+.router-pill:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.router-pill > .status-dot {
+  margin-top: 0;
+  flex-shrink: 0;
+}
+
+/* 配置弹窗左栏的显存预估（llama-fit-params 的逐卡输出）：四列等距，
+   数字右对齐并用等宽数字，多卡时逐行对齐好读 */
+.fit-table {
+  margin-top: 0.5rem;
+  border: 1px solid var(--border-color);
+  border-radius: 0.75rem;
+  overflow: hidden;
+  font-size: 0.8rem;
+}
+
+.fit-row {
+  display: grid;
+  grid-template-columns: 1.3fr 0.9fr 0.9fr 0.9fr 1fr;
+  gap: 0.4rem;
+  padding: 0.35rem 0.65rem;
+  border-top: 1px solid var(--border-color);
+}
+
+/* 合计列（模型 + 上下文 + 计算）加粗：一眼看出这张卡总共占多少 */
+.fit-row .fit-total {
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.fit-row:first-child {
+  border-top: none;
+}
+
+.fit-row.is-head {
+  background: var(--hover-bg);
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.fit-row span:not(:first-child) {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.router-pill-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+
+/* ---------- 参数说明弹窗（对齐 hub 旧版的 #paramDescModal） ----------
+   参数的问号以前用原生 title：说明是整段中文，WebView2 的原生提示按内容撑宽，
+   一撑就横出配置弹窗。hub 把提示做成"点问号开弹窗"，这里照搬。
+   注意：hub 把这几条写在 index.html 的内联 <style> 里，legacy/css/index.css
+   没有，所以必须由补丁层提供，否则弹窗宽度会回落到 .modal-content 的 600px。 */
+#paramDescModal .modal-content {
+  max-width: 560px;
+}
+
+.param-desc-flag {
+  display: inline-block;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--sidebar-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 2px 8px;
+  margin-bottom: 12px;
+  font-family: Consolas, monospace;
+}
+
+.param-desc-modal-body {
+  font-size: 15px;
+  line-height: 1.8;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-primary);
+  padding: 4px 0;
+}

@@ -1,0 +1,1969 @@
+{
+  "source": "llama.cpp-hub/classes/server-params.json + i18n/zh-CN.json",
+  "generatedAt": "2026-09-19",
+  "note": "router 掌管的键（port/host/api-key/alias/hf-repo）与已废弃的 mlock 已排除",
+  "groups": [
+    {
+      "id": "page.params.group.basic",
+      "label": "基础参数",
+      "order": 10,
+      "collapsed": false
+    },
+    {
+      "id": "page.params.group.sampling",
+      "label": "采样参数",
+      "order": 20,
+      "collapsed": true
+    },
+    {
+      "id": "page.params.group.sampler_chain",
+      "label": "采样器链",
+      "order": 21,
+      "collapsed": false
+    },
+    {
+      "id": "page.params.group.performance",
+      "label": "性能与缓存",
+      "order": 30,
+      "collapsed": true
+    },
+    {
+      "id": "page.params.group.features",
+      "label": "功能开关",
+      "order": 40,
+      "collapsed": true
+    },
+    {
+      "id": "page.params.group.template",
+      "label": "模板与推理",
+      "order": 50,
+      "collapsed": true
+    },
+    {
+      "id": "page.params.group.multimodal",
+      "label": "多模态",
+      "order": 60,
+      "collapsed": true
+    },
+    {
+      "id": "page.params.group.draft_model",
+      "label": "草稿模型",
+      "order": 70,
+      "collapsed": true
+    },
+    {
+      "id": "page.params.group.ngram_mod",
+      "label": "Ngram 哈希",
+      "order": 70,
+      "collapsed": true
+    },
+    {
+      "id": "page.params.group.ngram_map_k4v",
+      "label": "Ngram 模式匹配",
+      "order": 70,
+      "collapsed": true
+    }
+  ],
+  "params": [
+    {
+      "key": "ctx-size",
+      "flag": "--ctx-size",
+      "abbr": "-c",
+      "type": "INTEGER",
+      "uiType": "dropdown",
+      "delimiter": null,
+      "default": "8192",
+      "values": [
+        { "value": "4096", "label": "4K" },
+        { "value": "8192", "label": "8K" },
+        { "value": "16384", "label": "16K" },
+        { "value": "32768", "label": "32K" },
+        { "value": "65536", "label": "64K" },
+        { "value": "131072", "label": "128K" },
+        { "value": "262144", "label": "256K" }
+      ],
+      "label": "上下文窗口大小",
+      "desc": "--ctx-size：设置模型可用的上下文窗口大小（单位：token）。上下文窗口需要同时容纳提示词（prompt）和后续生成的 token；值越大，长对话/长文档能力越强，但 KV 缓存占用的内存/显存也会随之增长，预填充（prefill）和解码（decode）的计算量也可能上升。设置为 0 表示从模型文件的元数据读取默认上下文大小。输入框可以从下拉里挑常用档位（4K~256K），也可以直接填其它值。",
+      "group": "page.params.group.basic",
+      "order": 10,
+      "sort": 0,
+      "defaultEnabled": true
+    },
+    {
+      "key": "batch-size",
+      "flag": "--batch-size",
+      "abbr": "-b",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "2048",
+      "values": [],
+      "label": "批大小（Batch Size）",
+      "desc": "--batch-size：逻辑批大小：主要影响提示词预填充（prefill）阶段一次能并行处理的 token 数量。适当增大通常能提升吞吐、加速长 prompt 的处理，但会提高瞬时显存/内存占用，并可能在部分后端触发 OOM 或性能回退。该值偏向“理论/逻辑上限”，实际执行还会受到微批大小、后端实现与可用显存的限制。",
+      "group": "page.params.group.basic",
+      "order": 10,
+      "sort": 16,
+      "defaultEnabled": true
+    },
+    {
+      "key": "ubatch-size",
+      "flag": "--ubatch-size",
+      "abbr": "-ub",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "512",
+      "values": [],
+      "label": "微批大小（uBatch Size）",
+      "desc": "--ubatch-size：物理微批大小：用于把大的逻辑 batch 拆分为多个更小的 micro-batch 逐次执行，以在吞吐与显存峰值之间做权衡。增大可减少拆分次数、提升预填充速度，但会抬高显存峰值；减小则更省显存、更稳，但可能降低吞吐。通常在显存紧张或并发较高时，通过调小该值来避免 OOM。",
+      "group": "page.params.group.basic",
+      "order": 10,
+      "sort": 17,
+      "defaultEnabled": true
+    },
+    {
+      "key": "parallel",
+      "flag": "--parallel",
+      "abbr": "-np",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "4",
+      "values": [],
+      "label": "并行槽位数（并发）",
+      "desc": "--parallel：服务器可同时处理的并行槽位（slot）数量，本质上决定并发会话数上限。值越大，并发能力越强，但每个 slot 都会占用一定 KV 缓存与运行时资源，导致内存/显存占用上升，并可能降低单请求吞吐或增加整体延迟。设置为 -1 表示自动决定（通常会结合上下文大小与可用资源）。对于上下文较短、模型较小、且需要高并发的场景可适当调高；长上下文或显存紧张时建议保守设置。\n⚠ 注意：-1 虽受 llama-server 支持，但显存估算工具（llama-fit-params）无法处理该值，会导致估算失败。如需自动加载功能正常进行显存检查，请设置大于 0 的具体数值。",
+      "group": "page.params.group.basic",
+      "order": 10,
+      "sort": 18,
+      "defaultEnabled": false
+    },
+    {
+      "key": "threads",
+      "flag": "--threads",
+      "abbr": "-t",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "-1",
+      "values": [],
+      "label": "线程数",
+      "desc": "--threads：推理过程中使用的 CPU 线程数（主要影响 CPU 计算与部分后端的调度）。线程数越高不一定越快：过高可能导致线程争用、缓存抖动或抢占系统资源，反而增加延迟。设置为 -1 表示自动检测（通常按物理核心数或系统推荐值选择）。在 CPU 推理或需要稳定延迟时，建议围绕物理核心数做小范围测试选出最优值。",
+      "group": "page.params.group.basic",
+      "order": 10,
+      "sort": 23,
+      "defaultEnabled": false
+    },
+    {
+      "key": "seed",
+      "flag": "--seed",
+      "abbr": "-s",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "-1",
+      "values": [],
+      "label": "随机种子",
+      "desc": "--seed：随机数生成器种子，用于控制采样的可复现性：在相同模型、相同提示词与相同采样参数下，固定 seed 通常能得到一致或高度一致的输出，便于回归测试与问题复现。设置为 -1 表示每次启动/请求使用随机种子，从而获得更多样化结果。",
+      "group": "page.params.group.basic",
+      "order": 10,
+      "sort": 24,
+      "defaultEnabled": false
+    },
+    {
+      "key": "temp",
+      "flag": "--temp",
+      "abbr": "--temp",
+      "type": "FLOAT",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0.7",
+      "values": [],
+      "label": "温度（随机性）",
+      "desc": "--temp：控制采样随机性的温度参数。温度越低，输出越确定、更贴近高概率 token（更保守、重复更少但可能更“死板”）；温度越高，分布越平坦，生成更发散、更有创意但也更容易跑题或出现不可靠内容。常见范围约 0.1–1.2；设置为 0 时通常接近贪心/确定性选择（具体行为依实现而定）。",
+      "group": "page.params.group.sampling",
+      "order": 20,
+      "sort": 6,
+      "defaultEnabled": false
+    },
+    {
+      "key": "top-p",
+      "flag": "--top-p",
+      "abbr": "--top-p",
+      "type": "FLOAT",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0.95",
+      "values": [],
+      "label": "Top-P（核采样）",
+      "desc": "--top-p：核采样（Top-P / Nucleus Sampling）：每一步只在“按概率从高到低累加，直到累计概率达到 P”的最小 token 集合中进行采样。P 越小，候选集合越窄、输出越稳；P 越大，候选更丰富、表达更灵活。设置为 1.0 表示不做 Top-P 截断（等价于禁用）。",
+      "group": "page.params.group.sampling",
+      "order": 20,
+      "sort": 7,
+      "defaultEnabled": false
+    },
+    {
+      "key": "top-k",
+      "flag": "--top-k",
+      "abbr": "--top-k",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "40",
+      "values": [],
+      "label": "Top-K（截断采样）",
+      "desc": "--top-k：截断采样（Top-K）：每一步只从概率最高的 K 个 token 中进行采样。K 越小越保守，K 越大越发散；K 过小可能导致措辞单一，过大则可能增加离题风险。设置为 0 表示禁用 Top-K 截断。",
+      "group": "page.params.group.sampling",
+      "order": 20,
+      "sort": 8,
+      "defaultEnabled": false
+    },
+    {
+      "key": "min-p",
+      "flag": "--min-p",
+      "abbr": "--min-p",
+      "type": "FLOAT",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0.05",
+      "values": [],
+      "label": "Min-P（最小概率阈值）",
+      "desc": "--min-p：最小概率阈值（Min-P）：仅保留概率不低于“当前最可能 token 概率 × P”的 token 作为候选，用于过滤尾部极低概率 token，从而减少怪词/乱码/极端跳跃。P 越大过滤越强、输出越稳，但也更容易变得保守。设置为 0.0 表示禁用。",
+      "group": "page.params.group.sampling",
+      "order": 20,
+      "sort": 9,
+      "defaultEnabled": false
+    },
+    {
+      "key": "top-nsigma",
+      "flag": "--top-nsigma",
+      "abbr": "--top-nsigma",
+      "type": "FLOAT",
+      "uiType": null,
+      "delimiter": null,
+      "default": "-1.0",
+      "values": [],
+      "label": "Top-N Sigma",
+      "desc": "--top-nsigma：Top-N Sigma 采样：仅保留 logits 高于“平均值 + N × 标准差”阈值的 token 参与采样，用于按分布离散程度动态裁剪候选集合。N 越小过滤越强、输出越集中；N 越大保留的候选越多。设置为 -1.0 表示禁用。它常与 Top-K、Top-P、Min-P 等采样器一起使用，用于进一步抑制长尾低质量候选。",
+      "group": "page.params.group.sampling",
+      "order": 20,
+      "sort": 10,
+      "defaultEnabled": false
+    },
+    {
+      "key": "presence-penalty",
+      "flag": "--presence-penalty",
+      "abbr": "--presence-penalty",
+      "type": "FLOAT",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0.0",
+      "values": [],
+      "label": "存在惩罚（Presence Penalty）",
+      "desc": "--presence-penalty：存在惩罚：只要某个 token 在当前上下文中出现过，就对其施加惩罚，从而鼓励模型引入新词/新信息，减少“反复提到同一词”的情况。值越大，越倾向于避免重复与话题循环，但过高可能导致用词跳跃或偏离主题。设置为 0.0 表示禁用。",
+      "group": "page.params.group.sampling",
+      "order": 20,
+      "sort": 11,
+      "defaultEnabled": false
+    },
+    {
+      "key": "repeat-penalty",
+      "flag": "--repeat-penalty",
+      "abbr": "--repeat-penalty",
+      "type": "FLOAT",
+      "uiType": null,
+      "delimiter": null,
+      "default": "1.0",
+      "values": [],
+      "label": "重复惩罚（Repeat Penalty）",
+      "desc": "--repeat-penalty：重复惩罚系数：对近期已经出现/生成过的 token 降低其再次被采样的概率，用于抑制“复读机”现象。1.0 表示不惩罚；大于 1.0 会逐步增强抑制效果，通常 1.05–1.2 之间较常见。设置过高可能导致语句不通顺或强行换词。",
+      "group": "page.params.group.sampling",
+      "order": 20,
+      "sort": 12,
+      "defaultEnabled": false
+    },
+    {
+      "key": "frequency-penalty",
+      "flag": "--frequency-penalty",
+      "abbr": "--frequency-penalty",
+      "type": "FLOAT",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0.0",
+      "values": [],
+      "label": "频率惩罚（Frequency Penalty）",
+      "desc": "--frequency-penalty：频率惩罚：根据 token 在当前上下文中的出现次数施加惩罚，出现越频繁惩罚越强，从而抑制高频重复与模板化表达。与“存在惩罚”不同，它会随出现次数累积增强；值越大抑制越明显，但过高可能破坏用词连贯性。设置为 0.0 表示禁用。",
+      "group": "page.params.group.sampling",
+      "order": 20,
+      "sort": 13,
+      "defaultEnabled": false
+    },
+    {
+      "key": "dry-multiplier",
+      "flag": "--dry-multiplier",
+      "abbr": "--dry-multiplier",
+      "type": "FLOAT",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0.0",
+      "values": [],
+      "label": "DRY 惩罚倍数",
+      "desc": "--dry-multiplier：DRY（Don't Repeat Yourself）重复抑制的倍数系数，用于对正在形成的重复片段施加额外惩罚。值越大，对连续重复模式的抑制越强，能减少模型不断复述相似短语、句式或段落的情况；但设置过高也可能损伤自然衔接。设置为 0.0 表示禁用 DRY 采样。",
+      "group": "page.params.group.sampling",
+      "order": 20,
+      "sort": 14,
+      "defaultEnabled": false
+    },
+    {
+      "key": "dry-base",
+      "flag": "--dry-base",
+      "abbr": "--dry-base",
+      "type": "FLOAT",
+      "uiType": null,
+      "delimiter": null,
+      "default": "1.75",
+      "values": [],
+      "label": "DRY 惩罚底数",
+      "desc": "--dry-base：DRY 重复抑制的指数底数，用于决定当重复序列长度超过允许值后，惩罚随重复长度增长的速度。底数越大，长重复片段受到的额外惩罚增长越快；较小的值则更平缓。通常与 DRY 惩罚倍数一起调节，默认 1.75 适合作为大多数场景的起点。",
+      "group": "page.params.group.sampling",
+      "order": 20,
+      "sort": 15,
+      "defaultEnabled": false
+    },
+    {
+      "key": "dry-allowed-length",
+      "flag": "--dry-allowed-length",
+      "abbr": "--dry-allowed-length",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "2",
+      "values": [],
+      "label": "DRY 允许重复长度",
+      "desc": "在 DRY 采样中，只有当重复片段长度超过该阈值后，系统才会开始按指数方式放大惩罚。值越小，越早开始抑制重复延长；值越大，则允许较短的重复片段自然出现。默认值通常为 2。",
+      "group": "page.params.group.sampling",
+      "order": 20,
+      "sort": 15.5,
+      "defaultEnabled": false
+    },
+    {
+      "key": "dry-penalty-last-n",
+      "flag": "--dry-penalty-last-n",
+      "abbr": "--dry-penalty-last-n",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "-1",
+      "values": [],
+      "label": "DRY 扫描窗口",
+      "desc": "用于检测重复的回看 token 数量。值越大，DRY 会在更长的上下文范围内查找重复模式，但计算和约束范围也更大；0 表示禁用，-1 通常表示使用上下文长度。",
+      "group": "page.params.group.sampling",
+      "order": 20,
+      "sort": 15.6,
+      "defaultEnabled": false
+    },
+    {
+      "key": "samplers",
+      "flag": "--samplers",
+      "abbr": "--samplers",
+      "type": "STRING",
+      "uiType": "ordered-multiselect",
+      "delimiter": ";",
+      "default": "penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature",
+      "values": [
+        {
+          "value": "penalties",
+          "label": "penalties"
+        },
+        {
+          "value": "dry",
+          "label": "dry"
+        },
+        {
+          "value": "top_n_sigma",
+          "label": "top_n_sigma"
+        },
+        {
+          "value": "top_k",
+          "label": "top_k"
+        },
+        {
+          "value": "typ_p",
+          "label": "typ_p"
+        },
+        {
+          "value": "top_p",
+          "label": "top_p"
+        },
+        {
+          "value": "min_p",
+          "label": "min_p"
+        },
+        {
+          "value": "xtc",
+          "label": "xtc"
+        },
+        {
+          "value": "temperature",
+          "label": "temperature"
+        }
+      ],
+      "label": "采样器链（有序多选）",
+      "desc": "--samplers：按顺序组合 llama.cpp 的采样器链。勾选表示启用该采样器；右侧顺序表示实际执行次序，越靠前越先参与采样流程。最终值会按分号拼接后传给 --samplers。",
+      "group": "page.params.group.sampler_chain",
+      "order": 21,
+      "sort": 6.5,
+      "defaultEnabled": false
+    },
+    {
+      "key": "flash-attn",
+      "flag": "--flash-attn",
+      "abbr": "-fa",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "on",
+      "values": [
+        {
+          "value": "on",
+          "label": "on"
+        },
+        {
+          "value": "off",
+          "label": "off"
+        },
+        {
+          "value": "auto",
+          "label": "auto"
+        }
+      ],
+      "label": "Flash Attention 加速",
+      "desc": "--flash-attn：控制是否启用 Flash Attention（注意力计算融合优化）：on=强制开启，off=强制关闭，auto=自动检测后端能力并选择。开启通常会降低注意力计算的显存带宽开销、提升吞吐（尤其是长上下文/大 batch 预填充时），并可能减少显存占用；但在部分硬件/驱动/后端组合下可能出现性能回退或不稳定。遇到速度异常、显存峰值过高、或需要做性能对比测试时，可切到 off 进行验证；不确定时建议使用 auto。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 1,
+      "defaultEnabled": true
+    },
+    {
+      "key": "load-mode",
+      "flag": "--load-mode",
+      "abbr": "-lm",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "dio",
+      "values": [
+        {
+          "value": "none",
+          "label": "none"
+        },
+        {
+          "value": "mmap",
+          "label": "mmap"
+        },
+        {
+          "value": "mlock",
+          "label": "mlock"
+        },
+        {
+          "value": "mmap+mlock",
+          "label": "mmap+mlock"
+        },
+        {
+          "value": "dio",
+          "label": "dio"
+        }
+      ],
+      "label": "模型加载模式",
+      "desc": "--load-mode：控制 llama-server 加载模型权重的方式（默认：mmap）。可选值：none（常规读入内存，不使用 mmap 等特殊模式）、mmap（内存映射模型文件，启动更快且对内存更友好）、mlock（锁定模型到物理内存，防止被交换/压缩）、mmap+mlock（内存映射并锁定）、dio（使用 DirectIO 读取模型文件，绕过系统缓存）。不同模式在加载速度、内存占用、系统权限与稳定性上有不同权衡；例如在部分文件系统/网络盘/容器/权限受限环境下，mmap 可能触发映射失败或 SIGBUS，此时可尝试 none 或 dio。注意该参数已统一替代旧的 --no-mmap、--direct-io / -dio 等独立开关。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 2.5,
+      "defaultEnabled": true
+    },
+    {
+      "key": "cache-ram",
+      "flag": "--cache-ram",
+      "abbr": "-cram",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "8192",
+      "values": [],
+      "label": "KV 缓存内存上限",
+      "desc": "--cache-ram：限制 KV 缓存可占用的最大内存/显存预算（单位：MiB）。KV 缓存用于保存注意力所需的 K/V 状态，是长上下文与多并发的主要内存消耗来源；上限越大，越能支撑更长上下文或更多并发槽位，但占用也越高。设置为 -1 表示不设上限；设置为 0 表示禁用 KV 缓存（通常会导致无法正常自回归生成或性能极差，仅用于特殊测试）。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 4,
+      "defaultEnabled": false
+    },
+    {
+      "key": "fit",
+      "flag": "--fit",
+      "abbr": "--fit",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "on",
+      "values": [
+        {
+          "value": "on",
+          "label": "on"
+        },
+        {
+          "value": "off",
+          "label": "off"
+        }
+      ],
+      "label": "自适应显存",
+      "desc": "--fit：是否自动调整未设置的参数以适配设备显存：on=自动调整（默认），off=不自动调整。开启后系统会根据可用显存自动调整上下文大小、批大小等参数，避免 OOM；关闭后使用用户显式设置的值，超出显存会导致失败。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 5,
+      "defaultEnabled": true
+    },
+    {
+      "key": "fit-target",
+      "flag": "--fit-target",
+      "abbr": "-fitt",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "1024",
+      "values": [],
+      "label": "Fit 预留显存",
+      "desc": "--fit-target / -fitt：--fit 自动调整时为每个设备预留的显存余量（MiB），逗号分隔的列表，单个值会广播到所有设备。默认：1024。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 5.5,
+      "defaultEnabled": false
+    },
+    {
+      "key": "gpu-layers",
+      "flag": "--gpu-layers",
+      "abbr": "-ngl",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "-1",
+      "values": [],
+      "label": "GPU 层数",
+      "desc": "--gpu-layers / -ngl：设置存储到 VRAM 的最大层数。可选值：-1=让 fit 功能根据可用显存自动计算最佳值（默认），auto=让 llama.cpp 自动判断，all=将所有层都放到 GPU 上，或指定具体层数。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 6,
+      "defaultEnabled": false
+    },
+    {
+      "key": "kv-unified",
+      "flag": "--kv-unified",
+      "abbr": "-kvu",
+      "type": "LOGIC",
+      "uiType": null,
+      "delimiter": null,
+      "default": "1",
+      "values": [],
+      "label": "统一 KV 缓冲区（共享）",
+      "desc": "--kv-unified：让多个序列/会话共享统一的 KV 缓冲区管理方式，用于在多并发场景下更高效地复用与分配 KV 内存，通常有助于降低碎片与峰值占用，并改善并发下的稳定性。开启后在极端情况下可能影响某些工作负载的吞吐或带来不同的内存布局表现。若 slot（parallel）为自动模式，通常会默认启用以获得更稳的资源管理。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 7,
+      "defaultEnabled": false
+    },
+    {
+      "key": "kv-unified-per-slot",
+      "flag": "--kv-unified-per-slot",
+      "abbr": "",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "统一池每 slot 上下文上限",
+      "desc": "--kv-unified-per-slot N：给统一（共享）KV 池中的每个并行 slot 设置可用的 context 上限（单位：token）。不带 -c 启动时，共享 KV 池总大小直接按 并行slot数 × N 自动定容；带 -c 启动时，每个 slot 的上下文会被截断为 min(-c 的值, N)。若 N 超过了单 slot 池容量则不会生效（服务端会打印警告，提示加大 -c 或去掉 -c 让其自动定容）。使用场景：防止某个跑长 prompt 的 slot 独吞整个共享 KV 池、挤死其它并发 slot，保证并发下的公平性与可预期的内存上限。默认不设置（即不限制，等价于 0）。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 7.5,
+      "defaultEnabled": false
+    },
+    {
+      "key": "ctx-checkpoints",
+      "flag": "--ctx-checkpoints",
+      "abbr": "--ctx-checkpoints",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "32",
+      "values": [],
+      "label": "上下文检查点数量",
+      "desc": "--ctx-checkpoints / --swa-checkpoints / -ctxcp：每个插槽创建的最大上下文检查点数量，如果显存不足（某些模型可能有显存泄露的问题，如Gemma-4，见llama.cpp的issue：#21690 ），请减少该值或者设置为0。（默认值：32）",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 8,
+      "defaultEnabled": true
+    },
+    {
+      "key": "checkpoint-min-step",
+      "flag": "--checkpoint-min-step",
+      "abbr": "--checkpoint-min-step",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "256",
+      "values": [],
+      "label": "检查点间隔",
+      "desc": "--checkpoint-min-step：在 prompt prefill 阶段每处理 N 个 token 创建一个上下文检查点。适合超长 prompt，中断后可从检查点恢复而非重新处理。与 --ctx-checkpoints 配合使用：本参数控制创建频率，--ctx-checkpoints 控制每个 slot 最多保留多少个检查点。⚠ 如果你不明白这个参数的具体含义，请不要修改它。（default: 256）",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 8.1,
+      "defaultEnabled": false
+    },
+    {
+      "key": "no-cache-idle-slots",
+      "flag": "--no-cache-idle-slots",
+      "abbr": "",
+      "type": "LOGIC",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "禁用空闲插槽缓存",
+      "desc": "--no-cache-idle-slots：默认情况下，当你发送一个新请求时，服务器会自动把所有当前空闲 slot 的 KV cache 保存到 RAM 里、清空它们的 GPU 显存，腾出显存空间给新请求用。如果你勾上这个框，自动保存功能就会被关掉——空闲 slot 的 KV cache 会一直占着显存不放。只有当你遇到了空闲缓存功能导致崩溃或异常时才勾它。警告：关掉这个功能可能会导致显存占用变高！⚠ 如果你不明白这是干什么的，就别勾。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 8.2,
+      "defaultEnabled": false
+    },
+    {
+      "key": "swa-full",
+      "flag": "--swa-full",
+      "abbr": "",
+      "type": "LOGIC",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "完整 SWA 缓存",
+      "desc": "--swa-full：使用完整大小的滑动窗口注意力（SWA）KV 缓存，而非默认的窗口大小缓存。仅影响使用了滑动窗口注意力的模型（如 Mistral、Gemma-2、Qwen 等）。开启后上下文检查点（ctx-checkpoints）在 SWA 层上也能正常工作。警告：会显著增加 KV cache 内存占用！⚠ 如果你不明白这是干什么的，就不要修改它。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 8.3,
+      "defaultEnabled": false
+    },
+    {
+      "key": "cache-type-k",
+      "flag": "--cache-type-k",
+      "abbr": "-ctk",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "f16",
+      "values": [
+        {
+          "value": "f32",
+          "label": "f32"
+        },
+        {
+          "value": "f16",
+          "label": "f16"
+        },
+        {
+          "value": "bf16",
+          "label": "bf16"
+        },
+        {
+          "value": "q8_0",
+          "label": "q8_0"
+        },
+        {
+          "value": "q4_0",
+          "label": "q4_0"
+        },
+        {
+          "value": "q4_1",
+          "label": "q4_1"
+        },
+        {
+          "value": "iq4_nl",
+          "label": "iq4_nl"
+        },
+        {
+          "value": "q5_0",
+          "label": "q5_0"
+        },
+        {
+          "value": "q5_1",
+          "label": "q5_1"
+        },
+        {
+          "value": "turbo4",
+          "label": "turbo4"
+        },
+        {
+          "value": "turbo3",
+          "label": "turbo3"
+        },
+        {
+          "value": "turbo2",
+          "label": "turbo2"
+        }
+      ],
+      "label": "KV 缓存类型（K）",
+      "desc": "--cache-type-k：设置 KV 缓存中 K 向量的数据类型（精度/量化方式）。更高精度（如 f32）占用更大、通常更稳；更低精度或量化（如 q8/q5/q4/iq4）可显著节省显存并可能提升带宽受限场景的速度，但在部分模型/场景下可能带来轻微质量变化或数值稳定性差异，且不同后端对某些类型的支持程度不同。可选：f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 9,
+      "defaultEnabled": false
+    },
+    {
+      "key": "cache-type-v",
+      "flag": "--cache-type-v",
+      "abbr": "-ctv",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "f16",
+      "values": [
+        {
+          "value": "f32",
+          "label": "f32"
+        },
+        {
+          "value": "f16",
+          "label": "f16"
+        },
+        {
+          "value": "bf16",
+          "label": "bf16"
+        },
+        {
+          "value": "q8_0",
+          "label": "q8_0"
+        },
+        {
+          "value": "q4_0",
+          "label": "q4_0"
+        },
+        {
+          "value": "q4_1",
+          "label": "q4_1"
+        },
+        {
+          "value": "iq4_nl",
+          "label": "iq4_nl"
+        },
+        {
+          "value": "q5_0",
+          "label": "q5_0"
+        },
+        {
+          "value": "q5_1",
+          "label": "q5_1"
+        },
+        {
+          "value": "turbo4",
+          "label": "turbo4"
+        },
+        {
+          "value": "turbo3",
+          "label": "turbo3"
+        },
+        {
+          "value": "turbo2",
+          "label": "turbo2"
+        }
+      ],
+      "label": "KV 缓存类型（V）",
+      "desc": "--cache-type-v：设置 KV 缓存中 V 向量的数据类型（精度/量化方式）。该选项与 K 类型类似，主要影响 KV 缓存的显存占用与带宽开销：更低精度/量化可减少内存占用、提高可承载的上下文长度或并发数，但也可能带来轻微质量差异或在少数环境下不稳定。建议在显存紧张或需要更长上下文/更高并发时尝试更低精度，并对效果做对比验证。可选：f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 10,
+      "defaultEnabled": false
+    },
+    {
+      "key": "split-mode",
+      "flag": "--split-mode",
+      "abbr": "-sm",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "none",
+      "values": [
+        {
+          "value": "none",
+          "label": "none"
+        },
+        {
+          "value": "layer",
+          "label": "layer"
+        },
+        {
+          "value": "row",
+          "label": "row"
+        },
+        {
+          "value": "tensor",
+          "label": "tensor"
+        }
+      ],
+      "label": "拆分模式",
+      "desc": "你有多个GPU的时候才需要设置这个！多GPU的拆分模式。layer：层并行，默认推荐的方案，适合大部分场景，尤其是不同型号的GPU之间；row：简单来说就是性能更低的tensor；tensor：张量并行，llama.cpp新开发功能，需要相同型号的GPU，否则效果很差。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 11,
+      "defaultEnabled": false
+    },
+    {
+      "key": "tensor-split",
+      "flag": "--tensor-split",
+      "abbr": "-ts",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "",
+      "values": [],
+      "label": "张量拆分比例",
+      "desc": "--tensor-split / -ts：每个 GPU 卸载模型的比例，逗号分隔的比例列表，例如 3,1",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 11.5,
+      "defaultEnabled": false
+    },
+    {
+      "key": "cpu-moe",
+      "flag": "--cpu-moe",
+      "abbr": "--cpu-moe",
+      "type": "LOGIC",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "CPU MoE",
+      "desc": "--cpu-moe：将所有混合专家（MoE）权重保留在 CPU 内存中，不卸载到 GPU。当 GPU 显存不足以容纳 MoE 模型的专家权重时，可以开启此选项，将全部 MoE 计算放在 CPU 上执行。这会显著增加 CPU 内存占用并可能降低推理速度，但能避免显存不足导致的 OOM 错误。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 12,
+      "defaultEnabled": false
+    },
+    {
+      "key": "numa",
+      "flag": "--numa",
+      "abbr": "",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "",
+      "values": [
+        {
+          "value": "distribute",
+          "label": "distribute"
+        },
+        {
+          "value": "isolate",
+          "label": "isolate"
+        },
+        {
+          "value": "numactl",
+          "label": "numactl"
+        }
+      ],
+      "label": "NUMA 模式",
+      "desc": "--numa：尝试对某些 NUMA 系统进行优化。distribute：将执行均匀分布到所有节点。isolate：仅在与执行启动的节点 CPU 上生成线程。numactl：使用 numactl 提供的 CPU 映射。如果之前运行未使用此参数，建议在使用前清除系统页面缓存。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 13,
+      "defaultEnabled": false
+    },
+    {
+      "key": "n-cpu-moe",
+      "flag": "--n-cpu-moe",
+      "abbr": "-ncmoe",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "N 层 CPU MoE",
+      "desc": "--n-cpu-moe N：将前 N 层的混合专家（MoE）权重保留在 CPU 内存中，其余层正常卸载到 GPU。这是 --cpu-moe 的更精细替代方案，适用于 GPU 显存不足以容纳全部 MoE 层，但也不想把所有 MoE 都放到 CPU 上的场景。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 14,
+      "defaultEnabled": false
+    },
+    {
+      "key": "n-cpu-ffn",
+      "flag": "--n-cpu-ffn",
+      "abbr": "-ncffn",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "N 层 CPU FFN",
+      "desc": "--n-cpu-ffn N：将前 N 层的 dense FFN 权重（ffn_up、ffn_down、ffn_gate）保留在 CPU 内存中，其余层正常卸载到 GPU。与 --n-cpu-moe 是同一套机制，但针对的是 dense 模型的 FFN 权重（--n-cpu-moe 针对 MoE 专家权重），因此只对 dense 模型有意义。显存紧张时，前几层的 FFN 占用显存较大且前向时离 attention 较远、CPU 计算能被相对较好地隐藏，把它们的 FFN 钉在 CPU 上可省出一块显存。注意：N 给得越大，每个 token 的 CPU-GPU 数据往返越多，速度损失越明显，属于省显存的代价型参数。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 14.2,
+      "defaultEnabled": false
+    },
+    {
+      "key": "lazy-mode",
+      "flag": "--lazy-mode",
+      "abbr": "-lzm",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "auto",
+      "values": [
+        {
+          "value": "on",
+          "label": "on"
+        },
+        {
+          "value": "auto",
+          "label": "auto"
+        },
+        {
+          "value": "off",
+          "label": "off"
+        }
+      ],
+      "label": "惰性张量加载",
+      "desc": "--lazy-mode：对模型架构标记的巨型张量（如 Gemma 4 的逐层 token embedding、Qwen4-Exp 的 PLE 张量）不整体载入内存，而是保留在磁盘上，运行时按需从 mmap 映射中读取需要的行。可选值：on（所有被标记的张量都按需读取）、auto（默认，仅当张量超过 4 GiB 才按需读取——小张量按需读开销大、不划算）、off（全部整体读入，即旧行为）。注意：只有声明了这类张量的模型（目前为 gemma4、qwen4exp）设置后才有实际效果；存在惰性张量时加载会强制启用 mmap，且惰性张量会被排除在 mlock 之外。适用场景：跑带巨型 embedding 表的大模型而内存不够时启用，配合 NVMe SSD 效果最好，机械盘会明显变慢。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 14.5,
+      "defaultEnabled": false
+    },
+    {
+      "key": "embedding",
+      "flag": "--embedding",
+      "abbr": "--embeddings",
+      "type": "LOGIC",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "嵌入向量模式",
+      "desc": "--embedding：启用嵌入（Embeddings）能力，用于把输入文本编码为向量表示，便于语义检索、聚类、相似度匹配与 RAG。该模式通常用于专门的嵌入模型或支持嵌入输出的模型；与文本生成相比，它关注向量输出而非续写文本，吞吐/内存占用特征也会不同。仅在你需要提供 embeddings 接口或向量输出时开启。",
+      "group": "page.params.group.features",
+      "order": 40,
+      "sort": 4,
+      "defaultEnabled": false
+    },
+    {
+      "key": "rerank",
+      "flag": "--rerank",
+      "abbr": "--reranking",
+      "type": "LOGIC",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "重排序模式",
+      "desc": "--rerank：启用重排序（Rerank）能力，用于对“查询 + 候选文档/段落”的相关性进行打分并按分数排序，常用于检索后再排序（RAG rerank）以提高答案引用质量。该模式通常适配专门的重排序模型（多为交叉编码器风格），与常规生成模型的推理路径不同；开启后通常会增加一次打分计算开销，但能显著提升召回结果的精排质量。仅在需要 rerank 接口/功能时启用。",
+      "group": "page.params.group.features",
+      "order": 40,
+      "sort": 5,
+      "defaultEnabled": false
+    },
+    {
+      "key": "context-shift",
+      "flag": "--context-shift",
+      "abbr": "--context-shift",
+      "type": "LOGIC",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "上下文移位（Context Shift）",
+      "desc": "--context-shift：该功能 默认禁用。启用 KV Cache 的滑动窗口机制（也叫“上下文移位”或“上下文压缩”）。当上下文超出 --ctx-size 时，系统会自动丢弃最旧的 tokens（从左侧），保留最近的 tokens，而不是直接报错。",
+      "group": "page.params.group.features",
+      "order": 40,
+      "sort": 28,
+      "defaultEnabled": false
+    },
+    {
+      "key": "no-webui",
+      "flag": "--no-webui",
+      "abbr": "--no-webui",
+      "type": "LOGIC",
+      "uiType": null,
+      "delimiter": null,
+      "default": "1",
+      "values": [],
+      "label": "禁用webui",
+      "desc": "--no-webui：即llamacpp自带的webui，一般来说不需要启用\n\n⚠ 在 router 模式下不建议关闭：llama.cpp 自带界面用子实例的 props.ui 判断\"能不能聊\"，关掉后该模型会从聊天页的模型选择器里消失（模型管理列表里仍在），本应用的「开始聊天」按钮也会置灰。",
+      "group": "page.params.group.features",
+      "order": 40,
+      "sort": 29,
+      "defaultEnabled": true
+    },
+    {
+      "key": "no-jinja",
+      "flag": "--no-jinja",
+      "abbr": "--no-jinja",
+      "type": "LOGIC",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "禁用Jinja",
+      "desc": "--no-jinja：是否使用Jinja模板引擎进行聊天（默认启用jinja模板，所以该值为false）",
+      "group": "page.params.group.template",
+      "order": 50,
+      "sort": 26,
+      "defaultEnabled": false
+    },
+    {
+      "key": "chat-template",
+      "flag": "--chat-template",
+      "abbr": "--chat-template",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "",
+      "values": [
+        {
+          "value": "bailing",
+          "label": "bailing"
+        },
+        {
+          "value": "bailing-think",
+          "label": "bailing-think"
+        },
+        {
+          "value": "bailing2",
+          "label": "bailing2"
+        },
+        {
+          "value": "chatglm3",
+          "label": "chatglm3"
+        },
+        {
+          "value": "chatglm4",
+          "label": "chatglm4"
+        },
+        {
+          "value": "chatml",
+          "label": "chatml"
+        },
+        {
+          "value": "command-r",
+          "label": "command-r"
+        },
+        {
+          "value": "deepseek",
+          "label": "deepseek"
+        },
+        {
+          "value": "deepseek2",
+          "label": "deepseek2"
+        },
+        {
+          "value": "deepseek3",
+          "label": "deepseek3"
+        },
+        {
+          "value": "exaone3",
+          "label": "exaone3"
+        },
+        {
+          "value": "exaone4",
+          "label": "exaone4"
+        },
+        {
+          "value": "falcon3",
+          "label": "falcon3"
+        },
+        {
+          "value": "gemma",
+          "label": "gemma"
+        },
+        {
+          "value": "gigachat",
+          "label": "gigachat"
+        },
+        {
+          "value": "glmedge",
+          "label": "glmedge"
+        },
+        {
+          "value": "gpt-oss",
+          "label": "gpt-oss"
+        },
+        {
+          "value": "granite",
+          "label": "granite"
+        },
+        {
+          "value": "grok-2",
+          "label": "grok-2"
+        },
+        {
+          "value": "hunyuan-dense",
+          "label": "hunyuan-dense"
+        },
+        {
+          "value": "hunyuan-moe",
+          "label": "hunyuan-moe"
+        },
+        {
+          "value": "kimi-k2",
+          "label": "kimi-k2"
+        },
+        {
+          "value": "llama2",
+          "label": "llama2"
+        },
+        {
+          "value": "llama2-sys",
+          "label": "llama2-sys"
+        },
+        {
+          "value": "llama2-sys-bos",
+          "label": "llama2-sys-bos"
+        },
+        {
+          "value": "llama2-sys-strip",
+          "label": "llama2-sys-strip"
+        },
+        {
+          "value": "llama3",
+          "label": "llama3"
+        },
+        {
+          "value": "llama4",
+          "label": "llama4"
+        },
+        {
+          "value": "megrez",
+          "label": "megrez"
+        },
+        {
+          "value": "minicpm",
+          "label": "minicpm"
+        },
+        {
+          "value": "mistral-v1",
+          "label": "mistral-v1"
+        },
+        {
+          "value": "mistral-v3",
+          "label": "mistral-v3"
+        },
+        {
+          "value": "mistral-v3-tekken",
+          "label": "mistral-v3-tekken"
+        },
+        {
+          "value": "mistral-v7",
+          "label": "mistral-v7"
+        },
+        {
+          "value": "mistral-v7-tekken",
+          "label": "mistral-v7-tekken"
+        },
+        {
+          "value": "monarch",
+          "label": "monarch"
+        },
+        {
+          "value": "openchat",
+          "label": "openchat"
+        },
+        {
+          "value": "orion",
+          "label": "orion"
+        },
+        {
+          "value": "pangu-embedded",
+          "label": "pangu-embedded"
+        },
+        {
+          "value": "phi3",
+          "label": "phi3"
+        },
+        {
+          "value": "phi4",
+          "label": "phi4"
+        },
+        {
+          "value": "rwkv-world",
+          "label": "rwkv-world"
+        },
+        {
+          "value": "seed_oss",
+          "label": "seed_oss"
+        },
+        {
+          "value": "smolvlm",
+          "label": "smolvlm"
+        },
+        {
+          "value": "solar-open",
+          "label": "solar-open"
+        },
+        {
+          "value": "vicuna",
+          "label": "vicuna"
+        },
+        {
+          "value": "vicuna-orca",
+          "label": "vicuna-orca"
+        },
+        {
+          "value": "yandex",
+          "label": "yandex"
+        },
+        {
+          "value": "zephyr",
+          "label": "zephyr"
+        }
+      ],
+      "label": "内置聊天模板",
+      "desc": "--chat-template：一般情况下不要使用，除非你使用的GGUF模型没有内置的聊天模板。如果要使用，请将‘禁用Jinja’设置为1，否则目前的llamacpp，是不会让内置聊天模板生效的。默认为空值，即使用模型的内置聊天模板，如果模型的内置模板不准确，则再尝试修改模板。⚠ 如果同时设置了 --chat-template 和 --chat-template-file，后出现的那个生效。",
+      "group": "page.params.group.template",
+      "order": 50,
+      "sort": 27,
+      "defaultEnabled": false
+    },
+    {
+      "key": "json-schema",
+      "flag": "--json-schema",
+      "abbr": "-j",
+      "type": "JSON",
+      "uiType": null,
+      "delimiter": null,
+      "default": "",
+      "values": [],
+      "label": "JSON Schema",
+      "desc": "--json-schema / -j：用 JSON Schema 约束模型输出格式，启动时自动转为 GBNF 语法。警告：复杂的 Schema 会导致命令行极长，可能超出操作系统命令行长度限制（Windows 上限约 8191 字符）。建议大型 Schema 改用 --json-schema-file。也可以通过 API 请求体的 response_format.json_schema 字段按请求控制。如果同时设置了 --json-schema 和 --json-schema-file，后出现的那个生效。⚠ 如果你不明白这是干什么的，就不要修改它。",
+      "group": "page.params.group.template",
+      "order": 50,
+      "sort": 27.1,
+      "defaultEnabled": false
+    },
+    {
+      "key": "json-schema-file",
+      "flag": "--json-schema-file",
+      "abbr": "-jf",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "",
+      "values": [],
+      "label": "JSON Schema 文件",
+      "desc": "--json-schema-file / -jf：JSON Schema 文件的路径。推荐复杂或较长的 Schema 使用文件形式，避免操作系统命令行长度限制。点击文件夹按钮选择 .json 文件。也可以通过 API 请求体的 response_format.json_schema 字段按请求控制。如果同时设置了 --json-schema-file 和 --json-schema，后出现的那个生效。⚠ 如果你不明白这是干什么的，就不要修改它。",
+      "group": "page.params.group.template",
+      "order": 50,
+      "sort": 27.2,
+      "defaultEnabled": false
+    },
+    {
+      "key": "chat-template-kwargs",
+      "flag": "--chat-template-kwargs",
+      "abbr": "",
+      "type": "JSON",
+      "uiType": null,
+      "delimiter": null,
+      "default": "",
+      "values": [],
+      "label": "聊天模板额外参数",
+      "desc": "--chat-template-kwargs：传递给 Jinja 聊天模板引擎的额外键值对。必须是合法的 JSON 对象，例如 {\"key1\":\"value1\"}。点击代码按钮编辑。如需按模型设置默认值，建议使用『模型详情』的 Kwargs 面板——它的优先级比这个 CLI 参数高。优先级（从低到高）：CLI 启动参数 → API 请求体 chat_template_kwargs → 模型详情 - Kwargs 设置（model-chat-template-kwargs.json）。按 key 各自覆盖，后者胜出。⚠ 如果你不明白这是干什么的，就不要修改它。",
+      "group": "page.params.group.template",
+      "order": 50,
+      "sort": 27.5,
+      "defaultEnabled": false
+    },
+    {
+      "key": "reasoning",
+      "flag": "--reasoning",
+      "abbr": "-rea",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "auto",
+      "values": [
+        {
+          "value": "on",
+          "label": "on"
+        },
+        {
+          "value": "off",
+          "label": "off"
+        },
+        {
+          "value": "auto",
+          "label": "auto"
+        }
+      ],
+      "label": "推理模式",
+      "desc": "--reasoning：在对话中使用推理/思考（on, off, 或 auto，默认：auto，从模板自动检测）。",
+      "group": "page.params.group.template",
+      "order": 50,
+      "sort": 29.5,
+      "defaultEnabled": false
+    },
+    {
+      "key": "reasoning-preserve",
+      "flag": "--reasoning-preserve",
+      "abbr": "",
+      "type": "LOGIC",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "保留推理痕迹",
+      "desc": "--reasoning-preserve：在完整的对话历史中保留推理/思考痕迹，而不仅仅是最后一条assistant消息。兼容支持 supports_preserve_reasoning 能力的模板（默认：auto，由模板决定）。",
+      "group": "page.params.group.template",
+      "order": 50,
+      "sort": 29.6,
+      "defaultEnabled": false
+    },
+    {
+      "key": "reasoning-format",
+      "flag": "--reasoning-format",
+      "abbr": "--reasoning-format",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "auto",
+      "values": [
+        {
+          "value": "auto",
+          "label": "auto"
+        },
+        {
+          "value": "none",
+          "label": "none"
+        },
+        {
+          "value": "deepseek",
+          "label": "deepseek"
+        },
+        {
+          "value": "deepseek-legacy",
+          "label": "deepseek-legacy"
+        }
+      ],
+      "label": "推理格式",
+      "desc": "--reasoning-format：控制是否允许及/或从响应中提取思考标签，以及它们的返回格式；可选值：none: 在 message.content 中保留未解析的思考内容； deepseek：将思考内容放入 message.reasoning_content； deepseek-legacy：在 message.content 中保留<think>标签，同时填充 message.reasoning_content（默认：auto）",
+      "group": "page.params.group.template",
+      "order": 50,
+      "sort": 30,
+      "defaultEnabled": false
+    },
+    {
+      "key": "reasoning-budget",
+      "flag": "--reasoning-budget",
+      "abbr": "--reasoning-budget",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "-1",
+      "values": [],
+      "label": "强制推理",
+      "desc": "--reasoning-budget：控制允许的思考量；-1 表示无限制思考预算，或 0 表示禁用思考，其它任意参数：思维链的最大长度，但是未必一定有效（默认：-1）。",
+      "group": "page.params.group.template",
+      "order": 50,
+      "sort": 31,
+      "defaultEnabled": false
+    },
+    {
+      "key": "reasoning-effort",
+      "flag": "--reasoning-effort",
+      "abbr": "--reasoning-effort",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "default",
+      "values": [
+        {
+          "value": "default",
+          "label": "default"
+        },
+        {
+          "value": "minimal",
+          "label": "minimal"
+        },
+        {
+          "value": "low",
+          "label": "low"
+        },
+        {
+          "value": "medium",
+          "label": "medium"
+        },
+        {
+          "value": "high",
+          "label": "high"
+        },
+        {
+          "value": "xhigh",
+          "label": "xhigh"
+        },
+        {
+          "value": "max",
+          "label": "max"
+        }
+      ],
+      "label": "推理力度",
+      "desc": "--reasoning-effort：传递给聊天模板的推理力度级别；'default' 表示保持模板默认，或指定 'minimal'、'low'、'medium'、'high'、'xhigh'、'max'（默认：default）。注意：并非所有档位对所有模型都有效，具体支持的档位需查阅模型的官方说明，例如 Qwen3.8 仅支持 low、medium、xhigh 三个档位，不支持其它档位。",
+      "group": "page.params.group.template",
+      "order": 50,
+      "sort": 31.1,
+      "defaultEnabled": false
+    },
+    {
+      "key": "mmproj",
+      "flag": "--mmproj",
+      "abbr": "",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "",
+      "values": [],
+      "label": "多模态投影文件 (mmproj)",
+      "desc": "--mmproj：多模态投影器 .gguf 文件的路径。视觉/语言模型（如 LLaVA、Qwen-VL）需要此文件。不设置时服务器会自动检测模型同目录下的 mmproj 文件。手动设置此项可覆盖自动检测的结果。点击文件夹按钮选择 .gguf 文件。⚠ 如果你不明白这是干什么的，就不要修改它。",
+      "group": "page.params.group.multimodal",
+      "order": 60,
+      "sort": 31.5,
+      "defaultEnabled": false
+    },
+    {
+      "key": "no-mmproj",
+      "flag": "--no-mmproj",
+      "abbr": "",
+      "type": "LOGIC",
+      "uiType": null,
+      "delimiter": null,
+      "default": "false",
+      "values": [],
+      "label": "禁用多模态投影",
+      "desc": "--no-mmproj：即使模型目录里有 mmproj 投影文件也不加载（不启用视觉能力），可以省下一点显存。关掉表示让服务器照常自动检测同目录的 mmproj。配置弹窗左栏的「多模态（视觉）」开关控制的就是它。",
+      "group": "page.params.group.multimodal",
+      "order": 61,
+      "sort": 31.6,
+      "defaultEnabled": false
+    },
+    {
+      "key": "mmproj-device",
+      "flag": "--mmproj-device",
+      "abbr": "",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "",
+      "values": [],
+      "label": "mmproj设备",
+      "desc": "--mmproj-device：指定mmproj文件运行在哪个设备上。写法为 后端+设备序号，如 CUDA0、CUDA1 表示让mmproj分别跑在CUDA0、CUDA1上；Vulkan0 表示用Vulkan后端跑在0号设备上；none 表示不让mmproj使用GPU（相当于关闭mmproj offload，用CPU跑）。留空表示自动选择GPU/iGPU。",
+      "group": "page.params.group.multimodal",
+      "order": 60,
+      "sort": 31.6,
+      "defaultEnabled": false
+    },
+    {
+      "key": "no-mmproj-offload",
+      "flag": "--no-mmproj-offload",
+      "abbr": "--no-mmproj-offload",
+      "type": "LOGIC",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "禁用mmproj卸载",
+      "desc": "--no-mmproj-offload：卸载mmproj投影到CPU，当GPU显存不足时，可以开启该选项，但是CPU处理图片的性能往往不如GPU。提示：建议使用更新的 --mmproj-device 参数代替本参数，将 --mmproj-device 设为 none 效果相同（mmproj不用GPU、用CPU跑），而且更灵活（还可以指定跑在哪张显卡上）。",
+      "group": "page.params.group.multimodal",
+      "order": 60,
+      "sort": 32,
+      "defaultEnabled": false
+    },
+    {
+      "key": "image-min-tokens",
+      "flag": "--image-min-tokens",
+      "abbr": "--image-min-tokens",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "图片最小token数",
+      "desc": "--image-min-tokens：每张图片可占用的最小 token 数量，仅适用于动态分辨率的视觉模型。不设置此参数时，从模型文件读取默认值。如果你不知道它的作用，就不要动它。",
+      "group": "page.params.group.multimodal",
+      "order": 60,
+      "sort": 33,
+      "defaultEnabled": false
+    },
+    {
+      "key": "image-max-tokens",
+      "flag": "--image-max-tokens",
+      "abbr": "--image-max-tokens",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "图片最大token数",
+      "desc": "--image-max-tokens：每张图片可占用的最大 token 数量，仅适用于动态分辨率的视觉模型。不设置此参数时，从模型文件读取默认值。如果你不知道它的作用，就不要动它。",
+      "group": "page.params.group.multimodal",
+      "order": 60,
+      "sort": 34,
+      "defaultEnabled": false
+    },
+    {
+      "key": "video-fps",
+      "flag": "--video-fps",
+      "abbr": "",
+      "type": "FLOAT",
+      "uiType": null,
+      "delimiter": null,
+      "default": "4.0",
+      "values": [],
+      "label": "视频抽帧帧率",
+      "desc": "--video-fps N：视频抽帧的目标帧率（帧/秒），通过 ffmpeg 的 fps= 滤镜实现；设置为 ≤ 0 时使用视频原生帧率。抽帧数量的估算也按此值计算（视频时长 × 帧率）。适用于支持视频输入的多模态模型。默认：4.0。",
+      "group": "page.params.group.multimodal",
+      "order": 60,
+      "sort": 35,
+      "defaultEnabled": false
+    },
+    {
+      "key": "video-timestamp-interval",
+      "flag": "--video-timestamp-interval",
+      "abbr": "",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "5000",
+      "values": [],
+      "label": "视频时间戳间隔",
+      "desc": "--video-timestamp-interval N：在视频的文本表示中插入文本时间戳的间隔（单位：毫秒），即每隔 N 毫秒插入一个时间戳。适用于支持视频输入的多模态模型。默认：5000（5 秒）。",
+      "group": "page.params.group.multimodal",
+      "order": 60,
+      "sort": 36,
+      "defaultEnabled": false
+    },
+    {
+      "key": "video-ffmpeg-dir",
+      "flag": "--video-ffmpeg-dir",
+      "abbr": "",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "",
+      "values": [],
+      "label": "ffmpeg 目录",
+      "desc": "--video-ffmpeg-dir DIR：指定 ffmpeg/ffprobe 可执行文件所在的目录，适合这些二进制不在 PATH 中的部署环境。留空表示在 PATH 中搜索。适用于支持视频输入的多模态模型。",
+      "group": "page.params.group.multimodal",
+      "order": 60,
+      "sort": 37,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-type",
+      "flag": "--spec-type",
+      "abbr": "",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "none",
+      "values": [
+        {
+          "value": "none",
+          "label": "无"
+        },
+        {
+          "value": "draft-simple",
+          "label": "独立草稿模型（Simple）"
+        },
+        {
+          "value": "draft-eagle3",
+          "label": "Eagle3 草稿模型"
+        },
+        {
+          "value": "draft-mtp",
+          "label": "MTP（多 Token 预测）"
+        },
+        {
+          "value": "draft-dflash",
+          "label": "dFlash 草稿模型"
+        },
+        {
+          "value": "draft-dspark",
+          "label": "dSpark 草稿模型"
+        }
+      ],
+      "label": "草稿模型类型（互斥选择）",
+      "desc": "--spec-type：选择一个草稿模型类型（互斥，不可共存）。none=不启用；draft-simple=独立草稿模型；draft-eagle3=Eagle3 草稿模型；draft-mtp=MTP（多 Token 预测，需模型支持）；draft-dflash=dFlash 草稿模型。可配合 ngram-mod/ngram-map-k4v 使用。",
+      "group": "page.params.group.draft_model",
+      "order": 70,
+      "sort": 0,
+      "defaultEnabled": true
+    },
+    {
+      "key": "spec-draft-n-max",
+      "flag": "--spec-draft-n-max",
+      "abbr": "--spec-draft-n-max",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "3",
+      "values": [],
+      "label": "最大草稿令牌数",
+      "desc": "--spec-draft-n-max：每次推测解码生成的最大草稿令牌数（default: 16）。💡 对于Qwen3.5模型，将此值设为2即可获得更好效果，无需调整其它参数。⚠ 如果你不明白这些参数的具体含义，请不要使用。这些参数需要你有相当丰富的专业知识以及足够的耐心去测试。",
+      "group": "page.params.group.draft_model",
+      "order": 70,
+      "sort": 1,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-draft-n-min",
+      "flag": "--spec-draft-n-min",
+      "abbr": "--spec-draft-n-min",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "最小草稿令牌数",
+      "desc": "--spec-draft-n-min：每次推测解码使用的最少草稿令牌数（default: 0）。⚠ 如果你不明白这些参数的具体含义，请不要使用。这些参数需要你有相当丰富的专业知识以及足够的耐心去测试。",
+      "group": "page.params.group.draft_model",
+      "order": 70,
+      "sort": 2,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-draft-p-min",
+      "flag": "--spec-draft-p-min",
+      "abbr": "--draft-p-min",
+      "type": "FLOAT",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0.0",
+      "values": [],
+      "label": "草稿最小概率",
+      "desc": "--spec-draft-p-min / --draft-p-min P：投机解码的最小接受概率（贪婪模式）（default: 0.75）。⚠ 如果你不明白这些参数的具体含义，请不要使用。这些参数需要你有相当丰富的专业知识以及足够的耐心去测试。",
+      "group": "page.params.group.draft_model",
+      "order": 70,
+      "sort": 3,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-draft-p-split",
+      "flag": "--spec-draft-p-split",
+      "abbr": "--draft-p-split",
+      "type": "FLOAT",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0.10",
+      "values": [],
+      "label": "草稿分割概率",
+      "desc": "--spec-draft-p-split / --draft-p-split：推测解码的分割概率（default: 0.10）。⚠ 如果你不明白这些参数的具体含义，请不要使用。这些参数需要你有相当丰富的专业知识以及足够的耐心去测试。",
+      "group": "page.params.group.draft_model",
+      "order": 70,
+      "sort": 4,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-draft-model",
+      "flag": "--spec-draft-model",
+      "abbr": "--model-draft",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "",
+      "values": [],
+      "label": "草稿模型路径",
+      "desc": "--spec-draft-model / --model-draft：用于推测解码的草稿模型文件路径。留空时 MTP 模式会自动使用主模型的 MTP head。⚠ 如果你不明白这些参数的具体含义，请不要使用。这些参数需要你有相当丰富的专业知识以及足够的耐心去测试。",
+      "group": "page.params.group.draft_model",
+      "order": 70,
+      "sort": 5,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-draft-ngl",
+      "flag": "--spec-draft-ngl",
+      "abbr": "--n-gpu-layers-draft",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "-1",
+      "values": [],
+      "label": "草稿模型 GPU 层数",
+      "desc": "--spec-draft-ngl / --n-gpu-layers-draft：草稿模型存储到 VRAM 的最大层数。可选值：-1=自动（默认），auto=自动，all=全部，或指定具体层数。⚠ 如果你不明白这些参数的具体含义，请不要使用。这些参数需要你有相当丰富的专业知识以及足够的耐心去测试。",
+      "group": "page.params.group.draft_model",
+      "order": 70,
+      "sort": 6,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-draft-device",
+      "flag": "--spec-draft-device",
+      "abbr": "--device-draft",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "",
+      "values": [],
+      "label": "草稿模型设备列表",
+      "desc": "--spec-draft-device / --device-draft：草稿模型使用的 GPU 设备列表，逗号分隔。留空表示使用主模型相同的设备。⚠ 如果你不明白这些参数的具体含义，请不要使用。这些参数需要你有相当丰富的专业知识以及足够的耐心去测试。",
+      "group": "page.params.group.draft_model",
+      "order": 70,
+      "sort": 7,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-draft-threads",
+      "flag": "--spec-draft-threads",
+      "abbr": "--threads-draft",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "-1",
+      "values": [],
+      "label": "草稿模型线程数",
+      "desc": "--spec-draft-threads / --threads-draft：草稿模型生成时使用的线程数。设为 -1 则与主模型线程数相同。⚠ 如果你不明白这些参数的具体含义，请不要使用。这些参数需要你有相当丰富的专业知识以及足够的耐心去测试。",
+      "group": "page.params.group.draft_model",
+      "order": 70,
+      "sort": 8,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-draft-type-k",
+      "flag": "--spec-draft-type-k",
+      "abbr": "-ctkd",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "f16",
+      "values": [
+        {
+          "value": "f32",
+          "label": "f32"
+        },
+        {
+          "value": "f16",
+          "label": "f16"
+        },
+        {
+          "value": "bf16",
+          "label": "bf16"
+        },
+        {
+          "value": "q8_0",
+          "label": "q8_0"
+        },
+        {
+          "value": "q4_0",
+          "label": "q4_0"
+        },
+        {
+          "value": "q4_1",
+          "label": "q4_1"
+        },
+        {
+          "value": "iq4_nl",
+          "label": "iq4_nl"
+        },
+        {
+          "value": "q5_0",
+          "label": "q5_0"
+        },
+        {
+          "value": "q5_1",
+          "label": "q5_1"
+        }
+      ],
+      "label": "草稿模型 K 缓存类型",
+      "desc": "--spec-draft-type-k / -ctkd / --cache-type-k-draft：草稿模型 K 的 KV cache 数据类型。默认：f16。仅在投机解码启用时生效。",
+      "group": "page.params.group.draft_model",
+      "order": 70,
+      "sort": 8.5,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-draft-type-v",
+      "flag": "--spec-draft-type-v",
+      "abbr": "-ctvd",
+      "type": "STRING",
+      "uiType": null,
+      "delimiter": null,
+      "default": "f16",
+      "values": [
+        {
+          "value": "f32",
+          "label": "f32"
+        },
+        {
+          "value": "f16",
+          "label": "f16"
+        },
+        {
+          "value": "bf16",
+          "label": "bf16"
+        },
+        {
+          "value": "q8_0",
+          "label": "q8_0"
+        },
+        {
+          "value": "q4_0",
+          "label": "q4_0"
+        },
+        {
+          "value": "q4_1",
+          "label": "q4_1"
+        },
+        {
+          "value": "iq4_nl",
+          "label": "iq4_nl"
+        },
+        {
+          "value": "q5_0",
+          "label": "q5_0"
+        },
+        {
+          "value": "q5_1",
+          "label": "q5_1"
+        }
+      ],
+      "label": "草稿模型 V 缓存类型",
+      "desc": "--spec-draft-type-v / -ctvd / --cache-type-v-draft：草稿模型 V 的 KV cache 数据类型。默认：f16。仅在投机解码启用时生效。",
+      "group": "page.params.group.draft_model",
+      "order": 70,
+      "sort": 8.6,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-type_ngram-mod",
+      "flag": "--spec-type_ngram-mod",
+      "abbr": "--spec-type_ngram-mod",
+      "type": "LOGIC",
+      "uiType": null,
+      "delimiter": null,
+      "mergeInto": "spec-type",
+      "mergeValue": "ngram-mod",
+      "default": "0",
+      "values": [],
+      "label": "Ngram-mod 投机解码",
+      "desc": "--spec-type ngram-mod：启用 ngram-mod 投机解码。使用哈希池（所有服务 slot 共享）将 n-gram 哈希映射到下一个 token，进行快速草稿生成（~16 MB，固定内存）。",
+      "group": "page.params.group.ngram_mod",
+      "order": 70,
+      "sort": 9,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-ngram-mod-n-match",
+      "flag": "--spec-ngram-mod-n-match",
+      "abbr": "",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "24",
+      "values": [],
+      "label": "Ngram-mod 查找长度",
+      "desc": "--spec-ngram-mod-n-match N：ngram-mod 查找长度，即哈希的 n-gram 大小（默认：24，范围：1-1024）",
+      "group": "page.params.group.ngram_mod",
+      "order": 70,
+      "sort": 10,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-ngram-mod-n-min",
+      "flag": "--spec-ngram-mod-n-min",
+      "abbr": "",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "48",
+      "values": [],
+      "label": "Ngram-mod 最小草稿长度",
+      "desc": "--spec-ngram-mod-n-min N：最小草稿 token 数（默认：48，范围：0-1024）。不足此长度的草稿将被丢弃。",
+      "group": "page.params.group.ngram_mod",
+      "order": 70,
+      "sort": 11,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-ngram-mod-n-max",
+      "flag": "--spec-ngram-mod-n-max",
+      "abbr": "",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "64",
+      "values": [],
+      "label": "Ngram-mod 最大草稿长度",
+      "desc": "--spec-ngram-mod-n-max N：最大草稿 token 数（默认：64，范围：0-1024）。哈希链在此长度停止。",
+      "group": "page.params.group.ngram_mod",
+      "order": 70,
+      "sort": 12,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-type_ngram-map-k4v",
+      "flag": "--spec-type_ngram-map-k4v",
+      "abbr": "--spec-type_ngram-map-k4v",
+      "type": "LOGIC",
+      "uiType": null,
+      "delimiter": null,
+      "mergeInto": "spec-type",
+      "mergeValue": "ngram-map-k4v",
+      "default": "0",
+      "values": [],
+      "label": "Ngram-map-k4v 投机解码",
+      "desc": "--spec-type ngram-map-k4v：启用 ngram-map-k4v 投机解码。在 token 历史中查找当前 n-gram（key），每个 key 跟踪最多 4 个 m-gram（value）。当某个 value 的出现频率显著超过其他时，用作草稿。",
+      "group": "page.params.group.ngram_map_k4v",
+      "order": 70,
+      "sort": 13,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-ngram-map-k4v-size-n",
+      "flag": "--spec-ngram-map-k4v-size-n",
+      "abbr": "--spec-ngram-map-k4v-size-n",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "12",
+      "values": [],
+      "label": "Ngram-map-k4v Key 大小",
+      "desc": "--spec-ngram-map-k4v-size-n N：查找 key n-gram 的长度（默认：12，范围：1-1024）",
+      "group": "page.params.group.ngram_map_k4v",
+      "order": 70,
+      "sort": 14,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-ngram-map-k4v-size-m",
+      "flag": "--spec-ngram-map-k4v-size-m",
+      "abbr": "--spec-ngram-map-k4v-size-m",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "48",
+      "values": [],
+      "label": "Ngram-map-k4v 草稿大小",
+      "desc": "--spec-ngram-map-k4v-size-m N：草稿 m-gram 的长度（默认：48，范围：1-1024）",
+      "group": "page.params.group.ngram_map_k4v",
+      "order": 70,
+      "sort": 15,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-ngram-map-k4v-min-hits",
+      "flag": "--spec-ngram-map-k4v-min-hits",
+      "abbr": "--spec-ngram-map-k4v-min-hits",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "1",
+      "values": [],
+      "label": "Ngram-map-k4v 最小命中数",
+      "desc": "--spec-ngram-map-k4v-min-hits N：key 在历史中出现的最小次数后才生成草稿（默认：1，最小：1）",
+      "group": "page.params.group.ngram_map_k4v",
+      "order": 70,
+      "sort": 16,
+      "defaultEnabled": false
+    }
+  ]
+}

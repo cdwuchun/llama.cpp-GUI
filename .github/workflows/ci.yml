@@ -1,0 +1,51 @@
+# 最小 CI：类型检查 + 前端构建 + 后端单测 + 参数表单冒烟测试。
+#
+# 只在 windows-latest 上跑：这个应用是 Windows 专属的（NSIS 安装包、`winfix` 的
+# `mklink` junction、`bench.rs` 里的 kernel32 调用、WebView2 数据目录），
+# Linux/macOS 上连编译都过不去，跑没有意义。
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      # 先构建前端：一来 CI 要覆盖构建本身，二来 `tauri-build` 需要 `dist/`
+      # （`tauri.conf.json` 的 frontendDist）存在，后面的 `cargo test` 才不会抱怨。
+      - name: 前端类型检查与构建
+        run: npm run build
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # `.cargo/config.toml` 把 crates-io 换成了本机的 http://127.0.0.1:8787 代理
+      # （见 HANDOVER §6 的 schannel 说明）。CI 上没有这个代理，留着只会
+      # `Could not connect to server`，所以先删掉，让它走官方 crates.io。
+      - name: 移除本机 crates 代理配置
+        run: if (Test-Path .cargo/config.toml) { Remove-Item -Force .cargo/config.toml }
+
+      - name: 后端单元测试
+        run: npm run test:rs
+
+      - name: 参数表单渲染冒烟测试
+        run: npm run test:smoke

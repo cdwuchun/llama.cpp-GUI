@@ -1,0 +1,16 @@
+# 行尾统一为 LF，仓库里存的就是工作区里的那份字节。
+#
+# 为什么需要它：Windows 版 git 的 `core.autocrlf` 默认为 true，会在 checkout 时
+# 把文本文件转成 CRLF —— 同一个人换台机器、或者别人 clone 下去，`git diff` 就会
+# 整文件飘红。这里显式钉死，谁拿到的工作区都是同一份字节。
+* text=auto eol=lf
+
+# 二进制资产：不做行尾转换、不做文本 diff
+*.png binary
+*.ico binary
+*.icns binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.exe binary
+*.dll binary
