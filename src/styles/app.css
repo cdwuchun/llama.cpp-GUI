@@ -217,6 +217,29 @@
   border-radius: 7px;
 }
 
+.app-logo {
+  min-width: 0;
+}
+
+/* 侧栏只有 232px（--sidebar-w），版本号必须让位于品牌名而不是把它挤到换行：
+   空间不够时给「llama.cpp GUI」出省略号，版本号靠 white-space: nowrap 保持完整。
+   margin-left: auto 把它推到行尾（.sidebar-header 是 flex，legacy/index.css:212）。 */
+.app-version {
+  margin-left: auto;
+  padding-left: 6px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 0.66rem;
+  line-height: 1;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.app-logo > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .sidebar-nav {
   padding: 14px 10px;
   gap: 4px;

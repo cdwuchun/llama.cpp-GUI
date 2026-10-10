@@ -1,5 +1,7 @@
 import { Fragment, useEffect, useState } from "react";
 
+import { getVersion } from "@tauri-apps/api/app";
+
 import { BenchPanel } from "./components/BenchPanel";
 import { LogPanel } from "./components/LogPanel";
 import { ModelListPanel } from "./components/ModelListPanel";
@@ -48,6 +50,19 @@ export default function App() {
   const [navOpen, setNavOpen] = useState(false);
   // 主题放在 store 里（设置页顶栏也要用它切换）
   const theme = useApp((s) => s.theme);
+
+  /**
+   * GUI 自己的版本号：取自 `tauri.conf.json` 的 `version`（打包时的权威值 —— 安装包文件名
+   * 与 exe 的文件版本属性都源自它），所以显示的就是用户手上这一版。取不到就整行不渲染，
+   * 不用「版本未知」占位 —— 侧栏窄，多一行文案就换行。
+   */
+  const [guiVersion, setGuiVersion] = useState("");
+
+  useEffect(() => {
+    void getVersion()
+      .then(setGuiVersion)
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     void init();
@@ -149,6 +164,13 @@ export default function App() {
             {appLogo && <img src={appLogo} alt="llama.cpp GUI" className="app-logo-image" />}
             <span>llama.cpp GUI</span>
           </a>
+          {/* GUI 自己的版本（取自 tauri.conf.json —— exe 属性与安装包文件名都源自它）。
+              取不到就不渲染，不用「版本未知」占位；样式见 app.css 的 .app-version。 */}
+          {guiVersion && (
+            <span className="app-version" title={`llama.cpp GUI ${guiVersion}`}>
+              v{guiVersion}
+            </span>
+          )}
         </div>
 
         <nav className="sidebar-nav">
