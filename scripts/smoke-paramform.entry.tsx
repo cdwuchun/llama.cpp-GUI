@@ -139,6 +139,22 @@ console.log("Strata 参数表:");
   const empty = validateStrataSampling({ ...state, "sampling-top-p": { enabled: true, value: "" } });
   if (empty) throw new Error(`清空应该是合法的（= 删掉该键、回默认）: ${empty}`);
   console.log(`  采样往返 OK（坏值拦截: ${badK.slice(0, 24)}…）`);
+
+  // 表单初值：不传这个参数时引擎自己的默认是 700 MiB（0.1.41 实测）——
+  // 勾选启用又不填时不能写出 `--vram-reserve-mib 0`（等于不留余量，引擎会报 LOW 并可能卡住）
+  const reserve = state["vram-reserve-mib"];
+  if (!reserve || reserve.value !== "700") {
+    throw new Error(`vram-reserve-mib 的表单初值应为 700: ${JSON.stringify(reserve)}`);
+  }
+  if (reserve.enabled) throw new Error("vram-reserve-mib 默认不应启用（默认不下发这个参数）");
+  const withReserve = stateToConfig(cfg, {
+    ...state,
+    "vram-reserve-mib": { enabled: true, value: "700" },
+  });
+  if (!(withReserve.args as unknown[]).join(" ").includes("--vram-reserve-mib 700")) {
+    throw new Error(`启用后应写出 --vram-reserve-mib 700: ${JSON.stringify(withReserve.args)}`);
+  }
+  console.log("  显存预留初值 OK（700 MiB，可写回 args）");
 }
 
 console.log("全部通过 ✅");

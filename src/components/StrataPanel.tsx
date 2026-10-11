@@ -274,24 +274,31 @@ function ConfigCard({
       <button
         type="button"
         className={`btn-icon soft ${isRunning ? "is-running" : ""}`}
-        disabled={busy}
+        disabled={busy || isLoading}
         title={
-          isRunning
-            ? "卸载这个模型（引擎进程留着，显存释放）"
-            : mutex
-              ? "加载这个模型（显存互斥已开：会先卸载 router 正在运行的模型）"
-              : engineHere
-                ? "加载这个模型"
-                : runningElsewhere
-                  ? `启动并加载这个模型（Strata 互斥：会先停止正在运行的 ${runningElsewhere}）`
-                  : "启动引擎并加载这个模型"
+          isLoading
+            ? "模型正在加载（引擎已起，权重还没就绪）"
+            : isRunning
+              ? "卸载这个模型（引擎进程留着，显存释放）"
+              : mutex
+                ? "加载这个模型（显存互斥已开：会先卸载 router 正在运行的模型）"
+                : engineHere
+                  ? "加载这个模型"
+                  : runningElsewhere
+                    ? `启动并加载这个模型（Strata 互斥：会先停止正在运行的 ${runningElsewhere}）`
+                    : "启动引擎并加载这个模型"
         }
         onClick={onToggle}
       >
         <i className={`fas ${isRunning ? "fa-stop" : "fa-play"}`} />
       </button>
       {isRunning && (
-        <button type="button" className="btn-icon" title="在浏览器里打开这个模型的 WebUI" onClick={onWebui}>
+        <button
+          type="button"
+          className="btn-icon"
+          title={`在浏览器里打开「${name}」的 WebUI（这个模型的引擎端口 :${entry.port}）`}
+          onClick={onWebui}
+        >
           <i className="fas fa-external-link-alt" />
         </button>
       )}
@@ -777,7 +784,19 @@ export function StrataPanel() {
   }, [pinned]);
 
   const selected = settings?.strata_selected_config ?? null;
-  const runningFile = status.running && status.config_path ? basename(status.config_path) : null;
+  // 「在跑的是哪份 config」：优先按 config_path 认（GUI 槽位与探测都能给出），拿不到时
+  // 退回按 `/health` 报的模型名认。引擎从启动到端口监听之间探测不到，单看 `running`
+  // 会让卡片在这段空窗里一直显示「已停止」（用户 m01031：模型加载了卡片却没反应）。
+  const runningEntry = useMemo(() => {
+    const path = status.config_path;
+    if (path) {
+      const byPath = entries.find((e) => fileOf(e) === basename(path));
+      if (byPath) return byPath;
+    }
+    const name = status.model_name;
+    return name ? (entries.find((e) => e.model_name === name) ?? null) : null;
+  }, [entries, status.config_path, status.model_name]);
+  const runningFile = runningEntry ? fileOf(runningEntry) : null;
   // 多份 config 写同一个端口时，它们本来就只能有一个在跑（一个引擎 = 一份 config = 一个
   // 端口，用户 m00001）：底部提示里说清楚，免得用户以为两个模型能同时加载。
   const sharedPort = useMemo(() => {
@@ -838,7 +857,6 @@ export function StrataPanel() {
     status.live_max_context != null &&
     selectedEntry.max_context !== status.live_max_context;
 
-  const webuiUrl = `http://127.0.0.1:${status.port}/`;
   const configEntry = entries.find((e) => fileOf(e) === configFile) ?? null;
   const detailEntry = entries.find((e) => fileOf(e) === detailFile) ?? null;
 
@@ -966,19 +984,25 @@ export function StrataPanel() {
                   runningElsewhere={
                     runningFile && runningFile !== fileOf(e) ? status.model_name || runningFile : null
                   }
-                  // 「加载中」有两来路：用户在本页点了启动（`strataStarting`，纯前端状态），
-                  // 或**前门**正拿着 DSH 的请求在起引擎/加载模型（`proxy_serving` + 尚未
-                  // `loaded`，用户 m01266 第 2 点）。后者以前什么都不显示，加载完直接跳「运行中」。
+                  // 「加载中」有三来路：用户在本页点了启动（`strataStarting`，纯前端状态）、
+                  // **前门**正拿着 DSH 的请求在起引擎/加载模型（`proxy_serving` + 尚未
+                  // `loaded`，用户 m01266 第 2 点）、或**引擎已起但端口还没应答**（还在
+                  // 加载权重，用户 m01031）。最后一种以前什么都不显示，卡片像没反应。
                   isLoading={
                     starting === fileOf(e) ||
-                    (status.proxy_serving === fileOf(e) && !status.loaded)
+                    (status.proxy_serving === fileOf(e) && !status.loaded) ||
+                    (runningFile === fileOf(e) && !status.running)
                   }
                   mutex={!!settings?.strata_router_mutex}
                   grid={grid}
                   busy={busy}
                   onPick={() => void pickStrata(fileOf(e))}
                   onToggle={() => toggleOne(fileOf(e))}
-                  onWebui={() => void ipc.openLocalUrl(webuiUrl)}
+                  // WebUI 是**引擎进程自己**在它的端口上提供的页面，所以这里必须用**这张卡片自己的**
+                  // `entry.port`，不能用「当前在跑引擎的端口」：前者保证打开的就是这张卡片的模型，
+                  // 后者在代理背后切换引擎时会开成**另一个模型**的页面（用户 m02028「About 里的
+                  // 模型不对」就是这么来的：那次开出来的是当时在跑的 sc117 的页面）。
+                  onWebui={() => void ipc.openLocalUrl(`http://127.0.0.1:${e.port}/`)}
                   onConfigure={() => {
                     setDetailFile(null);
                     setConfigFile(fileOf(e));
@@ -998,9 +1022,11 @@ export function StrataPanel() {
           {status.proxy ? ` · 代理 :${status.proxy_port ?? 9090}（DSH 连这里）` : ""}
           {status.running
             ? ` · 引擎运行中 ${status.model_name || ""} · :${status.port}${status.version ? ` · ${status.version}` : ""}`
-            : status.proxy
-              ? " · 引擎未起，首次请求时自动启动并加载模型"
-              : " · Strata 未运行，用卡片上的启动按钮启动，或点上方「启动代理」让 DSH 直连"}
+            : runningEntry && !status.external
+              ? ` · 引擎启动/加载中 ${status.model_name || runningFile || ""} · :${status.port}（端口暂无响应）`
+              : status.proxy
+                ? " · 引擎未起，首次请求时自动启动并加载模型"
+                : " · Strata 未运行，用卡片上的启动按钮启动，或点上方「启动代理」让 DSH 直连"}
           {sharedPort && " · 多份 config 共用同一端口，同时只能跑一个（启动会先停掉正在跑的那个）"}
           {ctxMismatch && " · config 与运行时上下文不一致，重启才生效"}
         </div>

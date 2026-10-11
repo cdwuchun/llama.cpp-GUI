@@ -757,6 +757,11 @@ pub fn spawn_monitor(
                     st.running = false;
                     st.pid = None;
                     st.loaded = None;
+                    // 归属信息一并清掉：槽位空了，「这份 config 的引擎正在起」这个判断
+                    // （卡片据此显示「加载中」）必须跟着失效，否则进程死了卡片还在转圈。
+                    st.config_path = None;
+                    st.model_name = None;
+                    st.started_at_ms = None;
                     st.last_error = Some(match code {
                         Some(c) => format!("Strata 已退出（退出码 {c}）"),
                         None => "Strata 已退出".to_string(),

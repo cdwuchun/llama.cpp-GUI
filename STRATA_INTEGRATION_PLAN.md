@@ -1294,3 +1294,66 @@ Origin 防护：`_foreign_origin()`（`:4601-4608`）= `bool(origin) and origin.
 **真机验证（2026-10-11，冷启动整链路）**：`POST http://127.0.0.1:9090/v1/chat/completions`（唯一 prompt 78403 B ≈ 19k token，`stream:true`）→ 日志 `ensure ④起新引擎 strata-swift-iq3_xxs.json` → `Ok(())`、`forward 已写上游 78578 字节（头 175 + body 78403）`、`io::copy 结束，向客户端写 4835 字节`；客户端首字节 22.9 s、总 65.9 s、4835 B、18 个 chunk、含 `[DONE]`、`predicted_n: 16`（完整 SSE，引擎的 `: keep-alive` 心跳也完整穿过）。**修复前**同一请求 5561 ms 只收到 428 B 且无 `[DONE]`。随后 `cargo test --lib` 98 passed / 0 failed / 5 ignored、`npx tsc --noEmit` exit 0、`npm run tauri build` exit 0。
 
 **给下一位的提醒**：改前门转发（`forward` / `handle_connection`）后必须用 **>8k token 的未缓存 prompt** 经 9090 复测完整 SSE（小请求会掩盖这个 bug）；排查时开 `STRATA_PROXY_DEBUG=1`。
+
+
+### 22.9 卡片认不出「在跑的是哪个模型」（归属信息被探测失败清掉，用户 m01031）
+
+用户原话（m01031）："--vram-reserve-mib 我改成100 了，现在在gui中启动模型，模型明明加载了，模型卡片没有反应"。
+
+**现象**：引擎 `/health` 报 `loaded: true`、侧栏胶囊写着「引擎运行中 sc117-swift-iq2-xs · :9091」，但 Strata 页的卡片一律「已停止」、标题计数停在 `0/3`；此时点卡片的 ▶ 会走 `store.startStrataModel` 的「切换」分支（它按 `config_path` 判断跑的是不是这个模型），于是**把正在跑的引擎停掉重启**，看起来更像「没反应」。
+
+**根因**：`config_path` 只有两条写入路径 —— 启动引擎时写一次、探测到**外部**实例时写一次。而 `lib.rs::strata_probe` 的「所有已知端口都无响应」分支无条件清归属（`guard.config_path = None`）。引擎从 spawn 到端口监听之间、以及 `/load` 期间（上游 HTTP 服务单线程，加载 63 GB 权重时 `/health` 会被阻塞 → GUI 侧 3 s 探测超时）都会命中这条分支。此后探测恢复正常，`running` / `model_name` / `loaded` / `pid` 全都刷新回来，**`config_path` 却再也补不回来**（GUI 自己起的实例走「槽位」那条路，不写它）⇒ 前端 `runningFile = status.running && status.config_path ? … : null` 恒为 `null`，于是每张卡片都判成「不是我在跑」；面板计数也因为同一个 `runningFile` 显示 `0/3`。
+
+**修复（三层 + 前端兜底）**：
+
+- `lib.rs::apply_owned_status(&mut StrataStatus, Option<(u16, PathBuf, String, u64)>)`：纯函数，每次探测先按槽位把 `external` / `port` / `config_path` / `model_name` / `started_at_ms` 覆盖回快照（自愈）；单测 `slot_owned_instance_restores_ownership_fields`。
+- 「所有端口无响应」分支改为：槽位里有引擎（`slot_owned`）时**只清探测字段**（`running` / `loaded` / `version` / `pid`），不动归属；槽位为空时才整组清掉。
+- `spawn_monitor` 在进程退出时把 `config_path` / `model_name` / `started_at_ms` 一起清掉，保住「归属只在槽位非空时存在」这条不变式（否则进程没了、归属还在，前端会一直显示「加载中」）。
+- 前端 `StrataPanel.tsx`：`runningEntry` 先按 `config_path` 认，认不到就退回按 `/health` 报的 `model_name` 认；`isLoading` 增加第三种来源「槽位里有引擎、端口还没应答」（`runningFile === fileOf(e) && !status.running`）并在加载期间禁用 ▶；面板底部那行状态文案同步为「引擎启动/加载中 …（端口暂无响应）」。
+
+**真机验证（2026-10-11，便携版 `E:\AI\llama.cpp-gui`，全部经前门 9090）**：
+
+- 冷启动：`POST /v1/chat/completions`（`model: sc117-swift-iq2-xs`）→ 18 s 返回 200，`usage.prompt_tokens=57 / completion_tokens=16`、`predicted_per_second=52.8`；引擎 `/health` 变 `loaded: true`；卡片从「已停止」变为 **「运行中」**、计数 `1/3`、▶ 变停止按钮并出现 WebUI 按钮（修复前同状态下卡片恒为「已停止」、计数 `0/3`）。
+- 切换引擎：同样经 9090 请求 `swift-1.5-iq3_xxs` → 25 s 成功，端口从 9091 切到 9092（`Get-NetTCPConnection` 只剩 9092），面板文案「引擎运行中 swift-1.5-iq3_xxs · :9092」、计数 `1/3`。
+- 加载中反馈：再切回 `sc117-swift-iq2-xs`（22 s 成功），在 +5 s / +10 s / +16 s 三个时刻截图，卡片都是 **「加载中」**（橙圈 spinner、▶ 置灰）——正是用户 m01266 第 2 点要的反馈。
+- 构建级：`cargo test --lib` 99 passed / 0 failed / 5 ignored、`npx tsc --noEmit` exit 0、`npm run tauri build` exit 0；新 exe 已覆盖到便携版（备份 `E:\AI\llama.cpp-gui\llamacpp-gui.exe.bak-20261011-214400`）。
+
+**给下一位的提醒**：任何「探测失败」的分支都**不能**顺手清归属信息 —— 探测只证明「这一刻端口没应答」，不证明「引擎没了」。判定引擎死活只有两个权威来源：槽位里的 `Child`（`spawn_monitor` 用 `try_wait`）和外部实例的端口探测。前端同理：`config_path` 缺失不等于「没有实例在跑」，必须能退回按 `model_name` 认。
+
+### 22.10 显存账：把最多 expert 放进显存（用户 m01321）
+
+用户原话（m01321）："kv在内存里，显存中只有kv池；你计算一下能放下最多expert的方案"。
+
+**实测口径（2026-10-11，`sc117-swift-iq2-xs`，卡 total 12227 MiB）**
+
+- 引擎在跑时 nvidia-smi `used 11366 / free 579 MiB`；**杀掉引擎后 `used 0 / free 11944 MiB`** ⇒ GUI + WebView2 在 WDDM 下不计显存，11366 MiB 全是引擎的（Driver 自留 283 MiB）。
+- 引擎日志（`E:\AI\Strata\strata-<模型>.log`，每次启动写一段）里的显存明细：native projection matrices **1473.57 MiB**、MTP draft layer **835**（experts 675 + dense 111）、draft head **137.9**、verify 窗口 **57.9**、KV 驻留池（`--kv-resident` 个 cell；k8v4 = 816 B/cell × 约 12 个 QSA 层 ⇒ **每 cell 约 10.2 KiB** 跨层合计）、expert cache **5.26 GiB / 3907 槽**；余下约 **2.7 GiB** 是引擎自身的 CUDA 上下文与工作区，**不可调**。
+- **每槽 1.376 MiB**（两处口径一致：`expert cache 3907 slots, 5.26 GiB` 与 `the prompt path borrows 2918 CUDA0 cache slots (3.93 GiB)`）。
+
+**三个可调杠杆（实测边际代价，reserve 基线 612）**
+
+| 杠杆 | 效果 |
+|---|---|
+| `--vram-reserve-mib` 100 → 612 | 预留 512 MiB = **−374 槽**；换来引擎不再报 `0 MiB of VRAM free … LOW`（该状态下反复打大 prompt 会楔死，见 §8 第 5 条） |
+| `--kv-resident` 32768 → 8192 | 驻留池省 123 MiB = **+84 槽**（3907 vs 3823；**引擎会把 8192 抬到最小值 20480**，日志里 `KV streaming: 20480 of 204800 cells`） |
+| 不开 `--mtp` / `--spec` | 省 835 + 137.9 = 973 MiB = **+711 槽**；代价是失去投机解码（实测 `drafts accepted 4 of 5`） |
+| `--kv` k8v4 → q4_0 | 驻留池再省约 1/3（约 **+51 槽**），代价是 KV 精度略降 |
+| `--prefill auto:8192` | 不增槽位，但让提示路径少借缓存槽（引擎自己在 `356 MiB free` 那行建议过），长 prompt 更稳 |
+
+**用户定稿**：三份 config 统一 `--kv-resident 30720`；`--vram-reserve-mib` 两份 512（m01393），`swift-1.5-iq3_xxs` 最终**不传该参数**（m01423，走引擎默认 **700 MiB**）。
+
+**真机验证（2026-10-11 22:24 / 22:47 / 22:51，重启 GUI 后逐个冷启动，全部经前门 9090）**
+
+| 模型 | `--vram-reserve-mib` | 最终 expert cache | 引擎口径空闲显存 | nvidia-smi free | 引擎 LOW 警告 |
+|---|---|---|---|---|---|
+| `sc117-swift-iq2-xs` | 512 | **3909 槽 / 5.26 GiB** | 258 MiB | 997 MiB | 无 |
+| `swift-1.5-iq2_xs` | 512 | **3918 槽 / 5.25 GiB** | 256 MiB | 991 MiB | 无 |
+| `swift-1.5-iq3_xxs` | 不传（引擎默认 700） | **2770 槽 / 4.53 GiB** | 428 MiB | 1163 MiB | 无 |
+
+⇒ 三份都不再触发 LOW。512 对 IQ2 系列够用（sc117 从「4197 槽但会报 LOW、实测会楔死」变成「3909 槽、干净」）；`swift-1.5-iq3_xxs` 的每个槽明显更大（IQ3_XXS 专家更大，auto 口径约 2.2 MiB/槽）：512 时报 LOW 并直言要 782，782 时干净但只有 2720 槽，**不传参数反而最好**（引擎默认 700 MiB ⇒ 2770 槽、428 MiB 余量）。
+
+**踩过的坑（改 config 时注意）**：手动删 `--vram-reserve-mib` 时若把它的值留下（`"--vision",` 后面挂着 `"782",`），参数就变成 `--vision 782` ⇒ 引擎打印用法后**直接退出**，前门连试 3 次（22:50:23 / :39 / :54）、请求报 `An error occurred while sending the request`、端口始终没起来。删参数必须连值一起删；GUI 的 config 表单不吃这种写法，但手改 JSON 很容易踩。另外 GUI 参数表里这个参数的初值原先写的是 `default: "0"`（`defaultEnabled: false`，所以默认不发这个参数）—— 勾选启用又不填就会写出 `--vram-reserve-mib 0`（等于不留余量）。**2026-10-11 已按用户要求（m01450）改成 `default: "700"`**（引擎自己不带该参数时的默认值），`desc` 也补上了「填 0 会触发 LOW 警告」的说明，并在 `scripts/smoke-paramform.entry.tsx` 里加了断言钉住（初值 700、默认不启用、启用后写回 `--vram-reserve-mib 700`）。
+
+对照：改前 sc117 是 4197 槽但引擎报 LOW 且实测会楔死（见 §8 第 5 条）；`strata-swift-iq2_xs.log` 早先的 100/512 组合分别对应 640 MiB / 2394 槽。
+
+**给下一位的提醒**：GUI 的 config 快照是**按下缓存**走的 —— 改了磁盘上 config 的 `args` 后必须**重启 GUI**，否则引擎仍按旧 args 起（面板底部那句「config 与运行时上下文不一致，重启才生效」说的就是它）。改前记得备份 config（本轮 `strata-sc117-swift-iq2-xs.json.bak-20261011-220154`）。

@@ -4,7 +4,7 @@
 > 本文讲**怎么接手**：决定实现形态的 llama.cpp 行为约束、代码地图、配置与数据文件位置、
 > 验证手段（含现成脚本）、踩过的坑、未决项。
 >
-> 最后更新：2026-10-10。最近一次完整验证：`cargo test --lib` **93 passed / 0 failed / 5 ignored**，`npx tsc --noEmit` 无输出。
+> 最后更新：2026-10-11。最近一次完整验证：`cargo test --lib` **99 passed / 0 failed / 5 ignored**，`npx tsc --noEmit` 无输出（exit 0）。
 > （上一份构建产物 `src-tauri\target\release\llamacpp-gui.exe`，9,328,640 B，SHA256 `04EBD9CA…EBE9` 是 2026-09-23 的；
 > 其后做过一轮代码审查与修复，结论与逐条改动见 `CODE_REVIEW.md`，**exe 需要重新打包才能反映这些改动**。）
 >
@@ -149,6 +149,7 @@ Strata 的二进制不同名、没有 router mode、管理端点与 llama.cpp �
   1. **每条连接必须显式 `set_nonblocking(false)`**。监听套接字在 `start()` 里是 `set_nonblocking(true)`（非阻塞 accept + 30 ms 轮询），而 **Windows 上 `accept()` 返回的套接字会继承这个非阻塞标志**：不转回来的话所有 `read` 在没数据时直接返回 `WouldBlock`（`os error 10035`），读头/读体（`read_exact`）会随机失败、连接在请求体未读走时关闭，客户端看到的是 RST（「你的主机中的软件中止了一个已建立的连接」）。
   2. **绝不能在引擎生成期间向上游发 FIN（半关）**。上游 `serve/server.py:4127-4150 _watch_client` 每 0.5 s `select` + `recv(1, MSG_PEEK) == b""` 就把「请求套接字读到 EOF」判成**客户端挂断**并 `cancel.set()`，而取消只在提示读取的**分块边界**生效（`server.py:317`，块大小 8192 token）：症状是「小 prompt 侥幸成功、18859 token 的 prompt 在读到第一个块边界（约 5.7 s）时被取消」，引擎日志打 `0 generated ... (cancelled)`。所以前门**不挂**「客户端 → 引擎」的转发线程（请求体已由 `read_body` 整段读完、上游是 HTTP/1.0 + `Connection: close`），只做单向 `io::copy(上游 → 客户端)`。
 - **前门服务状态要回传给前端**：`StrataStatus.proxy_serving`（正在服务的 config 文件名，`state.strata_proxy_serving` 这个 LIFO 栈 + `Serving` 守卫在 `Drop` 时摘掉并广播 `strata://status`）。卡片据此在 **DSH 请求触发加载**时显示「加载中」（`strataStarting` 只覆盖"用户在本页点启动"那条路径，用户 m01266 第 2 点）。排查连接类问题时可设环境变量 `STRATA_PROXY_DEBUG=1` 让前门把逐连接轨迹写进 `%TEMP%\strata-proxy-debug.log`（默认关闭）。
+- **归属信息（`config_path` / `model_name` / `pid` / `started_at_ms` / `port`）只能在「槽位为空」时清**（用户 m01031）：引擎从 spawn 到端口监听之间、以及 `/load` 期间（上游 HTTP 服务单线程，加载 68 GB 权重时 `/health` 会超时）探测都会判「所有端口无响应」，而**探测失败不等于引擎没了**；以前这条分支无条件清 `config_path`，清掉之后 `running` / `model_name` / `loaded` 都能靠后续探测刷新回来，**唯独 `config_path` 补不回来**（它只由「外部实例」那条路写）⇒ 卡片永远「已停止」、面板计数停在 `0/3`，而侧栏写着「引擎运行中」。现在三层都堵上了：`merge_strata_probe` 每次探测都用槽位信息覆盖归属（`lib.rs::apply_owned_status`，有单测）、「无响应」分支在 `slot_owned` 时不动归属、`spawn_monitor` 在进程退出时把归属一起清掉（否则卡片会一直转「加载中」）；前端 `StrataPanel.tsx::runningEntry` 在 `config_path` 缺失时退回按 `/health` 的模型名认，并把「槽位里有引擎、端口还没应答」显示成「加载中」。
 
 ---
 
@@ -386,7 +387,7 @@ dev 构建（`tauri dev` / `cargo test`）**永远**用 `%APPDATA%` —— 否�
 2. ~~**模型列表每张卡片重复解析 `presetText`**（大列表时的性能点）。~~ ✅ 已修：`ModelCard` 改为 `memo`，父组件用一次 `useMemo` 算出 `webuiDisabledSections(presetText)`（`CODE_REVIEW.md` §1.2 的 M24）。
 3. **原路径 exe 的图标**：二进制已是新图标（复制成别的名字能正常显示），只是 Windows 按路径缓存；需要时按 §5.5 处理。
 4. `tmp/` 有 100+ 个验证产物，可随时清理，但请保留 §6.1 列出的那些。
-5. **Strata 引擎在显存耗尽后会卡死，不是 GUI 的 bug**（2026-10-11 实测，用户 m01266 排查副产品）：反复打大 prompt 之后 `/status` 长挂 `phase=reading the prompt`/`thinking`、`elapsed_s` 一直涨、`tokens_per_s` 掉到个位数，此后**所有**请求（连 `curl` **直连引擎端口**绕开前门也一样）要么空回复、要么只收到 236–428 B 就被断开。引擎日志自己给了原因与建议：`0 MiB of VRAM free with everything loaded - LOW: requests may stall; add --vram-reserve-mib 512 to the config's args (or lower --max-context)`（本机 12227 MiB 卡、权重约 40 GiB）。处置：杀掉 python 进程树后前门会在下一个请求冷启动新引擎；根治要在 config 的 `args` 里加 `--vram-reserve-mib 512`（GUI 不替用户写 args 类参数，需用户决定）。
+5. **Strata 引擎在显存耗尽后会卡死，不是 GUI 的 bug**（2026-10-11 实测，用户 m01266 排查副产品）：反复打大 prompt 之后 `/status` 长挂 `phase=reading the prompt`/`thinking`、`elapsed_s` 一直涨、`tokens_per_s` 掉到个位数，此后**所有**请求（连 `curl` **直连引擎端口**绕开前门也一样）要么空回复、要么只收到 236–428 B 就被断开。引擎日志自己给了原因与建议：`0 MiB of VRAM free with everything loaded - LOW: requests may stall; add --vram-reserve-mib 512 to the config's args (or lower --max-context)`（本机 12227 MiB 卡、权重约 40 GiB）。处置：杀掉 python 进程树后前门会在下一个请求冷启动新引擎；根治要在 config 的 `args` 里加 `--vram-reserve-mib`（按引擎自报值，GUI 不替用户写 args 类参数，需用户决定）。**2026-10-11 用户定稿：三份 config 统一 `--kv-resident 30720`，`--vram-reserve-mib` 两份 512、`swift-1.5-iq3_xxs` 不传（引擎默认 700 MiB）；实测 3909 / 3918 / 2770 槽，三份都不再报 LOW（IQ3_XXS 每槽约 2.2 MiB，明显大于 IQ2 系列的 1.376 MiB）。手改 config 删这个参数必须连值一起删 —— 只删 flag 会变成 `--vision 782`，引擎打印用法后直接退出（前门连试 3 次全失败）。完整显存账与杠杆见 `STRATA_INTEGRATION_PLAN.md` §22.10。**
 
 ---
 

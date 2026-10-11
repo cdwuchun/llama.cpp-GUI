@@ -517,16 +517,27 @@ async fn strata_probe(app: AppHandle, state: State<'_, AppState>) -> Result<stra
     // 所有已知端口都无响应。GUI 没有启动这个实例，端口探测就是判断它是否在跑的
     // **唯一依据**，所以这里必须落回未运行：沿用状态快照会让用户在 Strata 控制台
     // 关掉模型之后，GUI 侧栏永远显示「运行中」。
+    // 槽位里还握着进程（GUI 自己拉起的实例）时，只清「跑没跑、加载没加载」这类探测字段，
+    // **绝不动归属信息**：引擎从启动到端口监听之间有一段空窗（68 GB 权重在加载，几分钟），
+    // 这段空窗里只要清掉 config_path，卡片就再也认不出在跑的是哪份 config —— 实测面板
+    // 计数停在 0/3、卡片全「已停止」，而侧栏明明写着「引擎运行中」（用户 m01031）。
+    let slot_owned = state
+        .strata_slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
     let mut guard = state
         .strata_status
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     guard.running = false;
     guard.external = false;
-    guard.pid = None;
-    guard.config_path = None;
-    guard.model_name = None;
-    guard.started_at_ms = None;
+    if !slot_owned {
+        guard.pid = None;
+        guard.config_path = None;
+        guard.model_name = None;
+        guard.started_at_ms = None;
+    }
     guard.last_error = None;
     guard.version = None;
     guard.live_max_context = None;
@@ -605,6 +616,27 @@ fn probe_strata_ports(
     None
 }
 
+/// 把「GUI 槽位里的实例」的归属信息写回状态快照（纯函数，便于单测）。
+///
+/// 槽位是「本进程起的引擎」的唯一权威记录：只要它在，快照里的 config 路径 / 模型名 /
+/// 端口 / 启动时间就必须和它一致，否则卡片认不出在跑的是哪一份 config。探测只认端口，
+/// 引擎启动期的空窗会把 `config_path` 清掉一次，之后再怎么探测也补不回来（用户 m01031）。
+fn apply_owned_status(
+    status: &mut strata::StrataStatus,
+    owned: Option<(u16, PathBuf, String, u64)>,
+) {
+    let Some((port, config_path, model_name, started_at_ms)) = owned else {
+        return;
+    };
+    status.port = port;
+    status.config_path = Some(config_path);
+    if !model_name.is_empty() {
+        status.model_name = Some(model_name);
+    }
+    status.started_at_ms = Some(started_at_ms);
+    status.external = false;
+}
+
 /// 把一次探测结果并入状态快照。
 ///
 /// `external=true` 表示命中的实例不是 GUI 启动的（GUI 无法启停它）；
@@ -615,6 +647,13 @@ fn merge_strata_probe(
     external_hit: Option<(u16, Option<PathBuf>, Option<String>)>,
     external: bool,
 ) -> strata::StrataStatus {
+    // 槽位信息先取（顺序固定：先槽位、后状态，避免和 `strata_start_engine` 交叉持锁）
+    let owned_from_slot = state
+        .strata_slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|p| (p.port, p.config_path.clone(), p.model_name.clone(), p.started_at_ms));
     let mut guard = state.strata_status.lock().unwrap_or_else(|e| e.into_inner());
     guard.running = fresh.running;
     guard.version = fresh.version.clone();
@@ -640,6 +679,9 @@ fn merge_strata_probe(
             guard.model_name = model_name;
         }
     }
+    // GUI 自己拉起的实例：归属以槽位为准（自愈）。探测恢复后这一步就能把被清掉的
+    // config_path 补回来，卡片随之回到「运行中」。
+    apply_owned_status(&mut guard, owned_from_slot);
     guard.clone()
 }
 
@@ -1735,5 +1777,39 @@ mod tests {
         let empty = attribute_strata_hit(9090, None, &configs, guessed).unwrap();
         assert_eq!(empty.2.as_deref(), Some("swift-iq3_xxs"));
         assert_eq!(empty.0, 9090);
+    }
+
+    /// 槽位里的实例必须把归属信息补回快照（用户 m01031：卡片认不出在跑的是哪个模型）。
+    #[test]
+    fn slot_owned_instance_restores_ownership_fields() {
+        let mut st = strata::StrataStatus::default();
+        st.running = true;
+        st.port = 9090;
+        st.model_name = Some("探测出来的名字".into());
+
+        apply_owned_status(
+            &mut st,
+            Some((
+                9091,
+                PathBuf::from(r"E:\AI\Strata\strata-sc117-swift-iq2-xs.json"),
+                "sc117-swift-iq2-xs".to_string(),
+                1_700_000_000_000,
+            )),
+        );
+        assert_eq!(st.port, 9091);
+        assert_eq!(
+            st.config_path,
+            Some(PathBuf::from(r"E:\AI\Strata\strata-sc117-swift-iq2-xs.json"))
+        );
+        assert_eq!(st.model_name.as_deref(), Some("sc117-swift-iq2-xs"));
+        assert_eq!(st.started_at_ms, Some(1_700_000_000_000));
+        assert!(!st.external);
+
+        // 槽位空着（外部实例 / 进程已退出）：一个字都不改，交给探测结果
+        let before = st.clone();
+        apply_owned_status(&mut st, None);
+        assert_eq!(st.config_path, before.config_path);
+        assert_eq!(st.port, before.port);
+        assert_eq!(st.model_name, before.model_name);
     }
 }
