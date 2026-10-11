@@ -10,7 +10,8 @@
  * - 路径/端口/密钥全部从 config 现读，GUI 零硬编码（R2）
  * - 版本从运行时端点读，不缓存（R3）
  * - 能力探测不假设端点存在，读不到显示「未知/—」（R4）
- * - GUI 只写 config 的 `args`；顺序与未收录参数原样保留（R6）
+ * - GUI 只写 config 的 `args` 与表单认识的顶层字段（`vision.*` / `open_browser` / `sampling.*`）；
+ *   顺序与未收录参数原样保留（R6）
  * - 安装目录在「设置」页，本页不出现（m01301 需求 4）
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -26,6 +27,7 @@ import {
   stateToConfig,
   strataParamSchema,
   STRATA_INSTALL_FACT_FLAGS,
+  validateStrataSampling,
 } from "../utils/strataParams";
 import { fmtSize } from "../utils/models";
 import { getModelIcon } from "../utils/modelIcon";
@@ -151,6 +153,7 @@ function ConfigCard({
   isRunning,
   isLoading,
   engineHere,
+  runningElsewhere,
   mutex,
   grid,
   busy,
@@ -166,6 +169,8 @@ function ConfigCard({
   isLoading: boolean;
   /** 引擎进程在跑这个 config，但模型未加载（胶囊启了引擎、模型还没拉起） */
   engineHere: boolean;
+  /** 同端口上正在跑的是**另一个** config 的模型：Strata 互斥，启动时会先停掉它 */
+  runningElsewhere: string | null;
   mutex: boolean;
   grid: boolean;
   busy: boolean;
@@ -277,7 +282,9 @@ function ConfigCard({
               ? "加载这个模型（显存互斥已开：会先卸载 router 正在运行的模型）"
               : engineHere
                 ? "加载这个模型"
-                : "启动引擎并加载这个模型"
+                : runningElsewhere
+                  ? `启动并加载这个模型（Strata 互斥：会先停止正在运行的 ${runningElsewhere}）`
+                  : "启动引擎并加载这个模型"
         }
         onClick={onToggle}
       >
@@ -412,8 +419,16 @@ function StrataConfigSheet({ entry, onClose }: { entry: StrataModelEntry; onClos
         return false;
       }
     }
+    // 采样默认值写的是 config 顶层 sampling 块，上游对坏值直接拒绝启动（server.py），
+    // 所以在写盘前先拦一次（清空不算错：那等于删掉该键、回引擎默认）
+    const samplingError = validateStrataSampling(formState);
+    if (samplingError) {
+      setFormError(samplingError);
+      return false;
+    }
     // args 只改参数表认识的 flag（顺序不变、未收录的原样保留）；
-    // 顶层只写 vision.mmproj / vision.model / vision.exe / vision.gpu / vision.max_tokens / open_browser，其余顶层键不动（R6）
+    // 顶层只写 vision.mmproj / vision.model / vision.exe / vision.gpu / vision.max_tokens / open_browser
+    // 以及 sampling.{temperature,top_p,top_k,min_p}，其余顶层键不动（R6）
     const next = stateToConfig(formConfig, formState, strataRoot);
     const ok = await writeStrataConfig(file, JSON.stringify(next, null, 1));
     setFormError(ok ? "" : "写回 config 失败，见右上角错误");
@@ -741,6 +756,8 @@ export function StrataPanel() {
   const probeStrata = useApp((s) => s.probeStrata);
   const startStrataModel = useApp((s) => s.startStrataModel);
   const stopStrataModel = useApp((s) => s.stopStrataModel);
+  const startStrataProxy = useApp((s) => s.startStrataProxy);
+  const stopStrataProxy = useApp((s) => s.stopStrataProxy);
 
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
@@ -761,6 +778,15 @@ export function StrataPanel() {
 
   const selected = settings?.strata_selected_config ?? null;
   const runningFile = status.running && status.config_path ? basename(status.config_path) : null;
+  // 多份 config 写同一个端口时，它们本来就只能有一个在跑（一个引擎 = 一份 config = 一个
+  // 端口，用户 m00001）：底部提示里说清楚，免得用户以为两个模型能同时加载。
+  const sharedPort = useMemo(() => {
+    const count = new Map<number, number>();
+    for (const e of entries) {
+      if (e.port) count.set(e.port, (count.get(e.port) ?? 0) + 1);
+    }
+    return [...count.values()].some((n) => n > 1);
+  }, [entries]);
 
   const shown = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -868,6 +894,24 @@ export function StrataPanel() {
           >
             <i className={`fas ${grid ? "fa-list" : "fa-th-large"}`} />
           </button>
+          {/* 代理（前门）：DSH 等客户端连它，它按请求里的 model 自动切换引擎（用户 m00798 / m01151） */}
+          <button
+            type="button"
+            className="btn btn-secondary"
+            style={{ flexShrink: 0 }}
+            title={
+              status.proxy
+                ? `代理正在监听 :${status.proxy_port ?? 9090}（DSH 连这里）· 点击停止`
+                : "启动代理（默认 :9090）：一个端口挂全部 config，按请求里的 model 自动切换引擎 —— DSH 连它"
+            }
+            disabled={busy}
+            onClick={() => void (status.proxy ? stopStrataProxy() : startStrataProxy())}
+          >
+            <i className={`fas ${status.proxy ? "fa-door-open" : "fa-door-closed"}`} />
+            <span style={{ marginLeft: "0.35rem" }}>
+              {status.proxy ? `代理 :${status.proxy_port ?? 9090}` : "启动代理"}
+            </span>
+          </button>
           <button
             type="button"
             className="btn btn-secondary"
@@ -919,7 +963,16 @@ export function StrataPanel() {
                   isSelected={selected === fileOf(e)}
                   isRunning={runningFile === fileOf(e) && !!status.loaded}
                   engineHere={runningFile === fileOf(e) && !status.loaded}
-                  isLoading={starting === fileOf(e)}
+                  runningElsewhere={
+                    runningFile && runningFile !== fileOf(e) ? status.model_name || runningFile : null
+                  }
+                  // 「加载中」有两来路：用户在本页点了启动（`strataStarting`，纯前端状态），
+                  // 或**前门**正拿着 DSH 的请求在起引擎/加载模型（`proxy_serving` + 尚未
+                  // `loaded`，用户 m01266 第 2 点）。后者以前什么都不显示，加载完直接跳「运行中」。
+                  isLoading={
+                    starting === fileOf(e) ||
+                    (status.proxy_serving === fileOf(e) && !status.loaded)
+                  }
                   mutex={!!settings?.strata_router_mutex}
                   grid={grid}
                   busy={busy}
@@ -942,9 +995,13 @@ export function StrataPanel() {
 
         <div className="form-text" style={{ marginTop: "0.75rem" }}>
           {shown.length} 个 config
+          {status.proxy ? ` · 代理 :${status.proxy_port ?? 9090}（DSH 连这里）` : ""}
           {status.running
-            ? ` · 运行中 ${status.model_name || ""} · :${status.port}${status.version ? ` · ${status.version}` : ""}`
-            : " · Strata 未运行，用卡片上的启动按钮启动"}
+            ? ` · 引擎运行中 ${status.model_name || ""} · :${status.port}${status.version ? ` · ${status.version}` : ""}`
+            : status.proxy
+              ? " · 引擎未起，首次请求时自动启动并加载模型"
+              : " · Strata 未运行，用卡片上的启动按钮启动，或点上方「启动代理」让 DSH 直连"}
+          {sharedPort && " · 多份 config 共用同一端口，同时只能跑一个（启动会先停掉正在跑的那个）"}
           {ctxMismatch && " · config 与运行时上下文不一致，重启才生效"}
         </div>
       </div>

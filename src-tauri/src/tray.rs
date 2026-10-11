@@ -145,9 +145,13 @@ fn router_slot_busy<R: Runtime>(app: &AppHandle<R>) -> bool {
         .unwrap_or(false)
 }
 
+/// 「Strata 在跑」：引擎槽位里有进程，**或**前门代理在监听。
+///
+/// 前门开着就算在跑（它占着 9090 这个对外端口），只看引擎槽位会让
+/// "前门已开、模型还没加载"的状态被当成未运行。
 fn strata_slot_busy<R: Runtime>(app: &AppHandle<R>) -> bool {
     app.try_state::<AppState>()
-        .map(|state| state.strata_slot.lock().unwrap_or_else(|e| e.into_inner()).is_some())
+        .map(|state| crate::strata_busy(&state))
         .unwrap_or(false)
 }
 
@@ -187,6 +191,9 @@ fn quit<R: Runtime>(app: &AppHandle<R>) {
         if had_process && crate::strata::stop_strata(&state.strata_slot).is_none() {
             eprintln!("[tray] 退出时停止 Strata 失败：slot 已被清空但进程可能仍在");
         }
+        // 前门代理也要摘掉：它的监听线程是 GUI 进程内的，句柄不 drop 就走不到释放
+        // （虽然进程退出会一起带走，但这里显式关掉，退出路径才对得上）。
+        crate::strata_proxy::shutdown(&state);
     }
     app.exit(0);
 }

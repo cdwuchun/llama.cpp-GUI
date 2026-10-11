@@ -41,8 +41,9 @@ export const STRATA_INSTALL_FACT_FLAGS = [
 const GROUPS = [
   { id: "ctx", label: "上下文与 KV", order: 1, collapsed: false },
   { id: "speed", label: "加速与缓存", order: 2, collapsed: false },
-  { id: "vision", label: "多模态", order: 3, collapsed: false },
-  { id: "serve", label: "其它", order: 4, collapsed: true },
+  { id: "sampling", label: "采样", order: 3, collapsed: false },
+  { id: "vision", label: "多模态", order: 4, collapsed: false },
+  { id: "serve", label: "其它", order: 5, collapsed: true },
 ];
 
 /** 表单认识的参数（取值域摘自 `strata.exe --help`） */
@@ -346,6 +347,66 @@ const PARAM_META: Omit<ParamDef, "abbr" | "delimiter" | "mergeInto" | "mergeValu
     sort: 3,
     defaultEnabled: false,
   },
+  {
+    // 哨兵 flag：config 顶层 sampling.temperature（不是 CLI flag）
+    key: "sampling-temperature",
+    flag: "--sampling-temperature",
+    type: "FLOAT",
+    uiType: null,
+    default: "1.0",
+    values: [],
+    label: "温度",
+    desc: "采样默认值（config 顶层 sampling.temperature）：请求自己没带 temperature 时用它，0 = greedy。请求自带的字段永远优先；整块 sampling 缺失时，不带采样字段的请求按 greedy 解码。上游只接受 ≥ 0 的数字，坏值会让服务器拒绝启动。清空 = 删掉该键（回引擎默认）。改完要重启引擎才生效。",
+    group: "sampling",
+    order: 1,
+    sort: 1,
+    defaultEnabled: false,
+  },
+  {
+    // 哨兵 flag：config 顶层 sampling.top_p
+    key: "sampling-top-p",
+    flag: "--sampling-top-p",
+    type: "FLOAT",
+    uiType: null,
+    default: "0.95",
+    values: [],
+    label: "top_p",
+    desc: "核采样阈值（config 顶层 sampling.top_p）：只从前 top_p 概率质量里采样。上游只接受 0 < top_p ≤ 1，坏值会让服务器拒绝启动。请求自带的字段优先，清空 = 删掉该键。改完要重启引擎才生效。",
+    group: "sampling",
+    order: 2,
+    sort: 2,
+    defaultEnabled: false,
+  },
+  {
+    // 哨兵 flag：config 顶层 sampling.top_k
+    key: "sampling-top-k",
+    flag: "--sampling-top-k",
+    type: "INTEGER",
+    uiType: null,
+    default: "20",
+    values: [],
+    label: "top_k",
+    desc: "每步只保留概率最高的 k 个候选（config 顶层 sampling.top_k）。上游只接受 1..64 的整数，超出范围会直接拒绝启动。与「加速与缓存」里的 --spec-min-p 无关（那个管推测解码的草稿阈值）。请求自带的字段优先，清空 = 删掉该键。改完要重启引擎才生效。",
+    group: "sampling",
+    order: 3,
+    sort: 3,
+    defaultEnabled: false,
+  },
+  {
+    // 哨兵 flag：config 顶层 sampling.min_p
+    key: "sampling-min-p",
+    flag: "--sampling-min-p",
+    type: "FLOAT",
+    uiType: null,
+    default: "0.0",
+    values: [],
+    label: "min_p",
+    desc: "最小概率阈值（config 顶层 sampling.min_p）：相对最高概率低于该比例的候选直接丢掉，0 = 不启用。上游只接受 0 ≤ min_p ≤ 1，坏值会让服务器拒绝启动。请求自带的字段优先，清空 = 删掉该键。改完要重启引擎才生效。",
+    group: "sampling",
+    order: 4,
+    sort: 4,
+    defaultEnabled: false,
+  },
 ];
 
 /** 表单 schema（供 `ParamForm` 的 `schema` prop 使用） */
@@ -367,11 +428,101 @@ const FLAG_TO_KEY = new Map<string, string>(
 export const STRATA_KNOWN_FLAGS = new Set(FLAG_TO_KEY.keys());
 
 /**
- * 顶层字段类参数：它们不是 CLI flag，值存在 config 顶层（`vision.*` / `open_browser`），
- * 进 schema 只是为了复用 `ParamForm` 的分组渲染。**写回时绝不进 args** ——
+ * 顶层字段类参数：它们不是 CLI flag，值存在 config 顶层（`vision.*` / `open_browser` /
+ * `sampling.*`），进 schema 只是为了复用 `ParamForm` 的分组渲染。**写回时绝不进 args** ——
  * 上游引擎不认识这些 flag，塞进去会让引擎启动失败。
  */
-const TOP_LEVEL_KEYS = new Set(["vision-mmproj", "vision-gpu", "vision-max-tokens", "open-browser"]);
+const TOP_LEVEL_KEYS = new Set([
+  "vision-mmproj",
+  "vision-gpu",
+  "vision-max-tokens",
+  "open-browser",
+  "sampling-temperature",
+  "sampling-top-p",
+  "sampling-top-k",
+  "sampling-min-p",
+]);
+
+/** 表单 key → config 顶层 `sampling` 里的键名，以及上游 `server.py` 的取值域 */
+const SAMPLING_KEYS: {
+  key: string;
+  cfgKey: string;
+  label: string;
+  /** 整数型：写回时 Math.trunc */
+  int?: boolean;
+  /** 取值域的中文说法（直接进报错文案） */
+  range: string;
+  check: (n: number) => boolean;
+}[] = [
+  {
+    key: "sampling-temperature",
+    cfgKey: "temperature",
+    label: "温度",
+    range: "数字且 ≥ 0（0 = greedy）",
+    check: (n) => n >= 0,
+  },
+  {
+    key: "sampling-top-p",
+    cfgKey: "top_p",
+    label: "top_p",
+    range: "0 < top_p ≤ 1",
+    check: (n) => n > 0 && n <= 1,
+  },
+  {
+    key: "sampling-top-k",
+    cfgKey: "top_k",
+    label: "top_k",
+    int: true,
+    range: "1..64 的整数",
+    check: (n) => Number.isInteger(n) && n >= 1 && n <= 64,
+  },
+  {
+    key: "sampling-min-p",
+    cfgKey: "min_p",
+    label: "min_p",
+    range: "0 ≤ min_p ≤ 1",
+    check: (n) => n >= 0 && n <= 1,
+  },
+];
+
+/**
+ * 采样值在参数表里的显示文本。
+ *
+ * config 里存的是 JSON 数字，`String(1.0)` 得到 `"1"`、`String(0)` 得到 `"0"` ——
+ * 直接显示会让人以为小数点后的 0 被抹掉了。浮点键补足一位小数（1 → `1.0`、0 → `0.0`），
+ * 整数键（top_k）按整数显示。**只影响显示**：写回时仍是 JSON 数字。
+ */
+function samplingText(s: (typeof SAMPLING_KEYS)[number], v: unknown): string {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return String(v);
+  if (s.int) return String(Math.trunc(n));
+  return Number.isInteger(n) ? n.toFixed(1) : String(n);
+}
+
+const PARAM_DEFAULT = new Map(strataParamSchema.params.map((p) => [p.key, p.default]));
+
+/**
+ * 采样默认值的保存前校验。
+ *
+ * 上游 `server.py::sampling_defaults_from_config` 对 `sampling` 块的坏值是**直接退出服务器**
+ * （`expected a number >= 0 (0 = greedy)` / `the sampled path takes an integer 1..64`）,
+ * 所以这里必须在写盘之前拦住 —— 否则用户能靠一个数字把引擎变成起不来的状态。
+ *
+ * 返回错误文案；`null` = 通过。清空不算错误：那是上游 WebUI 的「空字段 = 删掉该键、回默认」。
+ */
+export function validateStrataSampling(state: Record<string, ParamState>): string | null {
+  for (const s of SAMPLING_KEYS) {
+    const st = state[s.key];
+    if (!st?.enabled) continue;
+    const raw = st.value.trim();
+    if (raw === "") continue;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || !s.check(n)) {
+      return `采样参数「${s.label}」的取值 "${raw}" 不合法：上游要求 ${s.range}，否则 Strata 启动时会直接退出`;
+    }
+  }
+  return null;
+}
 
 /**
  * token 是不是一个 flag（而不是某个 flag 的取值）—— 实现在 `utils/extraParams.ts`。
@@ -471,7 +622,7 @@ export function installFactFlags(args: unknown[]): string[] {
 }
 
 /**
- * config → 表单状态：args 走 `argsToState`，再灌入顶层字段（`vision.*` / `open_browser`）。
+ * config → 表单状态：args 走 `argsToState`，再灌入顶层字段（`vision.*` / `open_browser` / `sampling.*`）。
  *
  * 弹窗展示的是「这个 config 的完整启动配置」，顶层字段与 args 一样是启动事实。
  */
@@ -489,6 +640,18 @@ export function configToState(cfg: Record<string, unknown>): Record<string, Para
   const mt = vision?.max_tokens;
   state["vision-max-tokens"] = { enabled: mt != null, value: mt != null ? String(mt) : "768" };
   state["open-browser"] = { enabled: !!cfg.open_browser, value: cfg.open_browser ? "true" : "false" };
+  // 采样默认值：整块缺省 = 没写；某个键缺省 = 未启用，界面显示 schema 里的默认值当占位
+  const sampling =
+    cfg.sampling && typeof cfg.sampling === "object"
+      ? (cfg.sampling as Record<string, unknown>)
+      : undefined;
+  for (const s of SAMPLING_KEYS) {
+    const v = sampling?.[s.cfgKey];
+    state[s.key] = {
+      enabled: v != null,
+      value: v != null ? samplingText(s, v) : (PARAM_DEFAULT.get(s.key) ?? ""),
+    };
+  }
   return state;
 }
 
@@ -497,7 +660,8 @@ export function configToState(cfg: Record<string, unknown>): Record<string, Para
  *
  * args 走 `stateToArgs`（只动认识的 flag、保顺序、顶层字段永不进 args）；
  * 顶层只写表单认识的键 —— `vision.mmproj` / `vision.model` / `vision.exe` /
- * `vision.gpu` / `vision.max_tokens` / `open_browser`，其余键原样保留。
+ * `vision.gpu` / `vision.max_tokens` / `open_browser` / `sampling.{temperature,top_p,top_k,min_p}`，
+ * 其余键原样保留（`sampling` 块里 GUI 不认识的键也不动）。
  *
  * `vision.model` 是主模型，不由用户在这里选：GUI 从启动参数里的 `--model` 同步过来
  * （上游 `server.py` 把 exe/mmproj/model 三键都当必需键）。
@@ -512,6 +676,28 @@ export function stateToConfig(
 ): Record<string, unknown> {
   const args = Array.isArray(cfg.args) ? (cfg.args as unknown[]) : [];
   const next: Record<string, unknown> = { ...cfg, args: stateToArgs(args, state) };
+
+  // 采样默认值：写回 config 顶层 sampling 块。GUI 不认识的键原样保留
+  // （上游 0.1.39+ 往里放过实验开关键，例如 experimental_speed_projection）；
+  // 四个已知键按表单勾选增删 —— 未勾选或清空 = 删掉该键（上游 WebUI 的「空 = 回默认」）。
+  const prevSampling =
+    cfg.sampling && typeof cfg.sampling === "object"
+      ? { ...(cfg.sampling as Record<string, unknown>) }
+      : {};
+  const sampling: Record<string, unknown> = { ...prevSampling };
+  for (const s of SAMPLING_KEYS) {
+    const st = state[s.key];
+    const raw = st?.enabled ? st.value.trim() : "";
+    const n = raw === "" ? NaN : Number(raw);
+    // 坏值由 validateStrataSampling 在保存前拦下，这里只保证不写出坏值
+    if (raw !== "" && Number.isFinite(n) && s.check(n)) {
+      sampling[s.cfgKey] = s.int ? Math.trunc(n) : n;
+    } else {
+      delete sampling[s.cfgKey];
+    }
+  }
+  if (Object.keys(sampling).length > 0) next.sampling = sampling;
+  else delete next.sampling;
 
   const prevVision =
     cfg.vision && typeof cfg.vision === "object"

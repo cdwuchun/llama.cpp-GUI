@@ -27,6 +27,21 @@ pub struct AppState {
     pub strata_slot: Arc<Mutex<Option<StrataProcess>>>,
     /// Strata 状态快照（供 `strata_status` 直接返回）。
     pub strata_status: Arc<Mutex<StrataStatus>>,
+    /// Strata **前门代理**监听句柄（`None` = 没开；用户 m00798）。
+    ///
+    /// 一个端口（默认 9090）后面挂全部 config，按请求里的 `model` 决定转发给哪个引擎。
+    /// 句柄一 drop，监听端口随之释放，所以它必须活到进程退出。
+    pub strata_proxy: Arc<Mutex<Option<crate::strata_proxy::ProxyHandle>>>,
+    /// 引擎切换互斥：并发请求要不同模型时串行化「停旧 + 起新」。
+    ///
+    /// 不加这把锁，两个请求会同时走「停掉旧引擎 → 等端口释放 → 起新引擎」，
+    /// 第二个会因为端口还没让出来而启动失败（`spawn_strata` 的占用检查）。
+    pub strata_switch: Mutex<()>,
+    /// 前门**正在服务**的 config 文件名（LIFO 栈，空 = 空闲）。
+    ///
+    /// 用户 m01266 第 2 点：DSH 请求触发引擎启动/加载时，卡片要显示「加载中」而不是
+    /// 「已停止 → 直接跳到运行中」。前门自己在服务谁，它是唯一知情者，所以在这里登记。
+    pub strata_proxy_serving: Arc<Mutex<Vec<String>>>,
     /// 应用配置目录。
     pub config_dir: PathBuf,
     /// 模型扫描结果缓存（磁盘遍历较慢，避免每次刷新都重扫）。
@@ -152,6 +167,9 @@ impl AppState {
             })),
             strata_slot: Arc::new(Mutex::new(None)),
             strata_status: Arc::new(Mutex::new(StrataStatus::default())),
+            strata_proxy: Arc::new(Mutex::new(None)),
+            strata_switch: Mutex::new(()),
+            strata_proxy_serving: Arc::new(Mutex::new(Vec::new())),
             config_dir,
             scan_cache: Mutex::new(None),
             window_size: Mutex::new(initial_window),

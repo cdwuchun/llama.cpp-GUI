@@ -15,6 +15,12 @@ import {
   paramSchemaReady,
   paramStateToEntries,
 } from "../src/utils/paramSchema";
+import {
+  configToState,
+  stateToConfig,
+  strataParamSchema,
+  validateStrataSampling,
+} from "../src/utils/strataParams";
 
 function render(label: string, current: Record<string, string>): void {
   const state = initParamState(current);
@@ -53,5 +59,86 @@ const ctx = entries.find(([k]) => k === "ctx-size");
 const others = entries.filter(([k, v]) => k !== "ctx-size" && v === "");
 if (ctx?.[1] !== "4096") throw new Error(`ctx-size 未按预期回填: ${JSON.stringify(ctx)}`);
 console.log(`  表单→preset: 启用 1 项，其余 ${others.length} 项为空（将被删除）`);
+
+/**
+ * Strata 参数表（第二运行时通道）：顶层字段的读写往返。
+ *
+ * 这里盯的是三件容易写坏的事：哨兵 flag 绝不能混进 `args`（引擎不认识就起不来）、
+ * `sampling` 块里 GUI 不认识的键要原样保留、坏值必须在写盘前被拦下
+ * （上游 `server.py` 遇到坏值直接退出服务器）。
+ */
+console.log("Strata 参数表:");
+{
+  const cfg = {
+    exe: "E:\\AI\\Strata\\engine\\strata.exe",
+    args: ["--model", "m.gguf", "--max-context", "204800"],
+    sampling: {
+      temperature: 1.0,
+      top_p: 0.95,
+      top_k: 20,
+      min_p: 0,
+      experimental_speed_projection: false,
+    },
+  };
+  const state = configToState(cfg);
+  const html = renderToStaticMarkup(
+    <ParamForm state={state} onChange={() => {}} schema={strataParamSchema} />,
+  );
+  for (const label of ["采样", "温度", "top_p", "top_k", "min_p"]) {
+    if (!html.includes(label)) throw new Error(`strata 参数表未渲染「${label}」`);
+  }
+  if (state["sampling-top-k"]?.value !== "20") {
+    throw new Error(`top_k 未回填: ${JSON.stringify(state["sampling-top-k"])}`);
+  }
+  // JSON 数字会丢掉小数点后的 0（1.0 → 1、0 → 0），参数表必须补回来，否则用户以为精度被改了
+  if (state["sampling-temperature"]?.value !== "1.0" || state["sampling-top-p"]?.value !== "0.95") {
+    throw new Error(
+      `浮点采样值应保留小数点: ${JSON.stringify([
+        state["sampling-temperature"],
+        state["sampling-top-p"],
+      ])}`,
+    );
+  }
+  if (!state["sampling-min-p"]?.enabled || state["sampling-min-p"]?.value !== "0.0") {
+    throw new Error(
+      `min_p=0 是有效值，应视为已启用并显示为 0.0: ${JSON.stringify(state["sampling-min-p"])}`,
+    );
+  }
+  // 参数表里真正显示出来的文本（input 的 value 属性，SSR 会写进 HTML）
+  for (const shown of ['value="1.0"', 'value="0.95"', 'value="0.0"']) {
+    if (!html.includes(shown)) throw new Error(`参数表里没有显示出 ${shown}`);
+  }
+
+  const nextState = {
+    ...state,
+    "sampling-temperature": { enabled: true, value: "0.3" },
+    "sampling-top-p": { enabled: true, value: "0.5" },
+    "sampling-top-k": { enabled: false, value: "20" },
+  };
+  const next = stateToConfig(cfg, nextState);
+  const sampling = next.sampling as Record<string, unknown>;
+  if (sampling.temperature !== 0.3 || sampling.top_p !== 0.5) {
+    throw new Error(`采样写回不对: ${JSON.stringify(sampling)}`);
+  }
+  if ("top_k" in sampling) throw new Error("取消勾选后 top_k 应被删掉");
+  if (sampling.min_p !== 0) throw new Error(`min_p 应保持数字 0: ${JSON.stringify(sampling.min_p)}`);
+  if (sampling.experimental_speed_projection !== false) {
+    throw new Error("sampling 块里 GUI 不认识的键应原样保留");
+  }
+  const args = next.args as unknown[];
+  if (args.some((t) => String(t).startsWith("--sampling"))) {
+    throw new Error(`采样哨兵 flag 混进了 args: ${JSON.stringify(args)}`);
+  }
+  if (args.join(" ") !== cfg.args.join(" ")) throw new Error("args 不应被采样参数改动");
+
+  // 坏值必须在写盘前拦住，否则用户能靠一个数字把引擎变成起不来的状态
+  const badK = validateStrataSampling({ ...state, "sampling-top-k": { enabled: true, value: "100" } });
+  if (!badK) throw new Error("top_k=100 应被拦下");
+  const badP = validateStrataSampling({ ...state, "sampling-top-p": { enabled: true, value: "1.5" } });
+  if (!badP) throw new Error("top_p=1.5 应被拦下");
+  const empty = validateStrataSampling({ ...state, "sampling-top-p": { enabled: true, value: "" } });
+  if (empty) throw new Error(`清空应该是合法的（= 删掉该键、回默认）: ${empty}`);
+  console.log(`  采样往返 OK（坏值拦截: ${badK.slice(0, 24)}…）`);
+}
 
 console.log("全部通过 ✅");

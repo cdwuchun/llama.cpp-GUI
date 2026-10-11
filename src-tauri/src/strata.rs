@@ -112,6 +112,20 @@ pub struct StrataStatus {
     /// 运行中的实例**不是本 GUI 启动的**（用户自己跑了 `run-<model>.bat` 等）。
     /// GUI 无法启停它，前端要据此禁用启停按钮并给出说明。
     pub external: bool,
+    /// 前门代理是否在监听（用户 m00798）。
+    ///
+    /// 前门与引擎放在同一个快照里：前端胶囊、设置页、托盘都只读一处，也不用多开一路轮询。
+    #[serde(default)]
+    pub proxy: bool,
+    /// 前门端口 —— **DSH 等客户端该连的就是它**（引擎端口只给 GUI 自己用）。
+    #[serde(default)]
+    pub proxy_port: Option<u16>,
+    /// 前门当前正在服务的 config 文件名（`None` = 前门空闲或没开；用户 m01266 第 2 点）。
+    ///
+    /// 卡片据此显示「加载中」：请求是 DSH 发来的，GUI 的 `strataStarting` 只覆盖
+    /// 「用户在本页点了启动」那条路径，所以必须由前门自己登记。
+    #[serde(default)]
+    pub proxy_serving: Option<String>,
 }
 
 impl Default for StrataStatus {
@@ -132,6 +146,9 @@ impl Default for StrataStatus {
             max_tokens: None,
             models_autoload: None,
             external: false,
+            proxy: false,
+            proxy_port: None,
+            proxy_serving: None,
         }
     }
 }
@@ -492,8 +509,16 @@ pub fn spawn_strata(
     // 静默换端口 —— Strata 的 WebUI 与 config 都记着这个端口，换了对上，
     // 所以这里直接拒绝，让用户先停掉占用者（GUI 会显示占用来源）。
     if winfix::port_in_use(port) {
+        // 同端口互斥（用户 m00001）：先探一下看清占用者是谁，报错里点名，
+        // 用户才知道该去停哪个模型 —— 否则两个 9090 的 config 只能靠猜。
+        let occupant = probe(port, api_key.as_deref());
+        let who = occupant
+            .model_name
+            .or(occupant.last_error)
+            .map(|s| format!("（{s}）"))
+            .unwrap_or_default();
         anyhow::bail!(
-            "端口 {port} 已被占用。Strata 的 config 与 WebUI 都绑定这个端口，不能自动顺延，请先停止占用者。",
+            "端口 {port} 已被占用{who}。Strata 的 config 与 WebUI 都绑定这个端口，不能自动顺延，请先停止占用者。",
         );
     }
 
@@ -505,6 +530,22 @@ pub fn spawn_strata(
         Some(cmd) => cmd,
         None => fallback_command(&root, &entry.config_path, port),
     };
+
+    // run 脚本里的 `--port` 才是引擎真正绑定的端口：`server.py` 只认 CLI 参数
+    // （`cfg["port"]` 没有回退），config 里的 `port` 只是 GUI 用来找它的元数据。
+    // 两处不一致时 GUI 会一直等错端口（表现为"启动失败"并把刚起的进程杀掉），
+    // 所以在这里提前拦下，把要改的两个地方直接写进报错（用户 m00798 那种改端口只改了一处）。
+    if let Some(script) = entry.run_script.as_ref() {
+        if let Some(script_port) = arg_flag_value(&args, "--port") {
+            if script_port != port {
+                anyhow::bail!(
+                    "config 里写的端口是 {port}，但 {} 里的 --port 是 {script_port}。\
+                     引擎实际绑定的是 run 脚本里的端口，请把两处改成一致（GUI 按 config 的端口去连它）。",
+                    script.display()
+                );
+            }
+        }
+    }
 
     if !entry.engine_exists {
         anyhow::bail!(
@@ -629,8 +670,36 @@ pub fn spawn_strata(
         prompt_tokens: None,
         max_tokens: None,
         models_autoload: None,
+        // 前门状态由 `strata_proxy::apply_to` 在返回给前端前统一并进来
+        proxy: false,
+        proxy_port: None,
+        proxy_serving: None,
     };
     Ok((process, status))
+}
+
+/// 等端口真的可以再绑定。
+///
+/// `stop_strata` 只等**直接子进程**（python）退出，而监听端口的是它拉起的引擎子进程：
+/// 引擎还在关闭连接、释放显存时，`spawn_strata` 的 bind 仍会失败（"端口已被占用"）。
+/// 前门切换模型时必须先过这一关，否则第二次切换必然报错。
+pub fn wait_port_free(port: u16, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !crate::winfix::port_in_use(port) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// 取 `--flag value` 形式的参数值（用于校验 run 脚本里的 `--port`）。
+fn arg_flag_value(args: &[String], flag: &str) -> Option<u16> {
+    let index = args.iter().position(|a| a == flag)?;
+    args.get(index + 1).and_then(|v| v.trim().parse::<u16>().ok())
 }
 
 /// 停止 Strata。Strata 是单进程（引擎子进程由 server.py 管理），
@@ -732,6 +801,14 @@ pub fn probe(port: u16, api_key: Option<&str>) -> StrataStatus {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
             st.loaded = v.get("loaded").and_then(|x| x.as_bool());
             st.live_max_context = v.get("max_context").and_then(|x| x.as_u64());
+            // `/health` 报的 model 是「这个端口上到底在跑哪份 config」的权威判据。
+            // 多份 config 可以写同一个端口（用户 m00001：两个模型都写 9090），
+            // 只按端口猜归属会把实例记到错的卡片上，必须用这里报出的模型名反查。
+            st.model_name = v
+                .get("model")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
             // service 字段是「这确实是 Strata」的识别标志（R10 兼容降级判据）。
             if v.get("service").and_then(|x| x.as_str()) != Some("strata") {
                 st.last_error = Some("端口上运行的不是 Strata（/health 无 service:strata）".to_string());

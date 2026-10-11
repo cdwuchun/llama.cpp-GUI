@@ -123,6 +123,10 @@ interface AppStore {
   /** 重扫 Strata 根目录下的 config 列表 */
   refreshStrata: () => Promise<void>;
   startStrata: (configFile?: string | null) => Promise<void>;
+  /** 启动前门代理：DSH 等客户端连的端口，按请求里的 model 自动切换引擎（用户 m00798） */
+  startStrataProxy: () => Promise<void>;
+  /** 停止前门代理（引擎进程不动） */
+  stopStrataProxy: () => Promise<void>;
   /** 卡片「启动模型」：确保引擎在跑且跑的是这个 config，然后 POST /load */
   startStrataModel: (configFile?: string | null) => Promise<void>;
   /** 卡片「停止模型」：POST /unload 卸模型，引擎进程留着 */
@@ -179,6 +183,9 @@ const emptyStrataStatus: StrataStatus = {
   max_tokens: null,
   models_autoload: null,
   external: false,
+  proxy: false,
+  proxy_port: null,
+  proxy_serving: null,
 };
 
 /** 运行时状态轮询句柄（Strata 没有 SSE，用定时探测代替） */
@@ -444,12 +451,14 @@ export const useApp = create<AppStore>((set, get) => ({
         // 白白再启一次（探测轮询随后会把真实状态补上）。
         if (
           strataResult.status === "fulfilled" &&
-          !strataStatus.running &&
+          !strataStatus.proxy &&
           settings.auto_start_strata &&
-          settings.strata_root &&
-          settings.strata_selected_config
+          settings.strata_root
         ) {
-          void get().startStrata();
+          // 「打开程序就自动启动 strata」现在拉起的是**前门**（用户 m00798）：一个端口挂全部
+          // config，DSH 里选中哪个模型都能直接用；引擎由前门在首次请求时按需起，所以不必
+          // 先启引擎、也不用依赖某个选中的 config（也不再有写 config 的副作用）。
+          void get().startStrataProxy();
         }
 
         // 5) 全部就位才算初始化成功：失败时 initialized 保持 false，下次调用 init() 能重来
@@ -859,6 +868,46 @@ export const useApp = create<AppStore>((set, get) => ({
     }
   },
 
+  /** 启动前门代理（用户 m00798）：**DSH 等客户端连的端口**。
+   *
+   *  前门是"一个端口挂全部 config"：按请求里的 model 自动停旧引擎、起新引擎，
+   *  所以 DSH 里选中哪个模型都能直接用；引擎端口（各 config 的 port）只给 GUI 自己用。
+   *  只起前门不预加载模型：首次请求时才起引擎、加载模型（实测约 20–30 s，客户端超时 ≥60 s）。 */
+  async startStrataProxy() {
+    set({ busy: true, error: null, notice: null });
+    try {
+      // 显存互斥（用户 m03342）：前门会按需拉起引擎，先把 router 里占显存的模型卸掉
+      let mutexNote = "";
+      if (get().settings?.strata_router_mutex) {
+        const unloaded = await get().unloadRouterLoaded();
+        if (unloaded.length) mutexNote = `\n显存互斥：已卸载 router 的 ${unloaded.join("、")}`;
+      }
+      const status = await ipc.strataProxyStart();
+      set({ strataStatus: status });
+      get().startStrataPolling();
+      const port = status.proxy_port ?? status.port;
+      set({
+        notice: `Strata 代理已启动\nDSH 等客户端连 127.0.0.1:${port}（按请求里的 model 自动切换引擎）${mutexNote}`,
+      });
+    } catch (err) {
+      set({ error: errText(err) });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  /** 停止前门代理：引擎进程与已加载的模型都不动（下次还能接着用）。 */
+  async stopStrataProxy() {
+    set({ busy: true, error: null, notice: null });
+    try {
+      set({ strataStatus: await ipc.strataProxyStop() });
+    } catch (err) {
+      set({ error: errText(err) });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
   async startStrata(configFile) {
     // 「加载中」胶囊的判据：ipc.strataStart 是 Rust 侧等端口就绪才返回，
     // 这段调用期间就是加载窗口。记下正在启动的 config 文件名，
@@ -932,7 +981,12 @@ export const useApp = create<AppStore>((set, get) => ({
     }
   },
 
-  /** 卡片「启动模型」：确保引擎在跑且跑的是这个 config，然后加载模型 */
+  /** 卡片「启动模型」：确保引擎在跑这个 config，然后**真的把模型加载起来**。
+   *
+   *  Strata 一个引擎只服务一份 config、绑定一个端口（用户 m00001：两个模型都写 9090），
+   *  所以模型之间天然互斥 —— 切模型必须先把旧引擎卸干净：先 POST /unload（旧模型优雅
+   *  退出、上游顺手保存 learned expert profile、显存立刻释放），再杀进程树，然后起新引擎、
+   *  最后 /load。只起引擎不 /load 的话模型停在未加载态，卡片看起来仍然是「已停止」。 */
   async startStrataModel(configFile) {
     const root = get().settings?.strata_root;
     if (!root) {
@@ -956,19 +1010,36 @@ export const useApp = create<AppStore>((set, get) => ({
       await get().ensureStrataLazy(file);
       const st = get().strataStatus;
       const runningFile = st.config_path ? strataBaseName(st.config_path) : null;
+      const runningName = st.model_name || runningFile || "另一个模型";
+      const switching = st.running && runningFile !== file;
+      if (switching) {
+        // Strata 互斥（用户 m00001）：先把旧模型卸掉再停引擎，别让两份权重同时占显存。
+        // 只对 GUI 自己起的实例做 —— 外部实例（用户自己跑的 run-<model>.bat）的模型不归
+        // 本 GUI 管，卸它没道理，停它会在下面的 strataStop 里拿到点名报错。
+        if (st.loaded && !st.external && runningFile) {
+          try {
+            await ipc.strataUnloadModel(root, runningFile);
+          } catch {
+            /* 旧引擎忙或者已经退出：照旧走下面的进程树强杀 */
+          }
+        }
+        await ipc.strataStop();
+      }
       if (!st.running || runningFile !== file) {
-        // 引擎没跑，或跑的是别的模型：重启引擎（Strata 一个进程只服务一个 config）
-        if (st.running) await ipc.strataStop();
+        // 引擎没跑，或跑的是别的模型：重启引擎（一个引擎只服务一份 config）
         const status = await ipc.strataStart(file);
         set({ strataStatus: status });
         get().startStrataPolling();
         set({ settings: await ipc.settingsGet() });
-        set({ notice: `已启动 Strata 引擎（:${status.port}）${mutexNote}\n模型将在首次请求时自动加载` });
-      } else {
-        await ipc.strataLoadModel(root, file);
-        set({ notice: `已加载 Strata 模型${mutexNote}` });
-        await get().probeStrata();
       }
+      // 卡片按钮的语义是「启动并加载这个模型」：两条分支都要走到 /load，
+      // 否则引擎起来了模型还是没加载，卡片一直显示「已停止」= 看起来启动失败
+      await ipc.strataLoadModel(root, file);
+      const name = strataBaseName(file);
+      set({
+        notice: `${switching ? `已停止 ${runningName}（同端口互斥）\n` : ""}已加载 Strata 模型\n${name} · :${get().strataStatus.port}${mutexNote}`,
+      });
+      await get().probeStrata();
     } catch (err) {
       set({ error: errText(err) });
     } finally {

@@ -54,6 +54,7 @@
 | `src-tauri/src/idle.rs` | 轮询 `GET /models`（有模型在跑时 1s，全 unloaded 时 5s），把 `status.value == "sleeping"` 的模型 `POST /models/unload` | 只在 `sleep_idle_seconds > 0` 时随 router 启动；见 §2.3 |
 | `src-tauri/src/winfix.rs` | 非 ASCII 路径的 `mklink /J` 链接、端口探测、`CREATE_NO_WINDOW`、`no_throttle`（子进程脱离宿主 Job Object） | 子进程一律走 `hide_console` |
 | `src-tauri/src/strata.rs` | Strata 第二运行时通道：config 扫描 / 校验 / 原子写、引擎启停与崩溃监测、`/load`·`/unload` 转发 | 见 §2.11；方案与实现记录见 `STRATA_INTEGRATION_PLAN.md` |
+| `src-tauri/src/strata_proxy.rs` | **前门代理**：一个端口挂全部 config，按请求体里的 `model` 停旧引擎 / 起新引擎并原样转发；`/v1/models` 与「没引擎时的 `/health`」由它合成；`StrataStatus.proxy_serving` 回传给卡片显示「加载中」 | 见 §2.11 末尾「前门的两条硬约束」（Windows accept 继承非阻塞、绝不能向上游发 FIN）；用户 m00752/m00798/m01266 |
 | `src-tauri/src/state.rs` | `AppState`：进程槽、日志环形缓冲、扫描与元数据缓存、启动互斥、托盘可用标志 | 缓存的 TTL 若与前端轮询同周期，命中率≈0 |
 | `src-tauri/src/tray.rs` / `tray_icon.rs` | 托盘菜单与 RGBA 图标常量（由 `scripts/make-icons.mjs` 生成） | 托盘不直接调后端，把命令转给前端 |
 | `src/store.ts` | zustand 全局状态：设置、模型、preset、router 状态、通知 | 1224 行，业务编排几乎都在这里 |
@@ -137,7 +138,17 @@ Strata 的二进制不同名、没有 router mode、管理端点与 llama.cpp �
 - **config 写回必须「校验 → 备份 → 原子写」**，临时文件名要唯一（`strata.rs::temp_config_path`），整段写路径持 `strata_lock()`；只在 rename 那一步加锁没用。
 - **WebUI 用系统浏览器打开**（`ipc.openLocalUrl`），不内嵌 iframe —— 这样 Strata 自带界面升级时这个 GUI 不必跟着改 CSP。
 - 两条运行时的模型**显存互斥**：启动一边的模型前先卸掉另一边的（`settings.strata_router_mutex` 可关）。
+- **一个端口 = 一份 config = 一个引擎**：多份 config 写同一个端口时（本机两份都是 9090）它们天然互斥，切模型必须先 `/unload` 旧模型（上游顺手保存 learned expert profile、立刻放显存）再杀进程树，见 `store.ts::startStrataModel`（§22）。
+- **端口上跑的是哪份 config，只认 `/health` 的 `model`**：按端口猜归属会把在跑的实例记到别的卡片上（同端口多 config 时必错）。`lib.rs::attribute_strata_hit` 负责反查（有单测），报错信息一律点名模型名。
+- **卡片播放按钮 = 启动引擎 + `/load`**：只起引擎不 `/load` 的话 `/health.loaded=false`，卡片永远显示「已停止」（用户 m00001 的「模型都无法启动」就是这个）。只有侧栏「启动 Strata」胶囊是纯启引擎（强制 `lazy_load: true`）。
+- **`sampling` 是顶层字段，不是 flag**：`temperature` / `top_p` / `top_k` / `min_p` 写在 config 顶层的 `sampling` 对象里（`strataParams.ts` 的哨兵 `--sampling-*` **永不进 `args`**）。语义是「请求自己没带采样字段时的默认值」，改完要重启引擎才生效。上游对坏值**直接拒绝启动**（`temperature` ≥ 0、`top_p` 0 < v ≤ 1、`min_p` 0 ≤ v ≤ 1、`top_k` 1..64 的整数），所以保存前必须过 `validateStrataSampling`；块里 GUI 不认识的键（上游实验开关键）要原样保留。
 - 引擎与它 spawn 的子进程都加 `CREATE_BREAKAWAY_FROM_JOB`（`winfix::no_throttle`）：GUI 被后台化时，子进程若继承宿主 Job Object 会被 CPU 节流，推理速度掉到个位数 t/s；父 Job 未开 `BREAKAWAY_OK` 时必须去掉该 flag 重试（`strata.rs::spawn_strata` 里有回退）。
+- **前门代理（B 方案，用户 m00752/m00798）**：`settings.strata_host` / `strata_port`（默认 `127.0.0.1:9090`）是 GUI **进程内**的代理监听（`strata_proxy.rs`），客户端只连它，它按请求体里的 `model` 停旧引擎、起新引擎 —— 切换全程持 `state.strata_switch` 串行化，并等旧端口释放（`strata::wait_port_free`，20 s）。**引擎端口来自各 config 的 `port`，但真正被绑定的是 `run-<模型>.bat` 里的 `--port`**（上游 `server.py:5339/5559` 用 CLI 值，config 的 `port` 它根本不读），两处不一致时 `spawn_strata` 直接 bail 并说明原因。设置页的前门地址/端口**只写 GUI 设置、不写 config**（写进去会把各模型的引擎端口覆盖成 9090）；`api_key` / `idle_unload_s` / `min_free_vram_mib` / `before_load` 仍逐份写 config。
+- **前门是「一个端口挂全部 config」**：`GET /v1/models` 由前门合成（当前引擎那份 `loaded`、其余 `unloaded`，形状照抄上游 `server.py:4313-4323`），没有引擎时 `GET /health` 也由前门合成；点名未知 `model` 一律 404 `model not found: {name}`（与上游同形，上游是 `server.py:4404-4405` 拿请求 `model` 与**当前实例**比对）。`lib.rs::strata_busy` **只算引擎槽位**（不算前门：前门不占显存，算进来会让托盘的「启动服务」一开局就变灰）；`RunEvent::Exit` 与托盘 `quit` 都要关前门。
+- **前门的两条硬约束（都是实测踩出来的，改 `strata_proxy.rs` 前先读）**：
+  1. **每条连接必须显式 `set_nonblocking(false)`**。监听套接字在 `start()` 里是 `set_nonblocking(true)`（非阻塞 accept + 30 ms 轮询），而 **Windows 上 `accept()` 返回的套接字会继承这个非阻塞标志**：不转回来的话所有 `read` 在没数据时直接返回 `WouldBlock`（`os error 10035`），读头/读体（`read_exact`）会随机失败、连接在请求体未读走时关闭，客户端看到的是 RST（「你的主机中的软件中止了一个已建立的连接」）。
+  2. **绝不能在引擎生成期间向上游发 FIN（半关）**。上游 `serve/server.py:4127-4150 _watch_client` 每 0.5 s `select` + `recv(1, MSG_PEEK) == b""` 就把「请求套接字读到 EOF」判成**客户端挂断**并 `cancel.set()`，而取消只在提示读取的**分块边界**生效（`server.py:317`，块大小 8192 token）：症状是「小 prompt 侥幸成功、18859 token 的 prompt 在读到第一个块边界（约 5.7 s）时被取消」，引擎日志打 `0 generated ... (cancelled)`。所以前门**不挂**「客户端 → 引擎」的转发线程（请求体已由 `read_body` 整段读完、上游是 HTTP/1.0 + `Connection: close`），只做单向 `io::copy(上游 → 客户端)`。
+- **前门服务状态要回传给前端**：`StrataStatus.proxy_serving`（正在服务的 config 文件名，`state.strata_proxy_serving` 这个 LIFO 栈 + `Serving` 守卫在 `Drop` 时摘掉并广播 `strata://status`）。卡片据此在 **DSH 请求触发加载**时显示「加载中」（`strataStarting` 只覆盖"用户在本页点启动"那条路径，用户 m01266 第 2 点）。排查连接类问题时可设环境变量 `STRATA_PROXY_DEBUG=1` 让前门把逐连接轨迹写进 `%TEMP%\strata-proxy-debug.log`（默认关闭）。
 
 ---
 
@@ -375,6 +386,7 @@ dev 构建（`tauri dev` / `cargo test`）**永远**用 `%APPDATA%` —— 否�
 2. ~~**模型列表每张卡片重复解析 `presetText`**（大列表时的性能点）。~~ ✅ 已修：`ModelCard` 改为 `memo`，父组件用一次 `useMemo` 算出 `webuiDisabledSections(presetText)`（`CODE_REVIEW.md` §1.2 的 M24）。
 3. **原路径 exe 的图标**：二进制已是新图标（复制成别的名字能正常显示），只是 Windows 按路径缓存；需要时按 §5.5 处理。
 4. `tmp/` 有 100+ 个验证产物，可随时清理，但请保留 §6.1 列出的那些。
+5. **Strata 引擎在显存耗尽后会卡死，不是 GUI 的 bug**（2026-10-11 实测，用户 m01266 排查副产品）：反复打大 prompt 之后 `/status` 长挂 `phase=reading the prompt`/`thinking`、`elapsed_s` 一直涨、`tokens_per_s` 掉到个位数，此后**所有**请求（连 `curl` **直连引擎端口**绕开前门也一样）要么空回复、要么只收到 236–428 B 就被断开。引擎日志自己给了原因与建议：`0 MiB of VRAM free with everything loaded - LOW: requests may stall; add --vram-reserve-mib 512 to the config's args (or lower --max-context)`（本机 12227 MiB 卡、权重约 40 GiB）。处置：杀掉 python 进程树后前门会在下一个请求冷启动新引擎；根治要在 config 的 `args` 里加 `--vram-reserve-mib 512`（GUI 不替用户写 args 类参数，需用户决定）。
 
 ---
 

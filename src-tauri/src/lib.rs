@@ -10,6 +10,7 @@ mod router;
 mod settings;
 mod state;
 mod strata;
+mod strata_proxy;
 mod tray;
 mod tray_icon;
 mod versions;
@@ -336,7 +337,7 @@ async fn router_stop(app: AppHandle, state: State<'_, AppState>) -> Result<Route
 /// `strata_config_write` 刚落完盘就要用这里的返回值回给前端，走缓存会把 5 秒前的旧参数
 /// 原样回显 —— 用户看到「改了但没生效」。参数编辑是低频操作，多扫一次目录没关系。
 fn find_strata_entry(
-    state: &State<'_, AppState>,
+    state: &AppState,
     config_file: &str,
 ) -> Result<strata::StrataModelEntry, String> {
     let root = state
@@ -361,13 +362,36 @@ fn find_strata_entry(
         .ok_or_else(|| format!("在 {} 下未找到 config：{config_file}", root.display()))
 }
 
-#[tauri::command]
-fn strata_status(state: State<'_, AppState>) -> strata::StrataStatus {
-    state
+/// 当前状态快照（含前门代理字段）。
+///
+/// `strata_status`、前门的启停命令共用：前门状态与引擎状态放在同一个快照里，
+/// 前端胶囊、设置页、托盘都只读一处，也不用多开一路轮询。
+pub(crate) fn strata_snapshot(state: &AppState) -> strata::StrataStatus {
+    let mut snapshot = state
         .strata_status
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .clone()
+        .clone();
+    strata_proxy::apply_to(state, &mut snapshot);
+    snapshot
+}
+
+/// 判「Strata 引擎在跑」：引擎槽位里有进程。
+///
+/// 只看引擎槽位，**不含前门代理**：托盘那几个菜单项控制的是 router，而前门本身不占显存
+/// （模型还没加载时它只是个转发器），把它算进来会让「启动服务」在前门开着时永远变灰
+/// （用户 m00798 之后自启动默认就是拉起前门）。前门的启停走 GUI 里的胶囊 / 面板 / 设置页。
+pub(crate) fn strata_busy(state: &AppState) -> bool {
+    state
+        .strata_slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+}
+
+#[tauri::command]
+fn strata_status(state: State<'_, AppState>) -> strata::StrataStatus {
+    strata_snapshot(&state)
 }
 
 /// 扫描 Strata 根目录下的全部 config（照抄上游 `setup.py` 的识别规则）。
@@ -422,11 +446,12 @@ async fn strata_probe(app: AppHandle, state: State<'_, AppState>) -> Result<stra
     // 闭包只带走 owned 数据 —— 不借用 `state`，否则 `State<'_>` 会被要求
     // 跨 await 存活，而 Tauri 命令的 future 必须能跨线程。
     let (probed, selected_port) = tauri::async_runtime::spawn_blocking(move || {
-        let (probe_targets, selected_port): (
+        let (probe_targets, selected_port, entries_for_attr): (
             Vec<(u16, Option<String>, Option<PathBuf>, Option<String>)>,
             Option<u16>,
+            Vec<strata::StrataModelEntry>,
         ) = match gui_owned_for_scan {
-            Some((port, api_key)) => (vec![(port, api_key, None, None)], None),
+            Some((port, api_key)) => (vec![(port, api_key, None, None)], None, Vec::new()),
             None => {
                 // 未命中缓存时才碰 AppState：`try_state` 拿到的 `State` 活不过 await，
                 // 但在阻塞线程内部用一下是安全的（扫描本身不 await）。
@@ -462,10 +487,20 @@ async fn strata_probe(app: AppHandle, state: State<'_, AppState>) -> Result<stra
                         )
                     })
                     .collect();
-                (targets, selected_port)
+                (targets, selected_port, entries)
             }
         };
-        (probe_strata_ports(&probe_targets), selected_port)
+        // 命中端口后要按 `/health` 报的模型名反查归属（见 `attribute_strata_hit`）：
+        // 同端口多 config 时端口归属只是猜的，模型名才是事实。
+        let pairs: Vec<(String, PathBuf)> = entries_for_attr
+            .iter()
+            .map(|e| (e.model_name.clone(), e.config_path.clone()))
+            .collect();
+        let probed = probe_strata_ports(&probe_targets).map(|(fresh, hit)| {
+            let attributed = attribute_strata_hit(fresh.port, fresh.model_name.as_deref(), &pairs, hit);
+            (fresh, attributed)
+        });
+        (probed, selected_port)
     })
     .await
     .map_err(|err| format!("Strata 状态探测失败: {err}"))?;
@@ -473,7 +508,8 @@ async fn strata_probe(app: AppHandle, state: State<'_, AppState>) -> Result<stra
     if let Some((fresh, external_hit)) = probed {
         // GUI 自己启动的那条路径不带端口归属信息（槽位里已经有了）
         let external_hit = if gui_owned.is_some() { None } else { external_hit };
-        let merged = merge_strata_probe(&state, &fresh, external_hit, gui_owned.is_none());
+        let mut merged = merge_strata_probe(&state, &fresh, external_hit, gui_owned.is_none());
+        strata_proxy::apply_to(&state, &mut merged);
         let _ = app.emit("strata://status", merged.clone());
         return Ok(merged);
     }
@@ -505,7 +541,11 @@ async fn strata_probe(app: AppHandle, state: State<'_, AppState>) -> Result<stra
             guard.port = p;
         }
     }
-    let snap = guard.clone();
+    let snap = {
+        let mut snapshot = guard.clone();
+        strata_proxy::apply_to(&state, &mut snapshot);
+        snapshot
+    };
     let _ = app.emit("strata://status", snap.clone());
     Ok(snap)
 }
@@ -520,6 +560,25 @@ fn strata_probe_root(state: &AppState) -> PathBuf {
         .clone()
         .filter(|r| r.is_dir())
         .unwrap_or_default()
+}
+
+/// 命中端口后按 `/health` 报的模型名反查归属，返回 `(端口, config 路径, 模型名)`。
+///
+/// **同一端口可以写多份 config**（用户 m00001：两个模型都写 9090），此时「这个端口上有
+/// 东西在跑」只说明端口被占，**跑的是哪份 config** 只能看 `/health` 报出的模型名 ——
+/// 按端口猜归属会把在跑的实例记到别的卡片上，用户就会去点错卡片（停不掉、又对错的
+/// config 发 `/load`）。`configs` 是 `(模型名, config 路径)` 列表；模型名拿不到或对不上
+/// 任何 config 时才退回 `fallback`（探测目标自带的端口归属）。
+fn attribute_strata_hit(
+    port: u16,
+    live_model: Option<&str>,
+    configs: &[(String, PathBuf)],
+    fallback: Option<(u16, Option<PathBuf>, Option<String>)>,
+) -> Option<(u16, Option<PathBuf>, Option<String>)> {
+    let by_model = live_model
+        .and_then(|name| configs.iter().find(|(model, _)| model == name))
+        .map(|(model, path)| (port, Some(path.clone()), Some(model.clone())));
+    by_model.or(fallback)
 }
 
 /// 按顺序探测各个端口，返回第一个在跑的实例。
@@ -567,6 +626,11 @@ fn merge_strata_probe(
     guard.models_autoload = fresh.models_autoload;
     guard.last_error = fresh.last_error.clone();
     guard.external = external;
+    // `/health` 报出的模型名是端口上真实在跑的那份 config（同一端口可以有多份 config，
+    // 用户 m00001 两个模型都写 9090），比快照里记的名字可信，一律以探测结果为准。
+    if let Some(name) = fresh.model_name.clone() {
+        guard.model_name = Some(name);
+    }
     if let Some((port, config_path, model_name)) = external_hit {
         guard.port = port;
         if config_path.is_some() {
@@ -585,10 +649,32 @@ async fn strata_start(
     state: State<'_, AppState>,
     config_file: Option<String>,
 ) -> Result<strata::StrataStatus, String> {
+    strata_start_engine(&app, &state, config_file.as_deref())
+}
+
+/// 真正拉起一个 Strata 引擎 —— GUI 卡片、侧栏胶囊、**前门代理**都走这一条路径。
+///
+/// 抽成独立函数（而不是留在 `strata_start` 命令里）是为了让前门代理复用同一条启动路径：
+/// 找条目、防并发、spawn、挂崩溃监测、刷托盘、记住选中 config、报错文案 —— 代理自己
+/// 拼一套的话，两条路径的报错与状态刷新迟早会不一致。
+pub(crate) fn strata_start_engine(
+    app: &AppHandle,
+    state: &AppState,
+    config_file: Option<&str>,
+) -> Result<strata::StrataStatus, String> {
     {
         let guard = state.strata_slot.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_some() {
-            return Err("Strata 已在运行".into());
+        if let Some(p) = guard.as_ref() {
+            // 同端口互斥（用户 m00001）：一个引擎只服务一份 config，报错必须点名
+            // 是谁在跑 —— 两份 config 都写 9090 时，光说「已在运行」用户无从下手。
+            let who = if p.model_name.is_empty() {
+                format!("端口 :{}", p.port)
+            } else {
+                format!("{}，端口 :{}", p.model_name, p.port)
+            };
+            return Err(format!(
+                "Strata 已在运行（{who}）。一个引擎只服务一份 config，先停止它再启动这个模型"
+            ));
         }
     }
     // 同 router_start：并发的第二次启动必须在这里被挡住，否则两个进程只有一个能被记住
@@ -599,10 +685,9 @@ async fn strata_start(
 
     let settings = state.settings.get();
     let wanted = config_file
-        .as_deref()
         .or(settings.strata_selected_config.as_deref())
         .ok_or_else(|| "尚未选择 Strata 模型（也没有设置 strata_root）".to_string())?;
-    let entry = find_strata_entry(&state, wanted)?;
+    let entry = find_strata_entry(state, wanted)?;
 
     // 显存互斥：不硬禁止（双卡用户可以共存），但要留下可见提示。
     if state
@@ -619,7 +704,7 @@ async fn strata_start(
 
     // host / 端口 / 密钥全部来自 config（R2）：设置页「服务」分组是直接把这些值
     // 写进 strata-*.json，这里不追加命令行参数（用户 m01623）。
-    let (process, status) = strata::spawn_strata(&app, state.logs.clone(), &entry)
+    let (process, status) = strata::spawn_strata(app, state.logs.clone(), &entry)
         .map_err(|err| format!("{err:#}"))?;
 
     *state.strata_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(process);
@@ -632,6 +717,11 @@ async fn strata_start(
         .map(|n| n.to_string_lossy().to_string());
     state.settings.update(|s| s.strata_selected_config = file);
 
+    // 前门可能开着：spawn 返回的快照里 proxy 恒为 false，直接 emit 会让侧栏胶囊闪一下
+    // 「前门未运行」—— 按当前真实状态补上（用户 m00798）。
+    let mut status = status;
+    strata_proxy::apply_to(state, &mut status);
+
     let _ = app.emit("strata://status", status.clone());
     // Strata 不走 router 的 `sync_tooltip`，菜单可用性得在这里自己刷一次
     // （否则「启动服务」一直可点、「停止服务」一直是灰的）。
@@ -641,7 +731,7 @@ async fn strata_start(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .running;
-    tray::sync_menu_state(&app, router_running, true);
+    tray::sync_menu_state(app, router_running, true);
     Ok(status)
 }
 
@@ -650,13 +740,17 @@ async fn strata_stop(app: AppHandle, state: State<'_, AppState>) -> Result<strat
     let stopped = strata::stop_strata(&state.strata_slot);
     // 槽里没有进程 = 这个实例不是 GUI 拉起来的（例如用户自己跑了 run-<model>.bat）。
     // 强杀别人的进程树不合适，直接说明情况，让状态由轮询去反映真实端口占用。
-    let (snap_running, snap_port) = {
+    let (snap_running, snap_port, snap_name) = {
         let st = state.strata_status.lock().unwrap_or_else(|e| e.into_inner());
-        (st.running, st.port)
+        (st.running, st.port, st.model_name.clone())
     };
     if stopped.is_none() && snap_running {
+        let who = snap_name
+            .filter(|n| !n.is_empty())
+            .map(|n| format!("（{n}）"))
+            .unwrap_or_default();
         return Err(format!(
-            "端口 :{snap_port} 上的 Strata 不是由本 GUI 启动的，请在它自己的控制台里停止"
+            "端口 :{snap_port} 上的 Strata{who}不是由本 GUI 启动的，请在它自己的控制台里停止"
         ));
     }
     if let Some(pid) = stopped {
@@ -664,7 +758,7 @@ async fn strata_stop(app: AppHandle, state: State<'_, AppState>) -> Result<strat
             .logs
             .push("system", format!("[gui] 已停止 Strata（pid {pid}）"));
     }
-    let status = {
+    let mut status = {
         let mut st = state.strata_status.lock().unwrap_or_else(|e| e.into_inner());
         st.running = false;
         st.pid = None;
@@ -672,10 +766,13 @@ async fn strata_stop(app: AppHandle, state: State<'_, AppState>) -> Result<strat
         st.external = false;
         st.clone()
     };
+    // 引擎停了不代表前门停了：按真实状态补 proxy / proxy_port（用户 m00798）
+    strata_proxy::apply_to(&state, &mut status);
     let _ = app.emit("strata://status", status.clone());
     // router 侧照旧从进程槽读，这里没必要为了托盘再多查一次。
+    // Strata 侧跟着判一次：前门还开着的话「停止服务」仍应可点。
     let router_running = state.status.lock().unwrap_or_else(|e| e.into_inner()).running;
-    tray::sync_menu_state(&app, router_running, false);
+    tray::sync_menu_state(&app, router_running, strata_busy(&state));
     Ok(status)
 }
 
@@ -1503,6 +1600,8 @@ pub fn run() {
             strata_probe,
             strata_start,
             strata_stop,
+            strata_proxy::strata_proxy_start,
+            strata_proxy::strata_proxy_stop,
             strata_set_root,
             strata_pick,
             strata_config_read,
@@ -1553,6 +1652,8 @@ pub fn run() {
                 // （Strata 的引擎子进程占着显存，GUI 退出后不能留活口）
                 if let Some(state) = app_handle.try_state::<AppState>() {
                     persist_window_size(&state);
+                    // 前门先关：关掉它才不会在停引擎的过程中又有请求进来触发启动。
+                    strata_proxy::shutdown(&state);
                     // 这里只是第二道防线：`AppHandle::exit` 正常会走 `RunEvent::Exit`，
                     // 但 `request_exit` 失败时会退化成 `std::process::exit`（tauri 2.11.5
                     // src/app.rs:573）直接跳过本事件 —— 所以 tray::quit 自己也停一遍。
@@ -1599,5 +1700,40 @@ mod tests {
         assert!(placement_is_sane(-1920, 0));
         assert!(placement_is_sane(0, 0));
         assert!(placement_is_sane(2560, 140));
+    }
+
+    /// 同端口多 config（用户 m00001）：端口归属只是猜的，`/health` 报的模型名才是事实。
+    #[test]
+    fn strata_hit_follows_live_model_name_on_shared_port() {
+        let configs = vec![
+            (
+                "sc117-swift-iq2-xs".to_string(),
+                PathBuf::from(r"E:\AI\Strata\strata-sc117-swift-iq2-xs.json"),
+            ),
+            (
+                "swift-iq3_xxs".to_string(),
+                PathBuf::from(r"E:\AI\Strata\strata-swift-iq3_xxs.json"),
+            ),
+        ];
+        // 探测目标是「选中的 config」（iq3_xxs），它和被猜到的那份是同一个
+        let guessed = Some((
+            9090u16,
+            Some(configs[1].1.clone()),
+            Some(configs[1].0.clone()),
+        ));
+
+        // /health 说跑的是 iq2-xs：归属要改成真正在跑的那份
+        let fixed = attribute_strata_hit(9090, Some("sc117-swift-iq2-xs"), &configs, guessed.clone()).unwrap();
+        assert_eq!(fixed.1.as_ref(), Some(&configs[0].1));
+        assert_eq!(fixed.2.as_deref(), Some("sc117-swift-iq2-xs"));
+
+        // 模型名对不上任何 config：退回端口归属，不要凭空清空
+        let unknown = attribute_strata_hit(9090, Some("别的模型"), &configs, guessed.clone()).unwrap();
+        assert_eq!(unknown.2.as_deref(), Some("swift-iq3_xxs"));
+
+        // 拿不到 /health 的 model（老版本引擎）：同样退回
+        let empty = attribute_strata_hit(9090, None, &configs, guessed).unwrap();
+        assert_eq!(empty.2.as_deref(), Some("swift-iq3_xxs"));
+        assert_eq!(empty.0, 9090);
     }
 }

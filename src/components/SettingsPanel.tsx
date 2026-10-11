@@ -13,6 +13,8 @@ export function SettingsPanel() {
   const refreshModels = useApp((s) => s.refreshModels);
   const setStrataRoot = useApp((s) => s.setStrataRoot);
   const strataStatus = useApp((s) => s.strataStatus);
+  const startStrataProxy = useApp((s) => s.startStrataProxy);
+  const stopStrataProxy = useApp((s) => s.stopStrataProxy);
   const writeStrataConfig = useApp((s) => s.writeStrataConfig);
   const setError = useApp((s) => s.setError);
   const setNotice = useApp((s) => s.setNotice);
@@ -190,13 +192,15 @@ export function SettingsPanel() {
   };
 
   /**
-   * 保存 Strata 的 host / 端口 / 密钥：**直接写进所有 strata-*.json 的顶层字段**
-   * （用户 m01623）。留空的项跳过不动，保留各 config 原值；端口所有 config 写同一个值。
+   * 保存 Strata 的服务项（用户 m01623）。
    *
-   * 写的是 config 顶层的 `host` / `port` / `api_key`，不碰 `args`（R6），
-   * 也不往启动命令里追加参数（R1）—— 上游 setup.py 自己也是这么写 config 的。
-   * 序列化用 indent=1，与上游 `json.dumps(cfg, indent=1)` 一致。
-   * 正在运行的 Strata 早就读过自己的 config，所以提示重启才生效。
+   * `host` / `port` 现在是**前门代理**的监听地址与端口（用户 m00798），只存进 GUI 设置，
+   * **不再写进各 config**：每个模型的引擎端口属于它自己的 config 与 `run-<模型>.bat`，
+   * 前门按请求里的 `model` 自动停旧引擎、起新引擎。
+   * 其余项仍然直接写进所有 `strata-*.json` 的顶层字段（`api_key` / `idle_unload_s` /
+   * `min_free_vram_mib` / `before_load`），不碰 `args`（R6），也不往启动命令里追加参数（R1）
+   * —— 上游 setup.py 自己也是这么写 config 的。序列化用 indent=1，与上游
+   * `json.dumps(cfg, indent=1)` 一致。config 的改动在下一次启动引擎时生效。
    */
   const saveStrataService = async () => {
     const host = strataHost.trim();
@@ -212,8 +216,14 @@ export function SettingsPanel() {
     const freeParsed = Math.trunc(Number(strataMinFree));
     const minFree = Number.isFinite(freeParsed) && freeParsed > 0 ? freeParsed : null;
     const before = strataBefore.trim();
-    if (!host && port === null && !key && idle === null && minFree === null && !before) {
-      setError("所有服务项都留空了，没有要写入的内容");
+    // 代理地址/端口只进 GUI 设置（代理监听它们，跟各 config 的引擎端口是两回事）
+    await saveSettings({ strata_host: host || null, strata_port: port });
+    if (!key && idle === null && minFree === null && !before) {
+      setNotice(
+        `Strata 代理监听地址/端口已保存（${host || "127.0.0.1"}:${port ?? 9090}）${
+          strataStatus.proxy ? "；代理正在运行，重启代理后生效" : ""
+        }`,
+      );
       return;
     }
     setStrataSaving(true);
@@ -229,8 +239,8 @@ export function SettingsPanel() {
         const file = entry.config_path.split(/[\\/]/).pop() ?? "";
         try {
           const cfg = JSON.parse(await ipc.strataConfigRead(file)) as Record<string, unknown>;
-          if (host) cfg.host = host;
-          if (port !== null) cfg.port = port;
+          // 不再写 host / port：它们是前门的设置（上面已存进 GUI 设置），写进 config 会把
+          // 各模型自己的引擎端口覆盖成前门端口
           if (key) cfg.api_key = key;
           // 空闲卸载 / 显存门槛 / 加载前命令：留空 = 不动 config 里的原值
           if (idle !== null) cfg.idle_unload_s = idle;
@@ -244,8 +254,6 @@ export function SettingsPanel() {
       }
       if (written.length) {
         await saveSettings({
-          strata_host: host || null,
-          strata_port: port,
           strata_api_key: key || null,
           strata_idle_unload_s: idle,
           strata_min_free_vram_mib: minFree,
@@ -253,8 +261,6 @@ export function SettingsPanel() {
         });
       }
       const fields = [
-        host && "监听地址",
-        port !== null && "端口",
         key && "API Key",
         idle !== null && "空闲卸载",
         minFree !== null && "显存门槛",
@@ -504,11 +510,29 @@ export function SettingsPanel() {
             </small>
 
             <div className="form-group" style={{ marginBottom: 0 }}>
-              <label className="form-label">Strata 服务（填了才写，留空的项保留各 config 原值）</label>
+              <label className="form-label">Strata 代理 / 服务项（填了才写，留空的项保留各 config 原值）</label>
+              {/* 代理（前门）：一个端口挂全部 config，按请求里的 model 自动切换引擎（用户 m00798 / m01151）。
+                  DSH 等客户端连的就是这里，各模型的引擎端口在它们自己的 config / run-<模型>.bat 里。 */}
+              <div className="row" style={{ gap: "0.5rem", alignItems: "center", marginBottom: "0.4rem" }}>
+                <span className="form-text" style={{ margin: 0 }}>
+                  代理{strataStatus.proxy ? `运行中 · :${strataStatus.proxy_port ?? 9090}` : "未运行"}
+                  {strataStatus.proxy && strataStatus.running ? `（当前引擎 :${strataStatus.port}）` : ""}
+                  {" —— "}客户端连代理，代理按请求里的 <code>model</code> 自动切换引擎
+                </span>
+                <button
+                  type="button"
+                  className={`btn btn-sm ${strataStatus.proxy ? "btn-danger" : "btn-primary"}`}
+                  disabled={busy}
+                  onClick={() => void (strataStatus.proxy ? stopStrataProxy() : startStrataProxy())}
+                >
+                  <i className={`fas ${strataStatus.proxy ? "fa-stop" : "fa-play"}`} />{" "}
+                  {strataStatus.proxy ? "停止代理" : "启动代理"}
+                </button>
+              </div>
               <div className="row" style={{ gap: "0.75rem", alignItems: "flex-end", flexWrap: "wrap" }}>
                 <div style={{ width: 130 }}>
                   <label className="form-label" style={{ fontSize: "0.8rem" }}>
-                    监听地址
+                    代理监听地址
                   </label>
                   <input
                     className="form-control"
@@ -520,13 +544,13 @@ export function SettingsPanel() {
                 </div>
                 <div style={{ width: 130 }}>
                   <label className="form-label" style={{ fontSize: "0.8rem" }}>
-                    端口
+                    代理端口
                   </label>
                   <input
                     className="form-control"
                     style={{ width: 130 }}
                     value={strataPort}
-                    placeholder="config 的端口"
+                    placeholder="9090"
                     onChange={(e) => setStrataPort(e.target.value)}
                   />
                 </div>
@@ -587,12 +611,16 @@ export function SettingsPanel() {
                 </button>
               </div>
               <small className="form-text">
-                保存时把填了的项<b>直接写进所有 <code>strata-*.json</code> 的顶层字段</b>（<code>host</code> /{" "}
-                <code>port</code> / <code>api_key</code> / <code>idle_unload_s</code> /{" "}
-                <code>min_free_vram_mib</code> / <code>before_load</code>），不碰 <code>args</code>，也不改上游生成的{" "}
-                <code>run-&lt;模型&gt;.bat</code>。端口是所有 config 共用同一个值 —— 一次只跑一个模型时没问题，
-                以后要同时跑多个模型请给它们分不同端口。改动在<b>下一次启动 Strata</b> 时生效；
-                Strata 的端口不像 router 会自动顺延，占用时启动会直接报错。
+                <b>代理监听地址 / 代理端口</b>是 GUI 自己起的代理（默认 <code>127.0.0.1:9090</code>），
+                只存进 GUI 设置、<b>不写 config</b>；DSH 等客户端连它，它按请求里的 <code>model</code>{" "}
+                自动停掉旧引擎、起目标引擎。每个模型的<b>引擎端口在各自的 <code>strata-*.json</code> 与{" "}
+                <code>run-&lt;模型&gt;.bat</code></b> 里（两处必须一致，否则启动时 GUI 直接报错）。
+              </small>
+              <small className="form-text">
+                其余保存项写进所有 <code>strata-*.json</code> 的顶层字段（<code>api_key</code> /{" "}
+                <code>idle_unload_s</code> / <code>min_free_vram_mib</code> / <code>before_load</code>），
+                不碰 <code>args</code>，也不改上游生成的 <code>run-&lt;模型&gt;.bat</code>；
+                改动在<b>下一次启动引擎</b>时生效。Strata 的端口不像 router 会自动顺延，占用时启动会直接报错。
               </small>
               <small className="form-text">
                 <b>空闲卸载</b>（上游 <code>idle_unload_s</code>）：多少秒没有请求就自动卸载模型释放显存，

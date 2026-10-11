@@ -101,9 +101,19 @@ P7 已实现的能力（Strata 第二运行时通道）：
 
 - **并列接入，而不是塞进 router 流水线**：Strata（<https://github.com/Niko1221/Strata>）的二进制、
   管理端点、config 格式都与 llama.cpp router 不同，所以它作为**独立通道**与其并存，router 那条线不改。
-  后端注册了 11 个命令（`strata_status` / `strata_scan` / `strata_probe` / `strata_start` /
+  后端注册了 13 个命令（`strata_status` / `strata_scan` / `strata_probe` / `strata_start` /
   `strata_stop` / `strata_set_root` / `strata_pick` / `strata_config_read` / `strata_config_write` /
-  `strata_unload_model` / `strata_load_model`），外加压测命令 `bench_strata`。
+  `strata_unload_model` / `strata_load_model` / `strata_proxy_start` / `strata_proxy_stop`），
+  外加压测命令 `bench_strata`。
+- **前门代理：客户端只连一个端口**（`src-tauri/src/strata_proxy.rs`；默认 `127.0.0.1:9090`，
+  设置页里叫「代理监听地址 / 代理端口」）。DSH 等 OpenAI 兼容客户端只连它，它按请求体里的 `model`
+  挑 config，必要时**停旧引擎、起新引擎**（切换全程串行化；首次请求要等建引擎 + 加载模型，约 20–60 s）。
+  `GET /v1/models` 由它合成**全部** config（当前引擎那份 `loaded`、其余 `unloaded`），没有引擎时
+  `GET /health` 也由它合成，点名不存在的 `model` 回与上游同形的 404 —— 于是客户端里选中哪个模型都能直接用。
+  各模型的**引擎端口仍留在自己的 `strata-*.json` 与 `run-<模型>.bat`** 里（两处必须一致，不一致时启动直接报错），
+  代理地址 / 端口**只写 GUI 设置、不写 config**。侧栏胶囊显示「Strata 代理 :9090」、下面一行是引擎版本；
+  由 DSH 请求触发的加载会在对应卡片上显示「加载中」。排查连接类问题可设 `STRATA_PROXY_DEBUG=1` 启动，
+  代理会把逐连接轨迹写进 `%TEMP%\strata-proxy-debug.log`（默认关闭）。
 - **Strata 页**：卡片列表 + 搜索/刷新/排序/筛选/视图切换；「配置」Sheet 的上层是参数表单
   （`strata-*.json` 里的 `args` ↔ 表单状态的换算在 `src/utils/strataParams.ts`），下层是原始 JSON 编辑；
   写回走「校验 → 备份 → 原子写」，非法内容不会落盘。

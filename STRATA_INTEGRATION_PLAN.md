@@ -1191,3 +1191,106 @@ Origin 防护：`_foreign_origin()`（`:4601-4608`）= `bool(origin) and origin.
   - 宽度统一：前五项外层 `div` 与 `input` 都是 `width: 130`；API Key 是唯一弹性项，外层 `div` = `flex: 1, minWidth: "24ch"`，`input` = `minWidth: "24ch"`（容纳 24 个字符且随页面宽度伸缩）。
 - 验证：`npx tsc --noEmit` OK。
 
+## §22 同端口互斥 + 「卡片点了不加载」（用户 m00001）
+
+### 22.1 需求
+
+- User said (m00001): "我现在在strata中增加了一个模型，都是9090端口，在gui的strata页模型卡片中模型都无法启动，应该增加strata模型的互斥加载"。
+- 实机：新 config `E:\AI\Strata\strata-sc117-swift-iq2-xs.json` 与旧 config `E:\AI\Strata\strata-swift-iq3_xxs.json` 顶层 `port` **都是 9090**（host/api_key 也相同）。
+
+### 22.2 根因（两处，都在 GUI 侧）
+
+1. **卡片播放按钮只起引擎、不 `/load`**（§21.3 的实现漏洞）：`startStrataModel` 的「引擎没跑 / 跑的是别的 config」分支只调 `ipc.strataStart(file)` 就结束，只有 else 分支（引擎已在跑**同一个** config）才 `strataLoadModel`。于是点一次播放 = 引擎起来但 `/health.loaded` 仍是 false → 胶囊停在「已停止」= 用户看到的「模型无法启动」；**再点一次**才走 else 分支把模型加载起来。实测日志正是这个节奏：22:34:56 python 起 → 22:35:07 `engine started` → 22:35:23 `session is up (engine 0.1.41)`。
+2. **同端口归属靠猜**：`strata::probe` 丢弃了 `/health` 的 `model` 字段，`probe_strata_ports` 的归属取自「探测目标元组」，而目标里把**选中的 config** 排在第一个 —— 两份 config 写同一个 9090 时，在跑的实例永远被记到选中 config 的卡片上。后果：点真正在跑的那张 → `strataStop()` → 槽里没有进程 → 报「不是由本 GUI 启动的」；点被误判为运行的那张 → 对**错误的 config** 发 `/load`。
+3. 附带：切 config 时直接 `force_kill_tree` 强杀旧引擎，既不先 `POST /unload`（上游会顺手保存 learned expert profile、立刻释放显存），也不区分「GUI 起的实例」与「用户自己跑 `run-<model>.bat` 的实例」。
+
+排除的假设：`TIME_WAIT` **不会**让 `winfix::port_in_use` 误报（实测：9095 上起 `python -m http.server` 再强杀，netstat 仍有该端口的 TIME_WAIT，Rust `TcpListener::bind` 立刻 `BIND_OK`；有监听者时 `BIND_FAIL` os error 10048）→「端口已被占用」不是 TIME_WAIT 造成的。
+
+### 22.3 实现
+
+**Rust**
+
+- `strata.rs::probe`：把 `/health` 的 `model` 写进 `st.model_name`（非空才写）—— 端口上到底跑的是哪份 config，这是唯一权威判据。
+- `lib.rs::attribute_strata_hit`（新增）：按模型名反查 `(模型名, config 路径)` 列表修正归属；拿不到模型名或对不上任何 config 时才退回端口归属。
+- `lib.rs::merge_strata_probe`：以 `fresh.model_name` 为准。
+- `lib.rs::spawn_strata`：`port_in_use` 命中时先 `probe(port, api_key)`，把占用者写进报错 —— `端口 9090 已被占用（sc117-swift-iq2-xs）。…`。
+- `lib.rs::strata_start`：槽里已有进程时报 `Strata 已在运行（<模型>，端口 :9090）。一个引擎只服务一份 config，先停止它再启动这个模型`（原来是干巴巴的「Strata 已在运行」，同端口两 config 时用户无从下手）。
+- `lib.rs::strata_stop`：外部实例的报错带上快照里的模型名 —— `端口 :9090 上的 Strata（sc117-swift-iq2-xs）不是由本 GUI 启动的…`。
+
+**前端**
+
+- `store.ts::startStrataModel` 重写：切换模型时先 `POST /unload`（**仅 GUI 自己起的实例**：`st.loaded && !st.external`，失败不阻断）再 `strataStop()`；之后**两条分支统一走到 `ipc.strataLoadModel`**，成功 notice 写明「已停止 X（同端口互斥）→ 已加载 Y」。
+- `StrataPanel.tsx`：`ConfigCard` 新增 `runningElsewhere: string | null` prop（同端口在跑的是别的模型时填模型名），播放按钮 title 变成「启动并加载这个模型（Strata 互斥：会先停止正在运行的 X）」；底部提示行在有多份 config 共用同一端口时补一句「多份 config 共用同一端口，同时只能跑一个（启动会先停掉正在跑的那个）」。
+
+### 22.4 验证
+
+- `npx tsc --noEmit` OK；`cargo test --lib --offline` **94 passed / 0 failed / 5 ignored**（基线 93 + 新增 `strata_hit_follows_live_model_name_on_shared_port`：同端口两份 config、`/health` 报的是另一份 → 归属必须纠正；模型名对不上 / `model` 缺失 → 退回端口归属）。
+- 待用户在真机 GUI 上确认：点卡片 → 胶囊「加载中」→「运行中」；点另一张卡片 → 先停掉前一个再加载（9090 上同时只有一个实例）。
+
+### 22.5 两个模型的 expert profile 分开（用户 m00386）
+
+- User said (m00386): "两个模型的--expert-profile应该指向不同的文件"。
+- 起因：两份 config 原来都读**出厂** profile `E:\AI\Strata\data\expert-profile.bin`。这不是 bug —— `setup.py:5226` 写的是 `fam.get("profile", "expert-profile.bin")`，即按**模型家族**给默认值，Swift 家族的 iq3_xxs 与 IQ2_XS 因此同名。
+- 上游的正解就在 config 里：`serve/server.py:2105 learned_profile_args()`（#477，引擎 0.1.36+）认顶层键 `expert_profile_save`，让「下次启动从 learned 文件开始，而不是 config 的 `--expert-profile`」；判定只用 `profile_shape()`（读 STRP 头部的 层数 × 专家数），命中时 `server.py:2124 args[i] = save` —— 引擎最终拿到的就是 `--expert-profile <learned> --expert-profile-save <learned>`，**同一文件自读自写是上游的稳态**（`serve/test_server.py:1925` 正是这么断言的）。但 `server.py:2112` 在 args 里已含 `--expert-profile-save` 时整条逻辑直接 return；GUI 这两份 config 都是显式 args 形态，所以自动切换从来不发生。
+- 实测 STRP 头（读前 24 B，`<5I` = 版本,nl,ne,n,?）：`expert-profile.bin` / `expert-profile-learned.bin` / `expert-profile-learned-iq2abl.bin` 全是 `nl=48 ne=512 n=24576`、196632 B（= 24 + 8×24576）；`expert-profile-coder.bin` 是 `48×256 / 12288 / 98328 B`。形状按家族区分，引擎的 shape 校验有效。
+- 改动（2026/10/10 22:47，**直接改文件**，不是 GUI 写入，符合 §7 R6「GUI 永不写 `args` 里的路径类参数」）：`strata-sc117-swift-iq2-xs.json` 的 `--expert-profile` → `E:\AI\Strata\data\expert-profile-learned-iq2abl.bin`；`strata-swift-iq3_xxs.json` 的 `--expert-profile` → `E:\AI\Strata\data\expert-profile-learned.bin`。两者都等于各自已有的 `--expert-profile-save`（自读自写），出厂 profile 不再被任何 config 使用。备份在 config 同目录：`.bak-20261010-224726`（两份）。改后 JSON 解析通过、其余字段逐字未动（sc117 1838→1853 B，iq3_xxs 1724→1732 B）。
+- 不会被冲掉：`setup.py:3578`（#775 `keep_user_profile`）在重生成 config 时会**保留**用户手接的 `--expert-profile`（条件：是另一个仍然存在的文件）与 `--expert-profile-save`。
+- GUI 侧无需改动：`--expert-profile*` 属安装事实类 flag，在参数表单里只读列出（`src/utils/strataParams.ts:32-38` 的 `STRATA_INSTALL_FACT_FLAGS`，`strataParams.ts:468` 把它们归进 installFacts），L2 原文编辑才能改。
+- 未决（未改）：`--vram-reserve-mib 0` + `--max-context 204800` 同时加载完时报 `0 MiB of VRAM free with everything loaded - LOW: requests may stall; add --vram-reserve-mib 512 to the config's args (or lower --max-context)`。
+
+### 22.6 参数表加「采样」分组（用户 m00454）
+
+- User said (m00454): "strata的模型参数表中加上采样分组： "temperature"、 "top_p"、 "top_k"、"min_p" 参数选项"。
+- 上游语义（`serve/server.py:5270 sampling_defaults_from_config(cfg)` 与 `docs/DETAILS.md:1060-1067`）：config 顶层可选 `sampling` 块 = **请求自己没带采样字段时的默认值**；请求自带的字段永远优先（显式 `temperature: 0` 仍是 greedy）；**整块缺失**时，不带采样字段的请求按 greedy 解码。上游认的键还有 `presence_penalty` / `repetition_penalty` / `frequency_penalty` / `penalty_last_n` / `seed`，块里也放过实验开关键（`docs/DETAILS.md:1427` 的 `experimental_speed_projection`）。`docs/DETAILS.md:821-828`（#564）说明上游 WebUI 的 Model settings 卡片改的就是这四个键，语义是「**空字段 = 删掉该键**（回默认）」。
+- **坏值 = 引擎起不来**：`server.py:5282-5297` 逐键校验并 `raise SystemExit` —— `temperature` 需 ≥ 0、`top_p` 需 `0 < v ≤ 1`、`min_p` 需 `0 ≤ v ≤ 1`、`top_k` 需 `1..64` 的整数（上游文案 `the sampled path takes an integer 1..64`）。所以表单不能只做透传。
+- 实现（都在前端，Rust 一行未改）：
+  - `src/utils/strataParams.ts`：新分组 `{ id: "sampling", label: "采样", order: 3, collapsed: false }`，插在「加速与缓存」与「多模态」之间（`ParamForm` 按 `schema.groups` 的**数组顺序**渲染，`order` 只是记录；vision/serve 的 order 顺延为 4/5）。
+  - 4 个参数走**哨兵 flag** 模式（与既有的 `--vision-mmproj` 同款）：表单 key `sampling-temperature` / `sampling-top-p` / `sampling-top-k` / `sampling-min-p`，`flag` 只是占位（`--sampling-*`），并进 `TOP_LEVEL_KEYS` → `stateToArgs` 跳过它们，**永不进 `args`**（引擎不认这些 flag，塞进去会启动失败）。类型 FLOAT/FLOAT/INTEGER/FLOAT，`uiType: null` + `values: []` → `ParamForm` 渲染成数字输入框（FLOAT 带 `step=0.01`）。
+  - `SAMPLING_KEYS` 一张表驱动三处：`configToState`（读 `cfg.sampling.*`，键缺失 = 未启用 + schema 默认值当占位）、`stateToConfig`（勾选且取值合法 → 写**数字**，`top_k` 走 `Math.trunc`；未勾选或清空 → `delete` 该键；块里 GUI 不认识的键原样保留；四个键都没了且块内无其它键 → 整块删掉）、导出的 `validateStrataSampling`。
+  - `src/components/StrataPanel.tsx::save()` 在 `stateToConfig` 之前调 `validateStrataSampling(formState)`，报错如 `采样参数「top_k」的取值 "100" 不合法：上游要求 1..64 的整数，否则 Strata 启动时会直接退出`（清空不算错，那是「回默认」）；`StrataPanel.tsx` 顶部注释与 `stateToConfig` 的两处 R6 注释同步补上 `sampling.*`。
+  - 没动 Rust 侧：`strata.rs::write_config_raw` 的 W5 校验只要求顶层有 `exe`、`args` 是数组，多一个 `sampling` 块自然通过；`StrataModelEntry` 也不解析它。
+- 验证：`npx tsc --noEmit` OK；`scripts/smoke-paramform.entry.tsx` 新增 Strata 段落（用 `strataParamSchema` 渲染 + 读写往返 + 坏值拦截断言），实测输出 `采样往返 OK（坏值拦截: 采样参数「top_k」的取值 "100" 不合法…）`、`全部通过 ✅`（82 参数 / 10 分组）；断言覆盖「取消勾选后 `top_k` 被删」「`min_p` 保持数字 0」「`experimental_speed_projection` 原样保留」「args 一个 token 都没变」「清空合法」。
+- **受限沙箱下 `npm run test:smoke` 必失败**（esbuild 由 Node `child_process.spawn` 以 `stdio:'pipe'` 拉起 → 命名管道被禁 → `Error: spawn EPERM`，`errno -4048`）。绕法：PowerShell 里直接跑 `node_modules\@esbuild\win32-x64\esbuild.exe scripts\smoke-paramform.entry.tsx --bundle --platform=node --format=esm --packages=external --jsx=automatic --outfile=tmp\smoke-paramform.mjs`，再用一个补了 `localStorage` 替身的小 .mjs `import` 产物（与 `scripts/smoke-paramform.mjs` 的两步等价）。
+- 显示修正（用户 m00645）：config 里的 `sampling` 值是 JSON 数字，`String(1.0)` 得到 `"1"`、`String(0)` 得到 `"0"`，参数表看起来像被抹掉了小数位。`strataParams.ts` 新增 `samplingText(s, v)`：浮点键补足一位小数（`1` → `1.0`、`0` → `0.0`，`0.95` 不变），整数键 `top_k` 原样（`20`），非数字回落 `String(v)`；`configToState` 用它回填，`min_p` 的 schema 默认值同步由 `"0"` 改成 `"0.0"`。**只影响显示**，写回仍是 JSON 数字（`stateToConfig` 一行未改，所以「0.90 → 0.9」这类超过一位的尾零仍会随 JSON 归一化丢失）。
+- 待用户在真机确认：配置弹窗里出现「采样」分组、四个值按现有 config 回填（`1.0 / 0.95 / 20 / 0.0`）、保存后 config 顶层 `sampling` 被更新且未知键仍在。冒烟测试已断言 state 与渲染 HTML 里都是这几个字符串（`value="1.0"` / `value="0.95"` / `value="0.0"`）。
+
+### 22.7 前门代理（B 方案，用户 m00752 / m00773 / m00798）
+
+- 需求演进：m00645 问「strata 的模型现在支持 dsh 客户端拉起吗」→ m00743「在 gui 已经运行的情况下，strata 下有两个模型，dsh 都能实现选中任意模型都可以直接用吗」→ 实测**不能** → m00752「我选B方案，但是左下角的胶囊显示的端口和设置页 strata 服务的端口都是代理的端口」→ m00773「这样的话，strata 引擎，每个模型的端口不同也可以吧」→ **m00798「我的建议是前面的端口是9090，两个模型分别是9091和9092」**。
+- 为什么必须要代理（上游事实，全部有出处）：`server.py:4404-4405`（按 id 的端点在 `:4492-4493`）拿请求里的 `model` 与**当前实例**的 `svc.model` 比对，不符直接 `404 {"error":{"message":"model not found"}}`；`server.py:4310-4323` `/v1/models` 只列当前实例的模型（未加载时 `data: []`）；绑定端口的是 `server.py:5339 ap.add_argument("--port", type=int, default=8095)` 与 `:5559 httpd = serve(svc, host=a.host, port=a.port)`，**config 的 `port` 上游不读**（只有 `--host`/`--gpu` 的帮助文本写 "also … in the config"）。
+- 端口布局（本机实机已改，改前逐份备份 `<文件名>.bak-20261011-165150-engineport`）：前门 `127.0.0.1:9090`（GUI 设置 `strata_host` / `strata_port`）；`strata-sc117-swift-iq2-xs.json` → `9091`、`strata-swift-iq3_xxs.json` → `9092`，两个 `run-*.bat` 的 `--port` 同步改（`Select-String '9090'` 改后 0 命中）。
+- 后端新增 `src-tauri/src/strata_proxy.rs`（约 700 行，不引入任何依赖，手写 HTTP）：
+  - `pub fn start(app, host, port) -> Result<ProxyHandle, String>`：非阻塞 `accept` + 30 ms 轮询 + 每连接一线程；`ProxyHandle{port, stop: Arc<AtomicBool>, _listener}`；绑定失败文案提示「引擎可能正占着这个端口（旧布局里引擎就写 9090）」。
+  - `serve` 主流程：读头（限 64 KiB，逐字节读到 `\r\n\r\n`）→ `Expect: 100-continue` 先回 100 → 读体（chunked 也支持，限 64 MiB）→ `GET /v1/models|/models` 走 `models_payload` 合成全部 config → 从请求体（限 4 MiB 解析）或 `/v1/models/<id>` 路径取 `model` → 没有引擎时的 `GET /health` 由前门合成（`{"status":"ok","service":"strata","loaded":false,…,"proxy":true}`）→ `resolve_target` → `ensure_engine` → `forward`。
+  - `resolve_target`：点名必须精确等于某份 config 的 `model_name`，否则 404 `model not found: {name}`；未点名按 当前引擎 → 选中 config → 第一份。
+  - `ensure_engine`（持 `state.strata_switch`）：①已经是这份 config 的引擎 → 直接转发；②端口上探测到的 `model_name` 与目标相同 → 直接用（用户自己跑的 `.bat` 也算）；③有 GUI 引擎 → 停它 + `strata::wait_port_free(old_port, 20s)`，失败报「端口 :N 在 20 秒内没有释放，无法切换到 X」；④`crate::strata_start_engine(app, state, Some(file))`（与卡片、胶囊**同一条启动路径**，报错文案一致）。
+  - `forward`：跳掉 `host` / `connection` / `accept-encoding` / `expect` / `proxy-connection`，补 `Host: {host}:{port}` 与 `Connection: close`，**清掉客户端读超时**（流式响应之间的静默期不能被打断），引擎→客户端用本线程 `io::copy`、客户端→引擎用一个 pump 线程，收尾双向 `shutdown(Both)` + `pump.join()`。
+  - 命令 `strata_proxy_start` / `strata_proxy_stop`（端口取 `settings.strata_host`/`strata_port`，缺省 `127.0.0.1:9090`），`shutdown(&state)` 给退出用；`apply_to(&state, &mut StrataStatus)` 把 `proxy` / `proxy_port` 写进每一份对外快照。4 个单测（读头、body 取 model、100-continue 大小写、`0.0.0.0` → `127.0.0.1`）。
+- 接线：`state.rs` 加 `strata_proxy: Arc<Mutex<Option<ProxyHandle>>>` 与 `strata_switch: Mutex<()>`；`strata.rs` 的 `StrataStatus` 加 `proxy: bool` / `proxy_port: Option<u16>`（`#[serde(default)]`），新增 `wait_port_free`，`spawn_strata` 校验 run 脚本 `--port` 与 config `port` 一致；`lib.rs` 抽出 `strata_start_engine`（命令只转调它）、新增 `strata_snapshot`（快照 + `apply_to`）/`strata_busy`、`strata_start_engine` 与 `strata_stop` 都 `apply_to` 后再 emit（否则前门开着时前端会闪一下「前门未运行」）、注册两个命令、退出关前门；`tray.rs` 的 `strata_slot_busy` 改用 `crate::strata_busy`、`quit` 里关前门。
+- 前端：`StrataStatus` 加 `proxy` / `proxy_port`；`ipc.strataProxyStart/Stop`；`store.startStrataProxy/stopStrataProxy`（启动前照旧走显存互斥卸 router 的 loaded 模型）；**「打开程序就自动启动 strata」改为拉起前门**（不再要求选中 config、不再写 config 的 `lazy_load`）；侧栏胶囊前门优先（`Strata 前门 · :9090`，只有前门没开时才显示 `Strata 引擎 · :9091`，点击 = 前门开则停前门、否则引擎在跑停引擎、都没有就起前门）；设置页「服务」分组改名「Strata 前门 / 服务项」，加前门状态与启停按钮，前门地址/端口**不再写 config**、只存 GUI 设置；Strata 面板工具栏加前门按钮、底部文案显示前门端口与引擎状态。
+- 验证：`cargo check --lib` exit 0（15 s，无警告）；`cargo test --lib` **98 passed / 0 failed / 5 ignored**（其中 `strata_proxy::tests::*` 4 个全过）；`npx tsc --noEmit` exit 0。⚠️ **沙箱里 `cargo test --lib` 会报 30 个 `拒绝访问。 (os error 5)`**（会话 TEMP 目录不可写，与 §22.6 的 esbuild 那条同源，跟本轮改动无关），必须先把 `$env:TEMP` / `$env:TMP` 指到 `E:\Code\llama.cpp-GUI\tmp` 再跑；用管道接 cargo 时 `$LASTEXITCODE` 是 `Select-String` 的，判成败只能看输出文本。
+- 已知限制 / 待真机确认：切换引擎 + 首次加载约 20–30 s，客户端超时要 ≥60 s；前门对其它路径（含 `/v1/chat/completions` 与引擎自带 WebUI）原样透传；前门开着但引擎没起时，`strata_probe` 的 `running` 仍是 false（前门只在 `proxy` 字段里体现），所以面板的「刷新状态」按钮此时是灰的。
+- 术语与胶囊文案（用户 **m01151 / m01218**）：用户拍板 **①各个模型端口保持不同**（不做"全部 config 并到同一端口"的简化）；②侧栏胶囊文案是「**Strata 代理 :9090**」（不用"前门"这个词、端口前不放 `·`，只有代理没开时才显示 `Strata 引擎 :9091`）；③胶囊下方那行**始终显示引擎版本**（用户原话「依然显示 Strata 引擎的版本」）—— `strataStatus.version`（`/props` 的 build_info）优先，引擎没起时回落到扫描到的 `strataEntries[0].engine_version`（`BUILD.json`，同一套引擎安装各 config 相同），都没有才是「版本未知」；代理端口改放在胶囊 title 与面板/设置页文案里。GUI 里用户可见的「前门」字样统一改成「代理」（`App.tsx` / `StrataPanel.tsx` / `SettingsPanel.tsx`），代码标识符与本文档仍叫 `proxy` / 前门。
+
+
+
+
+### 22.8 代理「DSH 连不上 / 请求被提前取消」的两个根因（用户 m01266）
+
+用户原话（m01266）："1、代理工作有问题，dsh是把模型加载了，但是连接不上；2、由dsh请求导致的strata模型加载在模型卡片没有显示加载中，而是在加载后直接显示运行中"。
+
+**定位手段**：给前门加逐跳诊断日志（**默认关闭**，设 `STRATA_PROXY_DEBUG` 才写 `%TEMP%\strata-proxy-debug.log`，panic 也写进去）。注意用户跑的是**装好的便携版** `E:\AI\llama.cpp-gui\llamacpp-gui.exe`（配置在同目录 `settings.json`），复现必须把新构建覆盖到那里再启动。
+
+**根因一（连接被 RST / 请求被取消）**：`start()` 对**监听**套接字调 `listener.set_nonblocking(true)`（非阻塞 accept + 30 ms 轮询），而 **Windows 上 `accept()` 返回的套接字会继承这个非阻塞标志**：
+
+- 「客户端 → 引擎」的 pump 线程第一次 `read` 立刻拿到 `WouldBlock`，日志原文 `pump: 客户端读 Err(无法立即完成一个非阻止性套接字操作。 (os error 10035)) → shutdown(上游 Write)`，跳出循环并 `shutdown(上游, Write)`；
+- 上游 `serve/server.py:4127-4150 _watch_client` 每 0.5 s `select` + `recv(1, socket.MSG_PEEK) == b""` 就把「读到 EOF」判成客户端挂断并 `cancel.set()`，而取消只在**提示读取的分块边界**生效（`server.py:317`，块 8192 token）⇒ 症状是「小 prompt（<0.5 s 读完）侥幸成功、18859 token 的 prompt 在第一个块边界（约 5.7 s）被截断」，引擎日志打 `0 generated ... (cancelled)`；
+- 同一非阻塞状态还让 `read_head` / `read_body`（`read_exact`）在时序不利时 `WouldBlock` → `serve` 返回 Err 并在请求体未读走时关连接 ⇒ 客户端 RST（「你的主机中的软件中止了一个已建立的连接」）。
+
+**修复**（`src-tauri/src/strata_proxy.rs`）：① `handle_connection` 第一件事 `let _ = client.set_nonblocking(false);`；② `forward` **删掉**客户端→上游的 pump 线程（请求体已由 `read_body` 整段读完、上游是 HTTP/1.0 + `Connection: close`，没有需要转发的客户端字节），只做单向 `io::copy(上游 → 客户端)`。
+
+**根因二（卡片不显示「加载中」）**：DSH 请求触发的引擎启动/模型加载是**前门**发起的，前端 `strataStarting` 只覆盖「用户在本页点启动」，所以卡片从「已停止」直接跳到「运行中」。修复：`state.strata_proxy_serving`（LIFO 栈）+ `Serving` 守卫（`Serving::begin` push 并广播 `strata://status`，`Drop` 时摘掉再广播一次）→ `StrataStatus.proxy_serving`（config 文件名）→ `StrataPanel.tsx` 的 `isLoading = starting === fileOf(e) || (status.proxy_serving === fileOf(e) && !status.loaded)`。**不能用引擎 `/status` 的 `busy`**：实测 `loaded=true`、请求结束后仍连续 40 s 报 `busy=true`。
+
+**真机验证（2026-10-11，冷启动整链路）**：`POST http://127.0.0.1:9090/v1/chat/completions`（唯一 prompt 78403 B ≈ 19k token，`stream:true`）→ 日志 `ensure ④起新引擎 strata-swift-iq3_xxs.json` → `Ok(())`、`forward 已写上游 78578 字节（头 175 + body 78403）`、`io::copy 结束，向客户端写 4835 字节`；客户端首字节 22.9 s、总 65.9 s、4835 B、18 个 chunk、含 `[DONE]`、`predicted_n: 16`（完整 SSE，引擎的 `: keep-alive` 心跳也完整穿过）。**修复前**同一请求 5561 ms 只收到 428 B 且无 `[DONE]`。随后 `cargo test --lib` 98 passed / 0 failed / 5 ignored、`npx tsc --noEmit` exit 0、`npm run tauri build` exit 0。
+
+**给下一位的提醒**：改前门转发（`forward` / `handle_connection`）后必须用 **>8k token 的未缓存 prompt** 经 9090 复测完整 SSE（小请求会掩盖这个 bug）；排查时开 `STRATA_PROXY_DEBUG=1`。

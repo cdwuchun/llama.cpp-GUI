@@ -50,6 +50,10 @@ export const ipc = {
   strataProbe: () => invoke<StrataStatus>("strata_probe"),
   strataStart: (configFile?: string | null) => invoke<StrataStatus>("strata_start", { configFile: configFile ?? null }),
   strataStop: () => invoke<StrataStatus>("strata_stop"),
+  /** 启动前门代理（默认 :9090）：一个端口挂全部 config，按请求里的 model 自动切换引擎 */
+  strataProxyStart: () => invoke<StrataStatus>("strata_proxy_start"),
+  /** 停止前门代理（引擎进程不动） */
+  strataProxyStop: () => invoke<StrataStatus>("strata_proxy_stop"),
   strataSetRoot: (path: string) => invoke<Settings>("strata_set_root", { path }),
   strataPick: (configFile: string) => invoke<Settings>("strata_pick", { configFile }),
   /** 参数编辑 L2：读 config 原文 */

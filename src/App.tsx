@@ -43,8 +43,10 @@ export default function App() {
   const stopRouter = useApp((s) => s.stopRouter);
   const openModelChat = useApp((s) => s.openModelChat);
   const strataStatus = useApp((s) => s.strataStatus);
-  const startStrata = useApp((s) => s.startStrata);
+  const strataEntries = useApp((s) => s.strataEntries);
   const stopStrata = useApp((s) => s.stopStrata);
+  const startStrataProxy = useApp((s) => s.startStrataProxy);
+  const stopStrataProxy = useApp((s) => s.stopStrataProxy);
 
   const [tab, setTab] = useState<Tab>("models");
   const [navOpen, setNavOpen] = useState(false);
@@ -119,11 +121,33 @@ export default function App() {
    * 单行时整句当内容；错误固定用「错误」当标题。
    */
   // 胶囊下方小字：与 router 的 version 行共用 .sidebar-foot-note，字号字体一致。
-  // 只放版本号 —— 侧栏窄，附加文案会换行，用户要求取消。外部实例的说明留在 title 里。
-  const strataFootText = strataStatus.version ?? "版本未知";
-  const strataFootTitle = strataStatus.external
-    ? `${strataFootText} · 非本 GUI 启动，无法启/停`
-    : strataFootText;
+  // 这里**一直放引擎版本号**（用户 m01151）；代理端口写在胶囊文字与 title 里。
+  // 版本号有两个来源、口径不同（用户 m01636）：引擎在跑时是 `/props.build_info`（本来就带
+  // 前缀，`Strata 0.1.41`），引擎没起时回落到扫描到的 `engine_version`（引擎目录 BUILD.json，
+  // 只有 `0.1.41`）——所以统一补 `Strata ` 前缀，别让同一行一会儿有前缀一会儿没有。
+  // 回落时挑**正在跑/前门正在服务/选中**的那份 config，而不是按 mtime 排第一的那份。
+  const strataProxyPort = strataStatus.proxy_port ?? 9090;
+  const strataVersionFile =
+    strataStatus.proxy_serving ??
+    strataStatus.config_path?.split(/[\\/]/).pop() ??
+    settings?.strata_selected_config ??
+    null;
+  const strataVersionEntry =
+    strataEntries.find((e) => strataVersionFile !== null && e.config_path.endsWith(strataVersionFile)) ??
+    strataEntries[0];
+  const strataVersionRaw = strataStatus.version ?? strataVersionEntry?.engine_version ?? null;
+  const strataFootText = !strataVersionRaw
+    ? "版本未知"
+    : /^strata\b/i.test(strataVersionRaw)
+      ? strataVersionRaw
+      : `Strata ${strataVersionRaw}`;
+  const strataFootTitle = strataStatus.proxy
+    ? `代理 :${strataProxyPort} · DSH 等客户端连这里${
+        strataStatus.running ? `（引擎 :${strataStatus.port}）` : "（引擎按首次请求自动启动）"
+      } · 引擎版本 ${strataFootText}`
+    : strataStatus.external
+      ? `${strataFootText} · 非本 GUI 启动，无法启/停`
+      : strataFootText;
   const toastText = error ?? notice ?? "";
   const toastLines = toastText.split("\n");
   const toastTitle = error ? "错误" : toastLines.length > 1 ? toastLines[0] : "";
@@ -214,27 +238,44 @@ export default function App() {
             <Fragment>
               <button
                 type="button"
-                className={`router-pill ${strataStatus.running ? "is-running" : "is-stopped"}`}
-                disabled={busy || (strataStatus.running && strataStatus.external)}
+                className={`router-pill ${strataStatus.proxy || strataStatus.running ? "is-running" : "is-stopped"}`}
+                disabled={busy || (!strataStatus.proxy && strataStatus.running && strataStatus.external)}
                 style={{ marginBottom: "0.2rem" }}
                 title={
-                  strataStatus.running && strataStatus.external
-                    ? `端口 :${strataStatus.port} 上的 Strata 不是本 GUI 启动的，请在它自己的控制台里停止`
-                    : strataStatus.running
-                      ? `点击停止 Strata（:${strataStatus.port}）`
-                      : "点击启动 Strata（默认 config）"
+                  strataStatus.proxy
+                    ? `点击停止 Strata 代理（:${strataProxyPort} · DSH 等客户端连这里）`
+                    : strataStatus.running && strataStatus.external
+                      ? `端口 :${strataStatus.port} 上的 Strata 不是本 GUI 启动的，请在它自己的控制台里停止`
+                      : strataStatus.running
+                        ? `点击停止 Strata 引擎（:${strataStatus.port}）`
+                        : "点击启动 Strata 代理（默认 :9090 · 按请求里的 model 自动切换引擎）"
                 }
-                onClick={() => void (strataStatus.running ? stopStrata() : startStrata())}
+                onClick={() =>
+                  void (strataStatus.proxy ? stopStrataProxy() : strataStatus.running ? stopStrata() : startStrataProxy())
+                }
               >
-                <span className={`status-dot ${strataStatus.running ? "online" : "offline"}`} style={{ marginTop: 0 }} />
+                <span
+                  className={`status-dot ${strataStatus.proxy || strataStatus.running ? "online" : "offline"}`}
+                  style={{ marginTop: 0 }}
+                />
                 <span className="router-pill-text">
-                  {strataStatus.running
-                    ? `Strata 运行中 · :${strataStatus.port}`
-                    : "Strata 未运行"}
+                  {strataStatus.proxy
+                    ? `Strata 代理 :${strataProxyPort}`
+                    : strataStatus.running
+                      ? `Strata 引擎 :${strataStatus.port}`
+                      : "Strata 未运行"}
                 </span>
-                <i className={`fas ${strataStatus.running && !strataStatus.external ? "fa-stop" : strataStatus.running ? "fa-lock" : "fa-play"}`} />
+                <i
+                  className={`fas ${
+                    (strataStatus.proxy || strataStatus.running) && !(strataStatus.external && !strataStatus.proxy)
+                      ? "fa-stop"
+                      : strataStatus.running
+                        ? "fa-lock"
+                        : "fa-play"
+                  }`}
+                />
               </button>
-              {strataStatus.running && (
+              {(strataStatus.proxy || strataStatus.running) && (
                 <span
                   className="sidebar-foot-note"
                   // 与上下两颗胶囊等距（CSS 的 margin-top 也是 0.45rem）

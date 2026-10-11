@@ -222,6 +222,12 @@ export interface StrataStatus {
   models_autoload: boolean | null;
   /** 运行中的实例不是本 GUI 启动的（GUI 无法启停它） */
   external: boolean;
+  /** 前门代理是否在监听（用户 m00798：前门 9090，DSH 连它，引擎按模型各用各的端口） */
+  proxy: boolean;
+  /** 前门端口 —— DSH 等客户端要连的就是它（引擎端口只给 GUI 自己用） */
+  proxy_port: number | null;
+  /** 前门当前正在服务的 config 文件名（null = 空闲/没开）；卡片据此显示「加载中」（用户 m01266） */
+  proxy_serving: string | null;
 }
 
 export interface AppPaths {
