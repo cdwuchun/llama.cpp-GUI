@@ -1357,3 +1357,24 @@ Origin 防护：`_foreign_origin()`（`:4601-4608`）= `bool(origin) and origin.
 对照：改前 sc117 是 4197 槽但引擎报 LOW 且实测会楔死（见 §8 第 5 条）；`strata-swift-iq2_xs.log` 早先的 100/512 组合分别对应 640 MiB / 2394 槽。
 
 **给下一位的提醒**：GUI 的 config 快照是**按下缓存**走的 —— 改了磁盘上 config 的 `args` 后必须**重启 GUI**，否则引擎仍按旧 args 起（面板底部那句「config 与运行时上下文不一致，重启才生效」说的就是它）。改前记得备份 config（本轮 `strata-sc117-swift-iq2-xs.json.bak-20261011-220154`）。
+
+### 22.11 卡片不显示「这个模型支持 MTP」（`--mtp` 从没进过 config 快照，用户 m00001）
+
+用户原话（m00001）："gui中 strata页的模型卡中没有显示模型是否支持MTP"。
+
+**根因**：卡片徽标的条件只有 `entry.vision || !entry.engine_exists || !!entry.kv_resident`，而 `StrataModelEntry` 解析了 `--max-context` / `--kv` / `--kv-resident` / `--vram-reserve-mib` / `--prompt-cache` / `--spec`，**唯独没认 `--mtp`** —— 这个安装事实只出现在「配置」Sheet 左栏的 args 原文里，不打开弹窗就永远看不到。
+
+**改动（四处）**：
+
+- `src-tauri/src/strata.rs:72` 新增 `pub mtp: bool`，`:276` 取 `mtp: arg_value(&args, "--mtp").is_some()`。只暴露「有没有」，MTP 权重路径不下沉 WebView（与 `has_api_key` 同口径）。
+- `src/types.ts:191` 同步 `mtp: boolean`。
+- `src/components/StrataPanel.tsx:213-232` 徽标插在「视觉」之后（与模型列表页顺序一致），卡片视图与列表视图共用 `nameEl`，两处同时生效；`--spec=0` 显示「MTP 关」，悬停写明「权重已装、当前未启用投机解码」，启用时给出验证窗口 `--spec=N`。
+- `src/styles/app.css:663-667` 新增 `.mc-badges span.mc-badge-muted`（压暗 0.62 + 虚线边）；特异性 (0,2,1) 压过 `.mc-badges span`。
+
+**判据选型**：以 `args` 里带 `--mtp` 为准，**不用模型名正则**。模型列表页那条 `/mtp/i.test(name)` 认的是文件名里带 MTP 的外挂草稿场景；Strata 侧「装了 MTP」只由安装器写下的 `--mtp` 路径表达（`STRATA_INSTALL_FACT_FLAGS`，GUI 只读、写回原样保留）。`--mtp` 存在 = 支持；`--spec=0` = 支持但当前关闭。
+
+**验证（2026-10-12）**：`npx tsc --noEmit` exit 0；`cargo test --lib` **99 passed / 0 failed / 5 ignored**；`npm run tauri build` exit 0（`src-tauri\target\release\llamacpp-gui.exe` 9,845,760 B、`bundle\nsis\llama.cpp GUI_0.1.1_x64-setup.exe` 3,097,264 B，16:11）；用户已在新构建的 GUI 上真机检查并确认「没有问题」（m00147）。
+
+**构建踩的两道坎**（已记进 `HANDOVER.md` §6）：① 沙箱内 esbuild `spawn EPERM`（命名管道被禁，vite 连 config 都加载不了）；② 提权后 esbuild 起来了，但 `88 modules transformed` 之后 `[vite:esbuild-transpile] remove %TEMP%\esbuild-<hash>: Access is denied.` —— 提权进程写不到工作区外的临时目录 ⇒ 把 `TEMP`/`TMP` 指到工作区 `.tmpbuild` 后一次通过（临时目录与 `_build.log` 用完即清，cargo 代理任务一并停掉）。
+
+**给下一位的提醒**：卡片要显示 config 里的启动事实，得先让 `StrataModelEntry` 认这个键 —— 前端徽标只看后端字段，args 原文不会自动流到卡片上；安装事实类参数一律只暴露「有没有」。

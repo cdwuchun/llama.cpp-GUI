@@ -67,6 +67,9 @@ pub struct StrataModelEntry {
     pub gpu: Option<String>,
     pub prompt_cache: Option<String>,
     pub spec: Option<String>,
+    /// args 里带 `--mtp <路径>` = 这套安装给这个模型装了 MTP 草稿权重（安装事实类，GUI 只读）。
+    /// 只暴露「有没有」，路径原文不下沉给 WebView（与 `has_api_key` 同口径）。
+    pub mtp: bool,
     /// config 文件的 mtime（毫秒），列表按它倒序（照抄 `setup.py:3723-3725`）。
     pub modified_ms: u64,
     /// 顶层 `exe` 指向的引擎文件是否存在（升级中途失败时会是 false）。
@@ -270,6 +273,7 @@ fn parse_config(path: &Path) -> Option<StrataModelEntry> {
         }),
         prompt_cache: arg_value(&args, "--prompt-cache"),
         spec: arg_value(&args, "--spec"),
+        mtp: arg_value(&args, "--mtp").is_some(),
         modified_ms,
         engine_exists: Path::new(&obj.get("exe")?.as_str()?).exists(),
         engine_version,

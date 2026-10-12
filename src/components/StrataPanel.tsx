@@ -208,10 +208,23 @@ function ConfigCard({
 
   // 名字旁的徽标：纯文字、跟在名字后，与模型列表一致。
   // 运行状态不在这里重复——卡片底部已有状态胶囊。
-  const hasBadges = entry.vision || !entry.engine_exists || !!entry.kv_resident;
+  // MTP：config 的 args 里带 --mtp（安装事实）= 这个模型装了自带的 MTP 草稿头。
+  // --spec 是 MTP 验证窗口，写 0 = 权重装上了但投机解码关着，徽标要说清「当前没启用」。
+  const mtpDisabled = entry.mtp && entry.spec === "0";
+  const mtpTitle = entry.mtp
+    ? mtpDisabled
+      ? "模型自带 MTP 草稿头（config 已装 --mtp 权重），但 MTP 验证窗口 --spec=0，当前未启用投机解码"
+      : `模型自带 MTP 草稿头（config 已装 --mtp 权重），MTP 验证窗口 --spec=${entry.spec ?? "未设（引擎默认）"}`
+    : undefined;
+  const hasBadges = entry.vision || entry.mtp || !entry.engine_exists || !!entry.kv_resident;
   const badges = (
     <span className="mc-badges">
       {entry.vision && <span>视觉</span>}
+      {entry.mtp && (
+        <span title={mtpTitle} className={mtpDisabled ? "mc-badge-muted" : undefined}>
+          {mtpDisabled ? "MTP 关" : "MTP"}
+        </span>
+      )}
       {!entry.engine_exists && <span>引擎缺失</span>}
       {entry.kv_resident ? <span>KV 池</span> : null}
     </span>

@@ -658,6 +658,13 @@
   padding: 1px 5px;
 }
 
+/* 「装了但当前没启用」的徽标（Strata 卡片的「MTP 关」）：压暗 + 虚线边，
+   与生效徽标一眼区分，避免看着像已开启。 */
+.mc-badges span.mc-badge-muted {
+  opacity: 0.62;
+  border-style: dashed;
+}
+
 /* 卡片底部的「配置 / 详情」两个按钮收小，与左侧状态徽标（实测 32px）同高；
    legacy 的 .btn-icon 是 38px，比它旁边那个「已停止」胶囊高出一截。 */
 .model-actions .btn-icon {

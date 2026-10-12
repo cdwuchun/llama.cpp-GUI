@@ -187,6 +187,8 @@ export interface StrataModelEntry {
   gpu: string | null;
   prompt_cache: boolean;
   spec: string | null;
+  /** args 里带 --mtp = 这套安装给该模型装了 MTP 草稿权重（安装事实类，GUI 只读） */
+  mtp: boolean;
   modified_ms: number | null;
   /** 引擎文件是否存在（升级中途失败时会是 false） */
   engine_exists: boolean;

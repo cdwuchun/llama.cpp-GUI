@@ -62,12 +62,12 @@
 | `src/utils/models.ts` | 扫描结果 ↔ router 运行态合并、段名/别名规则、过滤排序（纯逻辑） | 组件文件只导出组件（Fast Refresh 规则） |
 | `src/utils/paramSchema.ts` | 参数表 schema 与表单状态换算（纯数据） | |
 | `src/components/ParamForm.tsx` | 参数表单控件（下拉、路径选择、JSON 编辑） | §5.2 |
-| `src/components/StrataPanel.tsx` | Strata 页：卡片列表 + 配置 / 详情 Sheet | 972 行；参数表单复用 `ParamForm` |
+| `src/components/StrataPanel.tsx` | Strata 页：卡片列表 + 配置 / 详情 Sheet | 1055 行；参数表单复用 `ParamForm` |
 | `src/utils/strataParams.ts` | `strata-*.json` 的 `args` ↔ 表单状态换算与参数 schema（纯逻辑） | 与 `utils/paramSchema.ts` 并列 |
 | `src/components/ModelSheets.tsx` | 模型配置弹窗 + 详情弹窗 | 含多模态开关 |
 | `src/components/SettingsPanel.tsx` | 设置页（目录 / 服务 / 启动与托盘） | 端口/上限/空闲释放/API Key 改动都会触发「重启 router?」弹窗（§5.4） |
 | `src/styles/legacy/index.css` | 参照实现默认首页的 CSS 原样引用 | 4276 行；改样式优先加在 `src/styles/app.css` |
-| `src/styles/app.css` | 本应用补充样式 | 1502 行 |
+| `src/styles/app.css` | 本应用补充样式 | 1533 行 |
 
 ---
 
@@ -141,6 +141,7 @@ Strata 的二进制不同名、没有 router mode、管理端点与 llama.cpp �
 - **一个端口 = 一份 config = 一个引擎**：多份 config 写同一个端口时（本机两份都是 9090）它们天然互斥，切模型必须先 `/unload` 旧模型（上游顺手保存 learned expert profile、立刻放显存）再杀进程树，见 `store.ts::startStrataModel`（§22）。
 - **端口上跑的是哪份 config，只认 `/health` 的 `model`**：按端口猜归属会把在跑的实例记到别的卡片上（同端口多 config 时必错）。`lib.rs::attribute_strata_hit` 负责反查（有单测），报错信息一律点名模型名。
 - **卡片播放按钮 = 启动引擎 + `/load`**：只起引擎不 `/load` 的话 `/health.loaded=false`，卡片永远显示「已停止」（用户 m00001 的「模型都无法启动」就是这个）。只有侧栏「启动 Strata」胶囊是纯启引擎（强制 `lazy_load: true`）。
+- **卡片徽标的「支持 MTP」以 `args` 里带 `--mtp` 为准**（`strata.rs::StrataModelEntry.mtp` 只暴露 bool，MTP 权重路径不下沉 WebView，与 `has_api_key` 同口径）：`--mtp` 是安装器写下的安装事实（`STRATA_INSTALL_FACT_FLAGS`，GUI 只读、写回原样保留），所以它表示"这套安装给这个模型装了自带的 MTP 草稿头"。**不要改用模型名正则** —— 模型列表页那条 `/mtp/i.test(name)` 认的是文件名里带 MTP 的外挂草稿场景，对 Strata 的 config 会漏判和误判。`--spec` 是 MTP 验证窗口，写 `0` 时徽标显示虚线压暗的「MTP 关」（权重在装、投机解码当前关闭）。
 - **`sampling` 是顶层字段，不是 flag**：`temperature` / `top_p` / `top_k` / `min_p` 写在 config 顶层的 `sampling` 对象里（`strataParams.ts` 的哨兵 `--sampling-*` **永不进 `args`**）。语义是「请求自己没带采样字段时的默认值」，改完要重启引擎才生效。上游对坏值**直接拒绝启动**（`temperature` ≥ 0、`top_p` 0 < v ≤ 1、`min_p` 0 ≤ v ≤ 1、`top_k` 1..64 的整数），所以保存前必须过 `validateStrataSampling`；块里 GUI 不认识的键（上游实验开关键）要原样保留。
 - 引擎与它 spawn 的子进程都加 `CREATE_BREAKAWAY_FROM_JOB`（`winfix::no_throttle`）：GUI 被后台化时，子进程若继承宿主 Job Object 会被 CPU 节流，推理速度掉到个位数 t/s；父 Job 未开 `BREAKAWAY_OK` 时必须去掉该 flag 重试（`strata.rs::spawn_strata` 里有回退）。
 - **前门代理（B 方案，用户 m00752/m00798）**：`settings.strata_host` / `strata_port`（默认 `127.0.0.1:9090`）是 GUI **进程内**的代理监听（`strata_proxy.rs`），客户端只连它，它按请求体里的 `model` 停旧引擎、起新引擎 —— 切换全程持 `state.strata_switch` 串行化，并等旧端口释放（`strata::wait_port_free`，20 s）。**引擎端口来自各 config 的 `port`，但真正被绑定的是 `run-<模型>.bat` 里的 `--port`**（上游 `server.py:5339/5559` 用 CLI 值，config 的 `port` 它根本不读），两处不一致时 `spawn_strata` 直接 bail 并说明原因。设置页的前门地址/端口**只写 GUI 设置、不写 config**（写进去会把各模型的引擎端口覆盖成 9090）；`api_key` / `idle_unload_s` / `min_free_vram_mib` / `before_load` 仍逐份写 config。
@@ -293,7 +294,7 @@ npm run tauri build
 npm install                        # 受限沙箱里需要 --ignore-scripts
 npm run cargo:proxy                # 另开终端保持运行：本机 crates 代理 http://127.0.0.1:8787
 npx tsc --noEmit                   # 前端类型检查（在仓库根执行）
-cd src-tauri; cargo test --lib      # 后端单元测试（当前 93 passed / 5 ignored）
+cd src-tauri; cargo test --lib      # 后端单元测试（当前 99 passed / 5 ignored）
 npm test                           # 等价于上面两条（test:web + test:rs）
 npm run tauri build                # 打包（产出 exe + NSIS 安装包）
 node scripts/make-icons.mjs        # 重新生成全部图标资产
@@ -301,6 +302,11 @@ node scripts/make-icons.mjs        # 重新生成全部图标资产
 
 - **cargo 要走本机代理**：本机 Windows 原生 TLS（schannel）不可用（`SEC_E_NO_CREDENTIALS`），Node 的 OpenSSL 可以出站，`.cargo/config.toml` 已把 `crates-io` 指向 `127.0.0.1:8787`。没开代理就会 `Could not connect to server`。
 - **沙箱限制**：命名管道被禁 → esbuild（Vite / TSX）报 `spawn EPERM`，`npm run tauri build` 需要更宽权限；**GUI 运行验证必须在沙箱外**（WebView2 渲染进程走命名管道，沙箱内起不来窗口，这不是应用缺陷）。
+- **提权构建还要把 `TEMP`/`TMP` 指进工作区**：只提权不够 —— esbuild 起来后会把转译结果写进 `%TEMP%\esbuild-<hash>` 再删除，提权进程对工作区外的临时目录没有写权，症状是前端 `88 modules transformed` 之后 `[vite:esbuild-transpile] remove C:\Users\…\AppData\Local\Temp\esbuild-<hash>: Access is denied.`。可用写法（2026-10-12 实测一次通过）：
+
+  ```powershell
+  $env:TEMP='E:\Code\llama.cpp-GUI\.tmpbuild'; $env:TMP=$env:TEMP; npm run tauri build
+  ```
 - **提权被拒绝就不要重试同一个命令**，换做法或先问用户。
 - 只想看真实扫描结果：`cargo test --lib real_environment_model_scan -- --ignored --nocapture`（打印当前模型库的模型与辅助文件）。
 - **磁盘占用**：`target/` 是唯一的膨胀源（`src-tauri/src` 本身不到 1 MB）。全量构建曾经是 **debug 8.2 GB + release 2.9 GB**，

@@ -117,6 +117,9 @@ P7 已实现的能力（Strata 第二运行时通道）：
 - **Strata 页**：卡片列表 + 搜索/刷新/排序/筛选/视图切换；「配置」Sheet 的上层是参数表单
   （`strata-*.json` 里的 `args` ↔ 表单状态的换算在 `src/utils/strataParams.ts`），下层是原始 JSON 编辑；
   写回走「校验 → 备份 → 原子写」，非法内容不会落盘。
+  卡片名后的徽标是四项：**视觉 / MTP / 引擎缺失 / KV 池**。「支持 MTP」的判据是这份 config 的
+  `args` 里带 `--mtp`（安装器写下的安装事实，路径 GUI 只读），不是按模型名猜；`--spec=0` 时
+  徽标显示成虚线压暗的 **「MTP 关」**（权重已装、当前未启用投机解码），悬停给出验证窗口 `--spec=N`。
 - **WebUI 交给系统浏览器**：用 `ipc.openLocalUrl` 打开，不接管、也不内嵌 iframe —— CSP 不必放宽，
   Strata 之后升级自带的 WebUI 也不会牵动这个 GUI。
 - **显存互斥**：启动 router 模型前先卸掉 Strata 正在跑的模型，反之亦然（设置里可关 `strata_router_mutex`）；
