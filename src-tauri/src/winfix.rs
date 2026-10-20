@@ -202,14 +202,6 @@ pub fn no_throttle(cmd: &mut Command) -> &mut Command {
 pub fn port_in_use(port: u16) -> bool {    TcpListener::bind(("127.0.0.1", port)).is_err()
 }
 
-/// 从首选端口开始寻找一个可用端口。
-pub fn find_free_port(preferred: u16) -> Option<u16> {
-    if !port_in_use(preferred) {
-        return Some(preferred);
-    }
-    (preferred.saturating_add(1)..preferred.saturating_add(64)).find(|p| !port_in_use(*p))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,17 +227,6 @@ mod tests {
         let dir = std::env::temp_dir();
         let out = ensure_ascii_dir(&dir, &dir.join("links")).unwrap();
         assert_eq!(out, dir);
-    }
-
-    #[test]
-    fn port_probe_reports_free_port() {
-        // 绑定一个端口占住它，再验证探测逻辑
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let busy = listener.local_addr().unwrap().port();
-        assert!(port_in_use(busy));
-        let free = find_free_port(busy);
-        assert!(free.is_some());
-        drop(listener);
     }
 
     /// 悬空 junction 必须能被替换：目标被删/改名后 `exists()` 返回 false（它跟随目标），

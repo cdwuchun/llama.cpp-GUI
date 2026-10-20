@@ -41,14 +41,14 @@ export class ErrorBoundary extends Component<Props, State> {
       return (
         <div className="notice error">
           <strong>{this.props.label ?? "界面"}渲染出错</strong>
-          <pre className="code-block" style={{ marginTop: 8 }}>
+          <pre className="code-block mt-2">
             {error.message}
           </pre>
           <div className="row">
             <button type="button" onClick={() => this.setState({ error: null })}>重试</button>
             {this.props.onClose && <button type="button" onClick={this.props.onClose}>关闭</button>}
           </div>
-          <div className="form-text" style={{ marginTop: 6 }}>
+          <div className="form-text mt-1">
             详情已写入「日志」页的 frontend 来源，可直接复制反馈。
           </div>
         </div>

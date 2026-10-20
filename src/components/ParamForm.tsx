@@ -164,8 +164,7 @@ function PathControl({
       <input
         type="text"
         list={listId}
-        className="form-control mono"
-        style={{ fontSize: 12 }}
+        className="form-control mono fs-xs"
         placeholder={
           cfg?.placeholder ?? (isDir ? "留空 = 在 PATH 中搜索" : "留空 = 自动检测同目录文件")
         }
@@ -381,8 +380,7 @@ function ValueControl({
       <div className="path-picker">
         <input
           type="text"
-          className="form-control json-param-input mono"
-          style={{ fontSize: 13 }}
+          className="form-control json-param-input mono fs-sm"
           value={state.value}
           readOnly
           placeholder="[JSON] 点击右侧按钮编辑"
@@ -609,14 +607,13 @@ export function ParamForm({
   return (
     <div>
       {headerTools && (
-        <div className="row" style={{ justifyContent: "space-between", marginBottom: "0.75rem" }}>
-          <span className="form-text" style={{ marginTop: 0 }}>
+        <div className="row row-split mb-3">
+          <span className="form-text mt-0">
             已启用 {enabledCount} / {schema.params.length} 个参数
           </span>
           <button
             type="button"
-            className="btn btn-secondary"
-            style={{ padding: "0.35rem 0.65rem", fontSize: "0.78rem" }}
+            className="btn btn-secondary btn-xs"
             disabled={enabledCount === 0}
             onClick={clearAll}
           >
@@ -649,50 +646,30 @@ export function ParamForm({
               </summary>
 
               <div className="param-group-body">
-                <div
-                  style={{
-                    display: "grid",
-                    // minmax(0,1fr)：默认的 `1fr` 下限是 min-content，长 option 文本
-                    // （例如 --samplers 的候选值）会把两栏撑出弹窗宽度
-                    gridTemplateColumns: special ? "minmax(0,1fr)" : "minmax(0,1fr) minmax(0,1fr)",
-                    gap: "1rem",
-                  }}
-                >
+                <div className={special ? "param-grid param-grid--single" : "param-grid"}>
                   {items.map((p) => {
                     const s = state[p.key] ?? {
                       enabled: false,
                       value: p.type === "LOGIC" ? boolText(p.default) : p.default,
                     };
                     return (
-                      <div className="form-group param-field" key={p.key} style={{ minWidth: 0 }}>
-                        <div
-                          className="param-label-row"
-                          style={{ display: "flex", alignItems: "center", gap: "0.4rem", lineHeight: 1.1 }}
-                        >
+                      <div className="form-group param-field" key={p.key}>
+                        <div className="param-label-row">
                           <input
                             className="form-check-input param-enable-toggle"
                             type="checkbox"
                             checked={s.enabled}
-                            title="勾选后写入该模型的 preset 段"
-                            style={{
-                              margin: 0,
-                              width: 14,
-                              height: 14,
-                              flex: "0 0 auto",
-                              transform: "translateY(1px)",
-                            }}
+                            title="勾选后写入该模型的配置"
                             onChange={(e) => setOne(p.key, { ...s, enabled: e.target.checked })}
                           />
                           <label
                             className="form-label"
-                            style={{ margin: 0, fontSize: 15, lineHeight: 1.1 }}
                             title={p.flag}
                           >
                             {p.label}
                             {p.desc && (
                               <i
                                 className="fas fa-question-circle param-desc-trigger"
-                                style={{ cursor: "pointer", marginLeft: 4 }}
                                 onClick={(e) => {
                                   // 与 hub 一致：点问号只开说明弹窗，不冒泡到 label
                                   e.preventDefault();
@@ -788,19 +765,18 @@ export function ParamForm({
           }
         >
           <textarea
-            className="form-control mono"
-            style={{ minHeight: 220, fontSize: 13, lineHeight: 1.5 }}
+            className="form-control mono json-edit-textarea"
             value={jsonEdit.text}
             placeholder='例如：{"chat_template_kwargs": {"enable_thinking": false}}'
             onChange={(e) => setJsonEdit({ ...jsonEdit, text: e.target.value, error: null })}
           />
           {jsonEdit.error && (
-            <div className="notice error" style={{ marginTop: "0.75rem" }}>
+            <div className="notice error mt-3">
               {jsonEdit.error}
             </div>
           )}
           <small className="form-text">
-            保存时会去掉换行（preset 一个键占一行）。留空表示不设置该参数。
+            保存时会去掉换行。留空表示不设置该参数。
           </small>
         </Modal>
       )}

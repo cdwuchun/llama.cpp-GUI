@@ -18,13 +18,15 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::model_config;
+use crate::scheduler;
 use crate::state::AppState;
 use crate::strata::{self, StrataModelEntry, StrataStatus};
 
@@ -204,12 +206,16 @@ impl Drop for Serving {
     }
 }
 
-/// 诊断日志（**默认关闭**）：设了环境变量 `STRATA_PROXY_DEBUG` 才写 `%TEMP%\strata-proxy-debug.log`。
+/// 前门诊断日志。
 ///
-/// 只在排查「客户端连不上前门 / 请求被提前取消」这类真机问题时开：记录每条连接的
-/// 请求行与体长、`ensure_engine` 走的是哪个分支、转发写了多少字节、上游何时被半关。
-/// 不设变量时每次调用只是一次 `var_os` 判断（这个函数本身几乎不进热路径）。
+/// 两条去向：
+/// 1. 始终写进日志文件（`<配置目录>\logs\gui-*.log`，来源标 `proxy`），**不进内存面板** ——
+///    一次请求就有好几行细粒度诊断，塞进面板会把真正有用的行刷掉（用户 m05885 要的是事后能查）。
+/// 2. 设了 `STRATA_PROXY_DEBUG` 时，额外照旧写 `%TEMP%\strata-proxy-debug.log`（老的排查脚本还在用）。
 fn dbg(msg: &str) {
+    if let Some(hub) = crate::logs::global() {
+        hub.push_file_only("proxy", &format!("[{:?}] {msg}", thread::current().id()));
+    }
     if std::env::var_os("STRATA_PROXY_DEBUG").is_none() {
         return;
     }
@@ -228,16 +234,54 @@ fn dbg(msg: &str) {
     }
 }
 
-/// 临时：把 panic 信息也写进调试日志（同样只在 `STRATA_PROXY_DEBUG` 打开时生效）。
-fn install_debug_hook() {
-    if std::env::var_os("STRATA_PROXY_DEBUG").is_none() {
-        return;
+/// 值得用户看见的前门事件（慢请求、错误）：进日志面板，也落盘。
+///
+/// 来源用 `system`：面板的「系统（GUI 与前门）」筛的就是它，不必再加一档（用户 m05885）。
+fn proxy_event(msg: &str) {
+    if let Some(hub) = crate::logs::global() {
+        hub.push("system", format!("[前门] {msg}"));
     }
+}
+
+/// 连接耗时阈值：超过就记一行「慢」。前门「连得上但不回包」只能靠耗时定位到哪一段（用户 m05816）。
+const SLOW_CONN_MS: u128 = 1000;
+
+/// 连接计时（RAII）。
+///
+/// 收尾放在 `Drop` 里：`serve` 里有十来处提前 return，逐个加收尾必漏。正常收工也要计时，
+/// 才分得清是「读头等太久」还是「请求处理慢」。
+struct ConnTimer {
+    t0: std::time::Instant,
+    what: String,
+}
+
+impl ConnTimer {
+    fn new(what: String) -> Self {
+        Self {
+            t0: std::time::Instant::now(),
+            what,
+        }
+    }
+}
+
+impl Drop for ConnTimer {
+    fn drop(&mut self) {
+        let ms = self.t0.elapsed().as_millis();
+        if ms >= SLOW_CONN_MS {
+            proxy_event(&format!("{} 耗时 {ms} ms", self.what));
+        }
+    }
+}
+
+/// panic 信息也写进日志（真机排查最需要的就是这一条）。
+fn install_debug_hook() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            dbg(&format!("PANIC: {info}"));
+            let text = format!("PANIC: {info}");
+            proxy_event(&text);
+            dbg(&text);
             prev(info);
         }));
         dbg("panic hook installed");
@@ -257,10 +301,16 @@ fn handle_connection(app: &AppHandle, mut client: TcpStream) {
     // 客户端提前断开（curl 超时、客户端取消）是常态，不值得刷日志。
     let peer = client.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     dbg(&format!("accept {peer}"));
+    // 超时就记一行「慢」：真机上前门卡住时，日志里有没有这行、耗时多少是唯一的线索
+    // （用户 m05816：连得上但不回包；用户 m05885：要能事后查）。
+    let _timer = ConnTimer::new(format!("连接 {peer}"));
     let r = serve(app, &mut client);
     match r {
         Ok(()) => dbg(&format!("serve ok {peer}")),
-        Err(e) => dbg(&format!("serve Err {peer}: {e}")),
+        Err(e) => {
+            dbg(&format!("serve Err {peer}: {e}"));
+            proxy_event(&format!("连接 {peer} 处理失败：{e}"));
+        }
     }
 }
 
@@ -281,6 +331,12 @@ fn serve(app: &AppHandle, client: &mut TcpStream) -> std::io::Result<()> {
         );
     };
     dbg(&format!("{method} {target} 头字段 {} 个", headers.len()));
+
+    // 跨源预检：webview 直连本机端口算跨源，`POST` + `application/json` 会先发 `OPTIONS`。
+    // 统一答 204 + CORS 头，不读 body（预检本来也没有 body）。
+    if method.eq_ignore_ascii_case("OPTIONS") {
+        return send_preflight(client);
+    }
 
     // `Expect: 100-continue`：不先回 100，客户端（reqwest 传大 body 时）会一直等，
     // 两边一起卡死；回过 100 之后我们才读 body。
@@ -317,9 +373,71 @@ fn serve(app: &AppHandle, client: &mut TcpStream) -> std::io::Result<()> {
         return send_json(client, 200, "OK", &models_payload(state));
     }
 
-    // 目标模型：请求体里的 `model` 优先；`/v1/models/<id>` 这种路径式再退一步。
+    // 显式加载/卸载：router 模式下客户端与前端都调这两个端点，前门作为它的替代品自己兑现
+    // （不再把 `/models/load` 透传给某个引擎 —— 单实例没有"加载别人"的能力）。
+    if method.eq_ignore_ascii_case("POST") && matches!(path.as_str(), "/models/load" | "/models/unload")
+    {
+        let name = model_in_body(&body).unwrap_or_default();
+        // 新扫描到、配置还没生成的模型：显式加载时按名字（= 扫描 id）现补一份配置，
+        // 不必让用户先去点一次「同步」（用户 m08378 第 2 点）。
+        let found = find_llama_model(state, &name).or_else(|| {
+            if path.ends_with("/load") {
+                scheduler::ensure_config_for(state, &name).ok()
+            } else {
+                None
+            }
+        });
+        let Some(item) = found else {
+            dbg(&format!("404 {path} model not found: {name}"));
+            return send_json(
+                client,
+                404,
+                "Not Found",
+                &json!({
+                    "error": {
+                        "message": format!("model not found: {name}"),
+                        "type": "invalid_request_error",
+                    }
+                }),
+            );
+        };
+        if path.ends_with("/load") {
+            return match scheduler::ensure_ready(app, state, &item.id) {
+                Ok(port) => send_json(
+                    client,
+                    200,
+                    "OK",
+                    &json!({"model": item.config.name, "port": port, "status": "loaded"}),
+                ),
+                Err(err) => {
+                    dbg(&format!("/models/load 失败: {err}"));
+                    send_json(
+                        client,
+                        503,
+                        "Service Unavailable",
+                        &json!({"error": {"message": err}}),
+                    )
+                }
+            };
+        }
+        let stopped = {
+            let mut sched = scheduler::lock_sched(state);
+            sched.stop(&item.id, &state.logs)
+        };
+        dbg(&format!("/models/unload {} → 进程被杀: {stopped}", item.id));
+        return send_json(
+            client,
+            200,
+            "OK",
+            &json!({"model": item.config.name, "status": "unloaded"}),
+        );
+    }
+
+    // 目标模型：请求体里的 `model` 优先；`/v1/models/<id>` 路径式次之；再退一步认
+    // query 里的 `?model=`（浏览器打开自带 WebUI 时靠它点名实例）。
     let wanted = model_in_body(&body)
-        .or_else(|| path.strip_prefix("/v1/models/").map(|s| s.to_string()));
+        .or_else(|| path.strip_prefix("/v1/models/").map(|s| s.to_string()))
+        .or_else(|| model_in_query(&target));
 
     // 没引擎时 `/health` 也要能答：客户端（含 DSH）用它判活，答"端口无响应"就等于没人接。
     if method.eq_ignore_ascii_case("GET") && path == "/health" && live_engine(state).is_none() {
@@ -335,6 +453,96 @@ fn serve(app: &AppHandle, client: &mut TcpStream) -> std::io::Result<()> {
                 "proxy": true,
             }),
         );
+    }
+
+    // llama.cpp 通道（P1）：配置目录里点名的模型交给前门调度器 —— 它负责起子实例、
+    // 等就绪、容量不够时先腾位置。Strata 那条路（下面）保持不变。
+    if let Some(name) = wanted.as_deref() {
+        if let Some(item) = find_llama_model(state, name) {
+            // 浏览器打开自带 WebUI（卡片上的 💬、或侧栏「开始聊天」带 `?model=`）：**302 到实例端口**。
+            // 不能把页面留在前门：WebUI 的模型列表走相对路径 `/v1/models`，那会回到前门拿到
+            // 两通道的合成列表（含 Strata 的模型，点了 404、看起来「改不了」—— 用户 m02258 第 1 点）；
+            // 落到实例端口后，WebUI 只跟那一个实例说话。
+            if is_page_request(&method, &path) {
+                return match scheduler::ensure_ready(app, state, &item.id) {
+                    Ok(port) => {
+                        dbg(&format!("→ WebUI 重定向到实例端口 {port}"));
+                        send_redirect(client, &format!("http://127.0.0.1:{port}/"))
+                    }
+                    Err(err) => send_html(client, &webui_error_html(&item.config.name, &err)),
+                };
+            }
+            return serve_llama(app, client, state, &method, &target, &headers, &body, &item);
+        }
+    }
+
+    // 浏览器打开自带 WebUI（侧栏「开始聊天」不带模型）：**页面与它引用的 JS/CSS/图标**
+    // 都挑一个已经就绪的实例转发 —— 静态文件哪个实例给的都是同一份。
+    // 一个都没就绪时，页面本身回一张提示页（列出模型点一个就起），资源请求照旧落默认
+    // 通道（此时页面没渲染，资源 404 无所谓）。
+    if wanted.is_none() && is_webui_asset(&path) {
+        if let Some(item) = first_ready_llama(state) {
+            // 页面请求：302 到实例端口（理由同上）；静态资源请求：照旧直接转发。
+            if is_page_request(&method, &path) {
+                if let Some(port) = item.config.port {
+                    dbg(&format!("→ 无点名，WebUI 重定向到已就绪实例 :{port}"));
+                    return send_redirect(client, &format!("http://127.0.0.1:{port}/"));
+                }
+            }
+            dbg("→ WebUI 静态资源交给已就绪的 llama.cpp 实例");
+            return serve_llama(app, client, state, &method, &target, &headers, &body, &item);
+        }
+        if is_page_request(&method, &path) {
+            dbg("→ 没有已就绪实例，给提示页");
+            return send_html(client, &webui_hint_html(state));
+        }
+    }
+
+    // llama.cpp 实例自带、但**不是** WebUI 静态资源的端点（`/tools`、`/build.json`、
+    // `/cors-proxy`）：无点名时它们只可能是冲 llama.cpp 实例来的。
+    // 漏掉这一段代价很大 —— `/tools` 与 `/build.json` 既不在 `is_webui_asset` 里，也不在
+    // `is_passive_probe` 里，于是落进默认通道（Strata 的默认 config）：点一次「开始聊天」
+    // 就把 40 GB 的 Strata 模型拉起来，而用户想聊的是已经在跑的 llama.cpp 模型
+    // （用户 m08817 实测：日志里 `GET /tools` 紧跟一条 `ensure ④起新引擎`）。
+    if wanted.is_none() && is_llama_endpoint(&path) {
+        if let Some(item) = first_ready_llama(state) {
+            dbg(&format!("→ {path} 交给已就绪的 llama.cpp 实例"));
+            return serve_llama(app, client, state, &method, &target, &headers, &body, &item);
+        }
+        dbg(&format!("→ {path} 没有已就绪实例，回空壳（不启动 Strata 引擎）"));
+        return match path.as_str() {
+            "/tools" => send_json(client, 200, "OK", &json!([])),
+            _ => send_json(client, 200, "OK", &json!({})),
+        };
+    }
+
+    // 无 model 的被动探测端点（`/props`、`/slots`、`/metrics`、`/v1/health`）：**不要**顺手把
+    // Strata 引擎拉起来（用户 m02258 第 2 点）—— 引擎只在该模型被点名时按需启动，
+    // 模型卡点启动、或前门收到点名该模型的请求。这些端点只是读状态，没引擎就回空壳。
+    if wanted.is_none() && is_passive_probe(&path) && live_engine(state).is_none() {
+        dbg(&format!("→ {path} 没有引擎，回空壳（不启动引擎）"));
+        return match path.as_str() {
+            "/slots" => send_json(client, 200, "OK", &json!([])),
+            _ => send_json(client, 200, "OK", &json!({})),
+        };
+    }
+
+    // 显存互斥（用户 m03160 第 2 点 / m08817）：Strata 通道真要干活了，就先把 llama.cpp
+    // 侧的实例停掉。互斥原先只在 GUI 前端做（store.startModel / startStrataModel），前门
+    // 自己拉起的加载会绕过它 —— 于是出现「Strata 起来了、llama.cpp 的模型还占着显存」。
+    // 只在真有实例在跑时才动，否则每个请求都要白拿一次调度锁。
+    if state.settings.get().strata_router_mutex {
+        let stopped = {
+            let mut sched = scheduler::lock_sched(state);
+            if sched.table().active_count() == 0 {
+                Vec::new()
+            } else {
+                sched.stop_all(&state.logs)
+            }
+        };
+        if !stopped.is_empty() {
+            dbg(&format!("→ 显存互斥：已停掉 llama.cpp 实例 {stopped:?}"));
+        }
     }
 
     let entry = match resolve_target(state, wanted.as_deref()) {
@@ -385,7 +593,290 @@ fn serve(app: &AppHandle, client: &mut TcpStream) -> std::io::Result<()> {
     }
 
     dbg(&format!("→ forward {}:{}（{}）", connect_host(&entry.host), entry.port, entry.model_name));
-    forward(client, &method, &target, &headers, &body, &entry)
+    forward(
+        client,
+        &method,
+        &target,
+        &headers,
+        &body,
+        UpstreamTarget {
+            host: &entry.host,
+            port: entry.port,
+            label: "Strata 引擎",
+        },
+    )
+}
+
+/// 在 llama.cpp 通道的配置目录里找请求点名的模型（文件名 id 与 `name` 字段都认）。
+/// query 里的 `model=`（浏览器打开自带 WebUI 时用它点名实例）；`%2F` 这类编码要还原。
+fn model_in_query(target: &str) -> Option<String> {
+    let query = target.split_once('?')?.1;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == "model" {
+            let decoded = percent_decode(value);
+            let trimmed = decoded.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 只解 `%XX` 与 `+`，够 query 参数用；模型名里的 `/` 会被浏览器编码成 `%2F`。
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+            match u8::from_str_radix(hex, 16) {
+                Ok(byte) => {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+                Err(_) => {}
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// WebUI 页面本体请求（只有这两个路径是页面，`/_app/...` 那些是资源）。
+fn is_page_request(method: &str, path: &str) -> bool {
+    method.eq_ignore_ascii_case("GET") && matches!(path, "/" | "/index.html")
+}
+
+/// 只读状态的探测端点：没有引擎时**不要**为它们把 Strata 引擎拉起来（用户 m02258 第 2 点）。
+fn is_passive_probe(path: &str) -> bool {
+    matches!(path, "/props" | "/slots" | "/metrics" | "/v1/health")
+}
+
+/// llama.cpp 实例自带、但**不是** WebUI 静态资源的端点。
+///
+/// `/tools`（MCP 工具列表）与 `/build.json`（构建信息）是自带 WebUI 每次打开都会要的，
+/// 不带扩展名、也不在 `is_webui_asset` 名单里；`/cors-proxy` 是它取跨域图片用的。
+/// 无点名时这些请求只可能是冲 llama.cpp 实例来的，绝不能落进 Strata 的默认通道
+/// —— 否则一次页面加载就会把 Strata 引擎和它几十 GB 的模型拉起来（用户 m08817）。
+fn is_llama_endpoint(path: &str) -> bool {
+    matches!(path, "/tools" | "/build.json" | "/cors-proxy")
+}
+
+/// 302 到实例自己的端口：浏览器跟着跳过去之后，页面里那些相对路径的请求就只发给那个实例了。
+fn send_redirect(client: &mut TcpStream, location: &str) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\
+         Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+    );
+    client.write_all(head.as_bytes())?;
+    client.flush()
+}
+
+/// WebUI 页面请求但实例起不来时给的错误页（端口被占、显存不够等）。
+fn webui_error_html(model: &str, err: &str) -> String {
+    format!(
+        "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\">\
+         <title>启动失败 · {name}</title>\
+         <body style=\"font:14px/1.6 system-ui;background:#0e1113;color:#eef1f3;padding:32px\">\
+         <h1 style=\"font-size:18px\">模型「{name}」没能启动</h1>\
+         <pre style=\"white-space:pre-wrap;background:#1b1f23;padding:12px;border-radius:8px\">{err}</pre>\
+         <p><a style=\"color:#34d399\" href=\"/\">← 返回模型列表</a></p></body></html>",
+        name = html_escape(model),
+        err = html_escape(err),
+    )
+}
+
+/// 自带 WebUI 的静态资源：页面、打包的 JS/CSS、图标 —— 任意实例给的都是同一份文件。
+///
+/// **必须连资源一起认出来**（用户 m02048 报「聊天界面是空白的」）：只认 `/` 的话，
+/// `index.html` 取得到，它引用的 `/_app/immutable/bundle.*.js` 却会掉进默认通道
+/// （Strata 引擎）拿到 `404 BaseHTTP`，浏览器里就是一个空白页 —— 实测前门取该
+/// bundle 是 404、直连已就绪实例是 200（2.6 MB）。
+fn is_webui_asset(path: &str) -> bool {
+    matches!(path, "/" | "/index.html" | "/manifest.webmanifest")
+        || path.starts_with("/_app/")
+        || path.starts_with("/favicon")
+        || path.starts_with("/apple-")
+        || [
+            ".js", ".mjs", ".css", ".svg", ".png", ".ico", ".webmanifest", ".woff2",
+        ]
+        .iter()
+        .any(|ext| path.ends_with(ext))
+}
+
+/// 一段自制 HTML（只在"聊天页但没有任何已就绪实例"时用）：列出本地模型，点一个就起它。
+fn webui_hint_html(state: &AppState) -> String {
+    let dir = state.model_config_dir();
+    let items = model_config::load_dir(&dir);
+    let mut rows = String::new();
+    {
+        let sched = scheduler::lock_sched(state);
+        for item in &items {
+            let name = item.config.name.as_str();
+            let state_now = sched.table().state_of(&item.id);
+            let label = match state_now {
+                scheduler::ModelState::Ready => "已加载",
+                scheduler::ModelState::Starting => "启动中",
+                scheduler::ModelState::Stopping => "停止中",
+                scheduler::ModelState::Failed => "启动失败",
+                scheduler::ModelState::Idle => "未加载",
+            };
+            rows.push_str(&format!(
+                "<li><a href=\"/?model={}\">{}</a><span class=\"s\">{}</span></li>",
+                url_encode(name),
+                html_escape(name),
+                label
+            ));
+        }
+    }
+    if rows.is_empty() {
+        rows.push_str("<li class=\"empty\">配置目录里还没有模型</li>");
+    }
+    format!(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">\
+<title>llama.cpp GUI · 前门</title>\
+<style>\
+body{{margin:0;padding:32px;background:#0e1113;color:#eef1f3;\
+font:14px/1.6 system-ui,\"Microsoft YaHei UI\",sans-serif}}\
+h1{{font-size:18px;margin:0 0 4px}}\
+p{{color:#8e979f;margin:0 0 18px}}\
+ul{{list-style:none;margin:0;padding:0;max-width:560px}}\
+li{{display:flex;justify-content:space-between;gap:12px;padding:8px 12px;\
+border:1px solid #2a3036;border-radius:10px;margin-bottom:6px;background:#161a1d}}\
+li.empty{{color:#8e979f;justify-content:center}}\
+a{{color:#34d399;text-decoration:none}}\
+.s{{color:#8e979f}}\
+</style></head><body>\
+<h1>前门 :9090</h1>\
+<p>还没有已加载的模型。点下面任意一个开始加载（首次要 20～60 秒），\
+或者回到 GUI 的模型页加载。</p><ul>{rows}</ul></body></html>"
+    )
+}
+
+/// 只做 percent-encode：模型名里可能有 `/`、中文、空格。
+fn url_encode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn send_html(client: &mut TcpStream, body: &str) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+Content-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    client.write_all(head.as_bytes())?;
+    client.write_all(body.as_bytes())?;
+    client.flush()
+}
+
+/// 已经就绪的 llama.cpp 实例（按配置目录顺序取第一个）：给"没点名模型"的根路径用。
+fn first_ready_llama(state: &AppState) -> Option<model_config::DirConfig> {
+    let dir = state.model_config_dir();
+    let items = model_config::load_dir(&dir);
+    let sched = scheduler::lock_sched(state);
+    items
+        .into_iter()
+        .find(|item| sched.table().state_of(&item.id) == scheduler::ModelState::Ready)
+}
+
+fn find_llama_model(state: &AppState, wanted: &str) -> Option<model_config::DirConfig> {
+    let dir = state.model_config_dir();
+    model_config::load_dir(&dir)
+        .into_iter()
+        .find(|item| model_config::same_id(&item.id, wanted) || item.config.name == wanted)
+}
+
+/// llama.cpp 通道的转发：先让调度器把子实例弄到就绪，再按字节流原样透传。
+fn serve_llama(
+    app: &AppHandle,
+    client: &mut TcpStream,
+    state: &AppState,
+    method: &str,
+    target: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    item: &model_config::DirConfig,
+) -> std::io::Result<()> {
+    // 这次请求打的是哪个模型，要能在默认日志里查到（用户 m01516）。以前只有开
+    // STRATA_PROXY_DEBUG 才有细粒度诊断，聊天页「模型自己换了」这类现象只能靠猜。
+    let was_ready = matches!(
+        scheduler::lock_sched(state).table().state_of(&item.id),
+        scheduler::ModelState::Ready
+    );
+    let port = match scheduler::ensure_ready(app, state, &item.id) {
+        Ok(port) => port,
+        Err(err) => {
+            dbg(&format!("ensure_ready 失败: {err}"));
+            return send_json(
+                client,
+                503,
+                "Service Unavailable",
+                &json!({"error": {"message": err}}),
+            );
+        }
+    };
+    // 监控页每 2 秒轮询 `/metrics?model=…`、`/slots?model=…` 也走这里，不能每轮都记；
+    // 只记「这次要起引擎」和真正的 POST 请求，够定位「哪个模型被点名」。
+    if !was_ready || method.eq_ignore_ascii_case("POST") {
+        state.logs.push(
+            "system",
+            format!(
+                "[前门] 请求模型 {} → {} :{port}",
+                item.config.name,
+                if was_ready { "已就绪实例" } else { "启动子实例" }
+            ),
+        );
+    }
+    dbg(&format!("→ forward 127.0.0.1:{port}（{}，llama.cpp）", item.id));
+    // 转发期间记下「这个模型在用」：容量闸淘汰时挑不到它（与 router 的 pick_victim 同规则）。
+    {
+        let mut sched = scheduler::lock_sched(state);
+        sched.table_mut().begin_request(&item.id);
+    }
+    let outcome = forward(
+        client,
+        method,
+        target,
+        headers,
+        body,
+        UpstreamTarget {
+            host: item.config.host.as_str(),
+            port,
+            label: "llama.cpp 子实例",
+        },
+    );
+    // 结束一定要记账，否则这个模型会被永远当成「在用」，再也不会被淘汰。
+    {
+        let mut sched = scheduler::lock_sched(state);
+        sched.table_mut().end_request(&item.id);
+        if outcome.is_ok() {
+            let now = crate::logs::now_ms();
+            sched.table_mut().touch(&item.id, now);
+        }
+    }
+    outcome
 }
 
 /// 路由候选项不匹配时的两种失败。
@@ -415,6 +906,18 @@ fn config_entries(state: &AppState) -> Vec<StrataModelEntry> {
         .unwrap_or_default()
 }
 
+/// 「哪个端口上跑着外部 Strata 实例」的探测结果缓存。
+///
+/// 合成模型列表时要挨个 config 探端口（外部实例只能靠探测发现），而列表是热路径：
+/// 前端每 5 秒拉一次、失败还要重试 5 次。没人监听时每次探测都要白等一个连接超时，
+/// 整个列表请求就被拖成好几秒 —— 前端等不到响应，卡片状态永远不更新（用户 m06134）。
+/// 列表要的只是「有没有在跑」，晚几秒认出来外部实例没有实际影响。
+static LIVE_PROBE_CACHE: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
+/// 探测结果的新鲜期。
+const LIVE_PROBE_TTL: Duration = Duration::from_secs(5);
+/// 探测外部实例的短超时：本机正常响应是毫秒级，连不上要尽快放弃（实测被拒约 2 秒）。
+const LIVE_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+
 /// 端口上真正在跑的模型名：GUI 槽位优先，其次逐个端口探测（外部实例只能靠探测）。
 fn live_model_name(state: &AppState, entries: &[StrataModelEntry]) -> Option<String> {
     if let Some((_port, path)) = live_engine(state) {
@@ -422,13 +925,26 @@ fn live_model_name(state: &AppState, entries: &[StrataModelEntry]) -> Option<Str
             return Some(entry.model_name.clone());
         }
     }
-    for entry in entries {
-        let probed = strata::probe(entry.port, entry.api_key.as_deref());
-        if probed.running {
-            return probed.model_name.or_else(|| Some(entry.model_name.clone()));
+    // 槽位为空才需要探测：先看缓存，免得每次列表请求都去挨个端口等连接超时。
+    {
+        let cache = LIVE_PROBE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, name)) = cache.as_ref() {
+            if at.elapsed() < LIVE_PROBE_TTL {
+                return name.clone();
+            }
         }
     }
-    None
+    let mut found = None;
+    for entry in entries {
+        let probed =
+            strata::probe_with_timeout(entry.port, entry.api_key.as_deref(), LIVE_PROBE_TIMEOUT);
+        if probed.running {
+            found = probed.model_name.or_else(|| Some(entry.model_name.clone()));
+            break;
+        }
+    }
+    *LIVE_PROBE_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), found.clone()));
+    found
 }
 
 /// 没点名模型时的兜底名（选中 config → 第一份 config）。
@@ -556,6 +1072,14 @@ fn ensure_engine(app: &AppHandle, state: &AppState, entry: &StrataModelEntry) ->
         .map_err(|err| format!("启动 Strata 引擎失败：{err}"))
 }
 
+/// 转发目标：两个通道（Strata 引擎 / llama.cpp 子实例）共用同一条转发路径。
+struct UpstreamTarget<'a> {
+    host: &'a str,
+    port: u16,
+    /// 出错提示里用的通道名（「Strata 引擎」/「llama.cpp 子实例」）。
+    label: &'a str,
+}
+
 /// 把请求转发给引擎，并把响应字节流原样回给客户端。
 fn forward(
     client: &mut TcpStream,
@@ -563,18 +1087,19 @@ fn forward(
     target: &str,
     headers: &[(String, String)],
     body: &[u8],
-    entry: &StrataModelEntry,
+    upstream_target: UpstreamTarget<'_>,
 ) -> std::io::Result<()> {
-    let host = connect_host(&entry.host);
-    let mut upstream = match TcpStream::connect((host.as_str(), entry.port)) {
+    let UpstreamTarget { host, port, label } = upstream_target;
+    let host = connect_host(host);
+    let mut upstream = match TcpStream::connect((host.as_str(), port)) {
         Ok(stream) => stream,
         Err(err) => {
-            dbg(&format!("forward 连上游失败 {host}:{} {err}", entry.port));
+            dbg(&format!("forward 连上游失败 {host}:{port} {err}"));
             return send_json(
                 client,
                 502,
                 "Bad Gateway",
-                &json!({"error": {"message": format!("连接 Strata 引擎 {host}:{} 失败：{err}", entry.port)}}),
+                &json!({"error": {"message": format!("连接 {label} {host}:{port} 失败：{err}")}}),
             );
         }
     };
@@ -587,9 +1112,13 @@ fn forward(
         match name.to_ascii_lowercase().as_str() {
             // Host 要指向引擎自己（上游 WebUI 的 Origin 判断用它）；
             // `Connection: close` 是上游 http.server 收尾的依据（不给 Content-Length 的响应靠关闭分隔）；
-            // 去掉 `Accept-Encoding` 让上游发未压缩字节，我们不必解压；
             // `Expect` 已经在本机回过 100 了，再转给上游会让它再等一次。
-            "host" | "connection" | "accept-encoding" | "expect" | "proxy-connection" => continue,
+            //
+            // **`Accept-Encoding` 必须原样转发**（原来在这里被丢掉）：llama.cpp 自带的 WebUI
+            // 资源是 gzip 存的，引擎要看到 `Accept-Encoding: gzip` 才肯发；不给就整页回
+            // 415 + `Error: gzip is not supported by this browser`（实测）。压缩响应不用我们
+            // 解压：`Content-Encoding` 跟着上游头一起给客户端，由客户端自己解。
+            "host" | "connection" | "expect" | "proxy-connection" => continue,
             _ => {}
         }
         request.push_str(name);
@@ -597,7 +1126,9 @@ fn forward(
         request.push_str(value);
         request.push_str("\r\n");
     }
-    request.push_str(&format!("Host: {host}:{}\r\n", entry.port));
+    // 鉴权头原样透传，前门**不代客户端补 key**（用户 m06545：客户端必须自己带 key）。
+    // 引擎按各自 config 的 `api_key` 加了 `--api-key` 之后，只带 key 的客户端才连得上。
+    request.push_str(&format!("Host: {host}:{port}\r\n"));
     request.push_str("Connection: close\r\n\r\n");
     upstream.write_all(request.as_bytes())?;
     if !body.is_empty() {
@@ -617,6 +1148,26 @@ fn forward(
     // 先清掉读超时：那个 120 秒是给"读请求头"用的，长响应的静默期不能被它打断。
     let _ = client.set_read_timeout(None);
 
+    // 上游响应头先自己读出来，缺 CORS 头就补一条再转给客户端。
+    //
+    // Strata 引擎是 Python `http.server`，响应里**不带** `Access-Control-Allow-Origin`；
+    // webview（`tauri://localhost`）直连本机端口算跨源，转发头原样给了它会被浏览器
+    // 拦在响应到达 JS 之前 —— 前端只能看到 `TypeError: Failed to fetch`（用户 m12671
+    // 压测 strata 模型就是这个），而不是任何 HTTP 状态码。
+    // llama.cpp / router 自带 CORS，所以这条对那条通道没有影响（已有就不重复加）。
+    // `read_head` 读到 `\r\n\r\n` 就停，不会把 body 一起吞掉。
+    let mut head = read_head(&mut upstream)?;
+    if !String::from_utf8_lossy(&head)
+        .to_ascii_lowercase()
+        .contains("access-control-allow-origin")
+        && head.ends_with(b"\r\n\r\n")
+    {
+        head.truncate(head.len() - 4);
+        head.extend_from_slice(b"\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
+    }
+    client.write_all(&head)?;
+    client.flush()?;
+
     let copied = std::io::copy(&mut upstream, client);
     match &copied {
         Ok(n) => dbg(&format!("forward io::copy 结束，向客户端写 {n} 字节")),
@@ -629,16 +1180,58 @@ fn forward(
 }
 
 /// 合成 `/v1/models`：列出**全部** config，字段形状照抄上游 `server.py:4313-4323`。
+/// 启动时把「前门能点到哪些模型」打进日志（用户 m02352 第 2 点）。
+///
+/// 客户端是照着这个列表点名 `model` 的，日志里看不到就得去翻配置目录；两个通道各起一行，
+/// 启动日志本身就说明前门当前认得哪些模型。
+fn log_available_models(state: &AppState) {
+    let payload = models_payload(state);
+    let empty: Vec<Value> = Vec::new();
+    let items = payload.get("data").and_then(|v| v.as_array()).unwrap_or(&empty);
+    let mut llamacpp: Vec<&str> = Vec::new();
+    let mut strata: Vec<&str> = Vec::new();
+    for item in items {
+        let Some(id) = item.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if item.get("channel").and_then(|v| v.as_str()) == Some("strata") {
+            strata.push(id);
+        } else {
+            llamacpp.push(id);
+        }
+    }
+    state.logs.push(
+        "system",
+        format!(
+            "[gui] 前门可用模型 {} 个（llama.cpp {} / Strata {}）",
+            items.len(),
+            llamacpp.len(),
+            strata.len()
+        ),
+    );
+    if !llamacpp.is_empty() {
+        state
+            .logs
+            .push("system", format!("[gui]   llama.cpp：{}", llamacpp.join("、")));
+    }
+    if !strata.is_empty() {
+        state
+            .logs
+            .push("system", format!("[gui]   Strata：{}", strata.join("、")));
+    }
+}
+
 fn models_payload(state: &AppState) -> Value {
     let entries = config_entries(state);
     let live = live_model_name(state, &entries);
-    let data: Vec<Value> = entries
+    let mut data: Vec<Value> = entries
         .iter()
         .map(|entry| {
             let loaded = live.as_deref() == Some(entry.model_name.as_str());
             json!({
                 "id": entry.model_name,
                 "object": "model",
+                "channel": "strata",
                 "status": { "value": if loaded { "loaded" } else { "unloaded" } },
                 "meta": {
                     "n_ctx": entry
@@ -654,7 +1247,44 @@ fn models_payload(state: &AppState) -> Value {
             })
         })
         .collect();
+    // llama.cpp 通道（P1）：配置目录里每一份都列上；未加载的也列 —— 客户端要能点名触发加载。
+    data.extend(llama_models_payload(state));
     json!({ "object": "list", "data": data })
+}
+
+/// llama.cpp 通道（P1）的模型列表：id 用配置里的 `name`（请求就按它点名），
+/// 同时带 `channel` / `port` / 调度器状态，便于界面区分两个通道。
+fn llama_models_payload(state: &AppState) -> Vec<Value> {
+    let dir = state.model_config_dir();
+    let items = model_config::load_dir(&dir);
+    let sched = scheduler::lock_sched(state);
+    items
+        .iter()
+        .map(|item| {
+            let state_now = sched.table().state_of(&item.id);
+            json!({
+                "id": item.config.name,
+                "object": "model",
+                "channel": "llamacpp",
+                // `status.value` 沿用 router 那套词汇（loaded/unloaded/loading）：前端卡片的
+                // 状态判断不用改；细粒度状态另给 `state`（idle/starting/ready/…）。
+                // 启动/停止中必须报 `loading` —— 否则前端整段时间都显示「未加载」，
+                // 「加载中」永远不会出现（用户 m02048 第 2 点）。
+                "status": {
+                    "value": match state_now {
+                        scheduler::ModelState::Ready => "loaded",
+                        scheduler::ModelState::Starting | scheduler::ModelState::Stopping => "loading",
+                        _ => "unloaded",
+                    },
+                },
+                "state": state_now.as_str(),
+                "loaded": state_now == scheduler::ModelState::Ready,
+                "port": item.config.port,
+"meta": { "n_ctx": crate::models::context_limit(&item.config).unwrap_or(0) },
+                "architecture": { "input_modalities": ["text"], "output_modalities": ["text"] },
+            })
+        })
+        .collect()
 }
 
 /// 连接引擎用的主机：config 里可能是 `0.0.0.0` / `::`（监听所有地址），连它没有意义。
@@ -810,16 +1440,64 @@ fn send_json(
     value: &Value,
 ) -> std::io::Result<()> {
     let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
+    // CORS 头必须带：webview（`tauri://localhost`）直连本机端口算**跨源**请求，
+    // router 自带 CORS 所以老路能work，前门自己合成的响应不带就会被浏览器拦掉
+    // （症状：前端只能看到「读取前门模型列表失败」这种笼统的 fetch 失败）。
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Headers: authorization, content-type, x-api-key\r\n\
+         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
          Connection: close\r\n\r\n",
         body.len()
     );
     client.write_all(head.as_bytes())?;
     client.write_all(&body)?;
     client.flush()
+}
+
+/// 跨源预检（`OPTIONS`）的应答：CORS 头 + 204，无 body。
+fn send_preflight(client: &mut TcpStream) -> std::io::Result<()> {
+    let head = "HTTP/1.1 204 No Content\r\n\
+                Content-Length: 0\r\n\
+                Access-Control-Allow-Origin: *\r\n\
+                Access-Control-Allow-Headers: authorization, content-type, x-api-key\r\n\
+                Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+                Connection: close\r\n\r\n";
+    client.write_all(head.as_bytes())?;
+    client.flush()
+}
+
+/// 随程序启动前门（用户 m00798 + A3：对外只留一个端口，llama.cpp 与 Strata 两通道都走它）。
+///
+/// 与 [`strata_proxy_start`] 的区别：不广播状态、不动托盘菜单（启动早期两者都还没就绪），
+/// 失败由调用方记日志——端口被占时程序照常可用，用户在胶囊里改端口后再点启动即可。
+pub fn autostart(app: &AppHandle, state: &AppState) -> Result<u16, String> {
+    if let Some(port) = running_port(state) {
+        return Ok(port);
+    }
+    let settings = state.settings.get();
+    let host = settings
+        .strata_host
+        .clone()
+        .filter(|h| !h.trim().is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = settings.strata_port.unwrap_or(DEFAULT_PORT);
+    let handle = start(app, &host, port)?;
+    *state
+        .strata_proxy
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    state.logs.push(
+        "system",
+        format!("[gui] 前门已监听 {host}:{port}（llama.cpp 子实例与 Strata 引擎都从这一个端口进）"),
+    );
+    log_available_models(state);
+    // 空闲释放不在这里挂：它是常驻线程（`lib.rs` 的 setup 里挂一次），每轮实时读设置，
+    // 跟前门起没起、是自动起还是手动起的都无关（用户 m06652）。
+    Ok(port)
 }
 
 /// 启动前门（端口取 GUI 设置里的 `strata_port`，缺省 9090）。
@@ -847,11 +1525,12 @@ pub async fn strata_proxy_start(
         "system",
         format!("[gui] Strata 前门已监听 {host}:{port}（按请求里的 model 自动切换引擎）"),
     );
+    log_available_models(state.inner());
 
     let snapshot = crate::strata_snapshot(&state);
     let _ = app.emit("strata://status", snapshot.clone());
-    let router_running = state.status.lock().unwrap_or_else(|e| e.into_inner()).running;
-    crate::tray::sync_menu_state(&app, router_running, true);
+    // 托盘提示与菜单可用性都跟着前门走：用户看到的「服务」就是它。
+    crate::tray::sync_tooltip(&app, true, port);
     Ok(snapshot)
 }
 
@@ -870,8 +1549,7 @@ pub async fn strata_proxy_stop(
 
     let snapshot = crate::strata_snapshot(&state);
     let _ = app.emit("strata://status", snapshot.clone());
-    let router_running = state.status.lock().unwrap_or_else(|e| e.into_inner()).running;
-    crate::tray::sync_menu_state(&app, router_running, crate::strata_busy(&state));
+    crate::tray::sync_tooltip(&app, false, port);
     Ok(snapshot)
 }
 

@@ -6,12 +6,10 @@ import { getModelIcon } from "../utils/modelIcon";
 import {
   fmtSize,
   mergeModels,
-  presetSections,
   selectModels,
-  webuiDisabledSections,
 } from "../utils/models";
 import { ConfigSheet, DetailSheet } from "./ModelSheets";
-import { PresetEditor } from "./PresetEditor";
+import { StrataPanel } from "./StrataPanel";
 
 type SortKey = "name_asc" | "name_desc" | "size_asc" | "size_desc";
 
@@ -24,11 +22,50 @@ const SORT_LABELS: Record<SortKey, string> = {
 };
 type Filter = "all" | "loaded" | "favourite" | "missing";
 
+/**
+ * 通道标签（用户 m02352 第 1 点）：llama.cpp 的子实例和 Strata 引擎是两套进程、两套配置，
+ * 混在一列里看不出哪个归谁，按标签分开看。
+ */
+type ChannelTab = "llamacpp" | "strata";
+
+/**
+ * 通道标签的显示文案。
+ *
+ * 标签上不带数量（用户 m02992 第 1 点）：一档有多少模型看标题后的统计，
+ * 那个数字跟着当前标签走。
+ */
+const CHANNEL_LABELS: Record<ChannelTab, string> = {
+  llamacpp: "llama.cpp",
+  strata: "Strata",
+};
+
+/**
+ * Strata 那档的筛选值域：搜索、刷新、视图切换是两档共用的
+ * （用户 m03160 第 1 点：两档共用同一条工具行）。
+ *
+ * 排序不再单列一套（用户 m03482 第 5 点：排序选项两档统一）—— 用 llama.cpp 那套
+ * 名称/大小，Strata 的 config 也有 `model_size_bytes`，大小排得出来。
+ * 「已选中（默认 config）」换成「收藏」（用户 m03333 第 8 点：GUI 启动 Strata 模型不需要
+ * 先挑一个默认模型，星标就和 llama.cpp 那边一样只当收藏用）；
+ * 「引擎缺失」这一档去掉（用户 m03333 第 7 点）。
+ */
+type StrataFilter = "all" | "running" | "favourite";
+
+const STRATA_FILTERS: StrataFilter[] = ["all", "running", "favourite"];
+
+const STRATA_FILTER_LABELS: Record<StrataFilter, string> = {
+  all: "全部模型",
+  running: "运行中",
+  favourite: "收藏",
+};
+
 /** 置顶项：叠在名称/大小排序之上，两项互斥 */
 type Pinned = "none" | "active" | "favourite";
 
 /** 状态徽标：对应 hub 的 `.model-status-badge` + `.status-*` 四态。 */
-function statusOf(model: ModelView) {
+type StatusBadge = { cls: string; icon: string; text: string };
+
+function statusOf(model: ModelView): StatusBadge {
   if (model.failed) {
     return { cls: "status-stopped", icon: "fa-exclamation-triangle", text: "加载失败" };
   }
@@ -57,35 +94,56 @@ function statusOf(model: ModelView) {
 const ModelCard = memo(function ModelCard({
   model,
   grid,
-  webuiOff,
   onConfigure,
   onDetail,
 }: {
   model: ModelView;
   grid: boolean;
   /** 这个模型的段是否关掉了自带 webui（父组件扫一次 preset 算好传下来） */
-  webuiOff: boolean;
   onConfigure: (id: string) => void;
   onDetail: (id: string) => void;
 }) {
   const busy = useApp((s) => s.busy);
-  const running = useApp((s) => s.status.running);
+  // 加载/卸载都走前门（统一入口 :9090），所以按钮的可用性看**前门在不在跑**，
+  // 不再看 router —— router 正在退役。
+  const running = useApp((s) => s.strataStatus.proxy);
   const startModel = useApp((s) => s.startModel);
   const stopModel = useApp((s) => s.stopModel);
   const toggleFavourite = useApp((s) => s.toggleFavourite);
-  const openModelChat = useApp((s) => s.openModelChat);
-  // 显存互斥（用户 m03342）：开启且 Strata 在跑时，启动按钮要说清会先停掉 Strata
+  // 显存互斥（用户 m03160 第 2 点）：开启且 Strata 在跑时，启动按钮要说清会先卸掉 Strata 的模型
   const mutex = useApp((s) => s.settings?.strata_router_mutex ?? false);
   const strataRunning = useApp((s) => s.strataStatus.running);
+  // Strata 通道的模型（用户 m02048 第 4 点）：启停不走前门，改调 Strata 接口，
+  // 用的是配置文件全名（`strataFile`），所以跟 `section` 分开取。
+  const startStrataModel = useApp((s) => s.startStrataModel);
+  const stopStrataModel = useApp((s) => s.stopStrataModel);
+  const isStrata = model.channel === "strata";
+  const strataFile = model.strataFile ?? null;
+  // 这一步是不是正在被启停（用户 m03482 第 3 点）：startModel/stopModel 在发请求**之前**
+  // 就把 id 记进 store，卡片据此立刻转圈，不用等第一次轮询（前门那条 await 要几十秒）。
+  // 各取一个布尔值，别取 modelPending 整个对象 —— 对象每次 set 都是新引用，
+  // 会让所有卡片跟着重渲染。
+  const isPending = useApp((s) => s.modelPending?.id === model.section);
+  const pendingStop = useApp((s) =>
+    s.modelPending?.id === model.section ? s.modelPending.stop : false,
+  );
 
   const active = model.status === "loaded" || model.status === "loading" || model.status === "sleeping";
   // 运行中且已分配到子实例端口时，才提供"打开聊天界面"入口（ModelView.port 已由 mergeModels 解析出来）；
   // 段落里关掉了自带 WebUI 的模型没有界面，按钮给禁用态
-  const chatPort = model.status === "loaded" ? model.port : null;
   // 不在这里扫整份 presets.ini：父组件用 webuiDisabledSections 一次算成集合，
   // 每张卡只做一次 Set.has（原来每张卡每次渲染都要 split 全文重扫一遍）
-  const chatDisabled = webuiOff;
-  const status = statusOf(model);
+  // 待启停期间直接给「加载中 / 卸载中」，和 Strata 卡片一致（用户 m04854：停下来的过程叫「卸载中」）。
+  // 判据是「这件事还没落地」：加载等前门报 loaded，卸载等前门报 unloaded。中间态也算进行中——前门把
+  // stopping 也报成 loading，只认 loaded 的话卸载途中会掉回 statusOf，显示成「加载中」（用户 m05592）。
+  // 一旦状态落地就以前门状态为准：`modelPending` 是前端乐观标记，它的收尾可能比状态轮询晚——提示都
+  // 弹了「加载成功」、显存也上去了，卡片仍停在「加载中」，连按钮都被禁用点不动，切一次 Strata 才自愈。
+  const pendingVisible =
+    isPending &&
+    (pendingStop ? model.status !== "unloaded" : model.status !== "loaded");
+  const status: StatusBadge = pendingVisible
+    ? { cls: "status-loading", icon: "fa-spinner fa-spin", text: pendingStop ? "卸载中" : "加载中" }
+    : statusOf(model);
   // hub 的 getModelIcon(architecture)：优先按 GGUF 架构匹配，名字/id 兜底
   const icon = getModelIcon(model.scanned?.architecture, model.name, model.id);
   const hasMtp = /mtp/i.test(model.name) || /mtp/i.test(model.id);
@@ -96,22 +154,36 @@ const ModelCard = memo(function ModelCard({
   const startStop = (
     <button
       type="button"
-      className={`btn-icon soft${active ? " is-running" : ""}`}
+      className={`btn-icon soft${active ? " is-running" : ""}${pendingVisible ? " is-pending" : ""}`}
       title={
-        !running
-          ? "router 未运行，无法启动"
-          : active
-            ? "停止"
-            : model.inPreset
-              ? mutex && strataRunning
-                ? "启动（显存互斥已开：会先停止 Strata）"
+        isStrata
+          ? !strataFile
+            ? "找不到这个 Strata 模型的配置文件（刷新一次试试）"
+            : active
+              ? "停止（停掉引擎进程，显存立即释放）"
+              : mutex && running
+                ? "启动（显存互斥已开：会先卸掉 llama.cpp 侧已加载的模型）"
+                : "启动（先卸掉正在跑的模型，再起这个）"
+          : !running
+            ? "前门未运行，无法启动"
+            : active
+              ? "停止"
+              : mutex && strataRunning
+                ? "启动（显存互斥已开：会先卸掉 Strata 的模型）"
                 : "启动"
-              : "请先在「配置」里保存，写入 presets.ini 后即可启动"
       }
-      disabled={!running || busy || (!active && !model.inPreset)}
-      onClick={() => void (active ? stopModel(model.section) : startModel(model.section))}
+      disabled={busy || pendingVisible || (isStrata ? !strataFile : !running)}
+      onClick={() =>
+        void (isStrata
+          ? active
+            ? stopStrataModel(strataFile ?? "")
+            : startStrataModel(strataFile ?? "")
+          : active
+            ? stopModel(model.section)
+            : startModel(model.section))
+      }
     >
-      <i className={`fas ${active ? "fa-stop" : "fa-play"}`} />
+      <i className={`fas ${pendingVisible ? "fa-spinner fa-spin" : active ? "fa-stop" : "fa-play"}`} />
     </button>
   );
 
@@ -138,15 +210,18 @@ const ModelCard = memo(function ModelCard({
     </div>
   );
 
-  // 徽标与 hub 新版一致：跟在模型名后面（inline），不再是独立一行
+  // 徽标与 hub 新版一致：跟在模型名后面（inline），不再是独立一行。
+  // 引擎标识已去掉（用户 m03333 第 1 点）：模型列表按引擎分标签了，llama.cpp 档里
+  // 每张卡都再标一遍「llama.cpp」是重复信息。
+  // 「未同步」徽标已去掉（用户 m08378 第 2 点）：那是 router 时代「先点同步才能启动」
+  // 的痕迹，现在点启用会自动补配置文件，不再需要这个提示。
   const badges = (
     <span className="mc-badges">
       {model.hasMmproj && <span>视觉</span>}
       {hasMtp && <span>MTP</span>}
-      {!model.inPreset && <span>未同步</span>}
     </span>
   );
-  const hasBadges = model.hasMmproj || hasMtp || !model.inPreset;
+  const hasBadges = model.hasMmproj || hasMtp;
 
   const nameEl = (
     <div className="model-name" title={`${model.name}\n${model.id}`}>
@@ -188,23 +263,6 @@ const ModelCard = memo(function ModelCard({
   const actions = (
     <div className="model-actions">
       {startStop}
-      {/* 运行中才给聊天入口：每个模型是独立子实例，各自一个 llama.cpp 自带界面。
-          段落里写了 webui = 0 的模型没有界面，这里给禁用态并说明去哪聊。 */}
-      {active && chatPort != null && (
-        <button
-          type="button"
-          className="btn-icon"
-          disabled={chatDisabled}
-          title={
-            chatDisabled
-              ? `${model.section} 已关闭自带 webui（配置里的「禁用webui」为 true）——请从侧栏「开始聊天」进入，在里面选模型`
-              : `打开 ${model.id} 的聊天界面（仅该模型，:${chatPort}）`
-          }
-          onClick={() => void openModelChat(model.section)}
-        >
-          <i className="fas fa-comments" />
-        </button>
-      )}
       {/* 这个按钮一律打开配置弹窗（弹窗里再「保存并加载」），所以固定用配置图标，
           之前未加载时会显示成播放图标，容易误认成直接启动。
           样式上不加 primary —— 与 hub 新版一致：配置是普通按钮。 */}
@@ -250,15 +308,26 @@ const ModelCard = memo(function ModelCard({
  * 排序下拉：上半部分是互斥的排序方式，横杠下面「运行中优先」是可以**叠加**在
  * 任意排序之上的开关（勾选后不关闭菜单，方便连着设）。
  */
-function SortMenu({
+const DEFAULT_PINS: { key: Pinned; label: string }[] = [
+  { key: "active", label: "运行中优先" },
+  { key: "favourite", label: "收藏优先" },
+];
+
+function SortMenu<T extends string>({
   sortKey,
+  labels,
   pinned,
+  pins = DEFAULT_PINS,
   onSort,
   onPin,
 }: {
-  sortKey: SortKey;
+  sortKey: T;
+  /** 这一档可选的排序方式（模型列表按名称/大小，Strata 按名称/上下文长度） */
+  labels: Record<T, string>;
   pinned: Pinned;
-  onSort: (key: SortKey) => void;
+  /** 可叠加的置顶项；Strata 那档没有收藏，只给「运行中优先」 */
+  pins?: { key: Pinned; label: string }[];
+  onSort: (key: T) => void;
   /** 置顶项互斥：点已选中的那个等于取消 */
   onPin: (next: Pinned) => void;
 }) {
@@ -285,18 +354,17 @@ function SortMenu({
     <div className="dropdown" ref={wrap}>
       <button
         type="button"
-        className={`btn btn-secondary ${open ? "active" : ""}`}
-        style={{ flexShrink: 0, whiteSpace: "nowrap" }}
+        className={`btn btn-secondary no-shrink nowrap ${open ? "active" : ""}`}
         title="排序方式"
         onClick={() => setOpen((v) => !v)}
       >
         <i className="fas fa-arrow-down-wide-short" />
-        <span>{SORT_LABELS[sortKey]}</span>
-        <i className={`fas fa-chevron-${open ? "up" : "down"}`} style={{ marginLeft: 4, fontSize: "0.7rem" }} />
+        <span>{labels[sortKey]}</span>
+        <i className={`fas fa-chevron-${open ? "up" : "down"} sort-chevron`} />
       </button>
       {open && (
         <div className="dropdown-menu">
-          {(Object.keys(SORT_LABELS) as SortKey[]).map((key) => (
+          {(Object.keys(labels) as T[]).map((key) => (
             <button
               type="button"
               key={key}
@@ -308,106 +376,23 @@ function SortMenu({
             >
               {/* 左侧固定 14px 的勾选位：选中项打勾，未选中留空（对齐不跳动） */}
               <i className={sortKey === key ? "fas fa-check" : ""} />
-              <span>{SORT_LABELS[key]}</span>
+              <span>{labels[key]}</span>
             </button>
           ))}
           {/* 横杠：上面是互斥的排序方式，下面是可以**叠加**在排序之上的置顶项。
-              两个置顶项之间互斥（选一个会取消另一个），都用同一个 ✓ 标记。 */}
+              置顶项之间互斥（选一个会取消另一个），都用同一个 ✓ 标记。 */}
           <div className="dropdown-sep" />
-          <button
-            type="button"
-            className="dropdown-item"
-            onClick={() => onPin(pinned === "active" ? "none" : "active")}
-          >
-            <i className={pinned === "active" ? "fas fa-check" : ""} />
-            <span>运行中优先</span>
-          </button>
-          <button
-            type="button"
-            className="dropdown-item"
-            onClick={() => onPin(pinned === "favourite" ? "none" : "favourite")}
-          >
-            <i className={pinned === "favourite" ? "fas fa-check" : ""} />
-            <span>收藏优先</span>
-          </button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/**
- * 顶栏的 preset 下拉：把「同步到 presets.ini」和「编辑 preset 文件」这两件事收在一个按钮里，
- * 顶栏只留搜索 / 刷新 / 排序 / 筛选 / 视图切换。
- */
-function PresetMenu({
-  busy,
-  canSync,
-  onSyncPreset,
-  onEditPreset,
-}: {
-  busy: boolean;
-  canSync: boolean;
-  onSyncPreset: () => void;
-  onEditPreset: () => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const wrap = useRef<HTMLDivElement>(null);
-
-  // 点空白处 / 按 Esc 关闭
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (wrap.current && !wrap.current.contains(e.target as Node)) setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
-    };
-    document.addEventListener("mousedown", onDown);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onDown);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [open]);
-
-  const item = (icon: string, label: string, onClick: () => void, disabled = false) => (
-    <button
-      type="button"
-      className="dropdown-item"
-      disabled={disabled}
-      onClick={() => {
-        setOpen(false);
-        onClick();
-      }}
-    >
-      <i className={icon} />
-      <span>{label}</span>
-    </button>
-  );
-
-  return (
-    <div className="dropdown" ref={wrap}>
-      <button
-        type="button"
-        className={`btn btn-secondary ${open ? "active" : ""}`}
-        style={{ flexShrink: 0 }}
-        title="presets.ini 相关操作"
-        onClick={() => setOpen((v) => !v)}
-      >
-        <i className="fas fa-file-lines" />
-        <span>preset</span>
-        <i className={`fas fa-chevron-${open ? "up" : "down"}`} style={{ marginLeft: 4, fontSize: "0.7rem" }} />
-      </button>
-      {open && (
-        <div className="dropdown-menu">
-          {item(
-            "fas fa-file-import",
-            "同步到 presets.ini",
-            onSyncPreset,
-            busy || !canSync,
-          )}
-          {item("fas fa-file-pen", "编辑 preset 文件", onEditPreset, busy)}
+          {pins.map((pin) => (
+            <button
+              type="button"
+              key={pin.key}
+              className="dropdown-item"
+              onClick={() => onPin(pinned === pin.key ? "none" : pin.key)}
+            >
+              <i className={pinned === pin.key ? "fas fa-check" : ""} />
+              <span>{pin.label}</span>
+            </button>
+          ))}
         </div>
       )}
     </div>
@@ -417,16 +402,31 @@ function PresetMenu({
 export function ModelListPanel() {
   const scanned = useApp((s) => s.scanned);
   const routerModels = useApp((s) => s.routerModels);
-  const presetText = useApp((s) => s.presetText);
+  const strataEntries = useApp((s) => s.strataEntries);
+  // 原生 config 清单（第三刀：不再解析 presets.ini 文本）
+  const configs = useApp((s) => s.configs);
   const settings = useApp((s) => s.settings);
-  const status = useApp((s) => s.status);
+  // Strata 那档的标题统计要用引擎状态（用户 m02992 第 1 点）
+  const strataStatus = useApp((s) => s.strataStatus);
   const busy = useApp((s) => s.busy);
   const refreshModels = useApp((s) => s.refreshModels);
-  const syncPreset = useApp((s) => s.syncPreset);
+  // Strata 那档的刷新按钮重扫 strata-*.json（用户 m03160 第 1 点：两档共用一条工具行）
+  const refreshStrata = useApp((s) => s.refreshStrata);
 
   const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState<Filter>("all");
-  const [sortKey, setSortKey] = useState<SortKey>("name_asc");
+  // 筛选与排序各记一份（用户 m03333 第 6 点：切档回来还是上次选的那档）
+  const [filter, setFilter] = useState<Filter>(() => {
+    const saved = localStorage.getItem("modelFilter");
+    return saved === "all" || saved === "loaded" || saved === "favourite" || saved === "missing"
+      ? saved
+      : "all";
+  });
+  const [sortKey, setSortKey] = useState<SortKey>(() => {
+    const saved = localStorage.getItem("modelSort");
+    return saved === "name_asc" || saved === "name_desc" || saved === "size_asc" || saved === "size_desc"
+      ? saved
+      : "name_asc";
+  });
   // 置顶项是叠在排序之上的开关（不是排序的一种），单独记一个偏好。
   // 兼容旧键 modelRunningFirst（那时只有"运行中优先"）。
   const [pinned, setPinned] = useState<Pinned>(() => {
@@ -436,27 +436,41 @@ export function ModelListPanel() {
   });
   // hub 的默认视图是列表；这里默认卡片，和用户当前在 hub 里看到的保持一致
   const [grid, setGrid] = useState(() => localStorage.getItem("modelView") !== "list");
+  // 通道标签的记忆：没有「全部」这一档了（用户 m02992 第 1 点），默认落在 llama.cpp
+  const [channel, setChannel] = useState<ChannelTab>(() => {
+    const saved = localStorage.getItem("modelChannel");
+    return saved === "strata" ? "strata" : "llamacpp";
+  });
+  // Strata 那档的筛选/排序各记一份 —— 值域和模型列表不同（引擎侧 config 没有收藏、
+  // 排序按上下文长度）；搜索词、刷新按钮、视图切换是两档共用的（用户 m03160 第 1 点）。
+  const [strataFilter, setStrataFilter] = useState<StrataFilter>(() => {
+    const saved = localStorage.getItem("strataFilter") as StrataFilter | null;
+    return saved && STRATA_FILTERS.includes(saved) ? saved : "all";
+  });
   const [configId, setConfigId] = useState<string | null>(null);
   const [detailId, setDetailId] = useState<string | null>(null);
-  const [editingPreset, setEditingPreset] = useState(false);
 
   useEffect(() => {
     localStorage.setItem("modelView", grid ? "grid" : "list");
   }, [grid]);
   useEffect(() => {
+    localStorage.setItem("modelChannel", channel);
+  }, [channel]);
+  useEffect(() => {
     localStorage.setItem("modelPinned", pinned);
     localStorage.setItem("modelRunningFirst", pinned === "active" ? "1" : "0");
   }, [pinned]);
+  useEffect(() => {
+    localStorage.setItem("modelFilter", filter);
+  }, [filter]);
+  useEffect(() => {
+    localStorage.setItem("modelSort", sortKey);
+  }, [sortKey]);
+  useEffect(() => {
+    localStorage.setItem("strataFilter", strataFilter);
+  }, [strataFilter]);
 
-  const sections = useMemo(() => presetSections(presetText), [presetText]);
-  /**
-   * 关掉了自带 webui 的段名集合：整份 preset 只扫这一次。
-   *
-   * 原来是每张卡片各自调 `webuiDisabled(presetText, section)`（内部就是
-   * `presetValue` → `split(/\r?\n/)` 扫全文），开销是「卡片数 × 文件行数」，
-   * 而且每次渲染都重算。
-   */
-  const webuiOff = useMemo(() => webuiDisabledSections(presetText), [presetText]);
+  const sections = useMemo(() => new Set(configs.map((c) => c.name)), [configs]);
 
   // 固定引用（配合卡片的 memo）：id 由卡片回传，父组件不用为每个模型各建一个闭包
   const openConfig = useCallback((id: string) => {
@@ -472,8 +486,9 @@ export function ModelListPanel() {
         settings?.favourites ?? [],
         sections,
         settings?.aliases ?? {},
+        strataEntries,
       ),
-    [scanned, routerModels, settings?.favourites, sections, settings?.aliases],
+    [scanned, routerModels, settings?.favourites, sections, settings?.aliases, strataEntries],
   );
 
   const shown = useMemo(() => {
@@ -488,8 +503,22 @@ export function ModelListPanel() {
     });
   }, [merged, query, filter, sortKey, pinned]);
 
-  const loadedCount = merged.filter((m) => m.status === "loaded").length;
-  const totalMiB = shown.reduce((sum, m) => sum + (m.sizeBytes ?? 0), 0);
+  // 通道过滤（用户 m02352 第 1 点）：`channel` 是前门给的字段；本地扫描出来的项没有它，
+  // 按 llama.cpp 算 —— 没有通道标记的就是 llama.cpp 子实例。
+  const channelShown = useMemo(
+    () => shown.filter((m) => (m.channel ?? "llamacpp") === channel),
+    [shown, channel],
+  );
+
+  // 标题后的统计跟着当前标签走（用户 m02992 第 1 点）。Strata 那档画的是引擎侧 config
+  // （strataEntries，本地扫描出来的，不看前门），数字也从它数，免得和标签下的内容对不上。
+  const channelTotal = channel === "strata" ? strataEntries.length : channelShown.length;
+  const channelLoaded =
+    channel === "strata"
+      ? strataStatus.running && strataStatus.loaded
+        ? 1
+        : 0
+      : channelShown.filter((m) => m.status === "loaded").length;
   const configModel = merged.find((m) => m.id === configId) ?? null;
   const detailModel = merged.find((m) => m.id === detailId) ?? null;
 
@@ -497,10 +526,27 @@ export function ModelListPanel() {
     <main className="main-area">
       <div className="top-bar">
         <h1 className="page-title">
-          <span>模型列表</span> <span className="model-count-badge">{loadedCount}/{merged.length}</span>
+          <span>模型</span> <span className="model-count-badge">{channelLoaded}/{channelTotal}</span>
         </h1>
+        <div className="st-tabs" role="tablist" aria-label="引擎通道">
+          {(Object.keys(CHANNEL_LABELS) as ChannelTab[]).map((key) => (
+            <button
+              key={key}
+              type="button"
+              role="tab"
+              aria-selected={channel === key}
+              className={`st-tab${channel === key ? " is-active" : ""}`}
+              onClick={() => setChannel(key)}
+            >
+              {CHANNEL_LABELS[key]}
+            </button>
+          ))}
+        </div>
+        {/* 一条工具行两档共用（用户 m03160 第 1 点）：搜索词、刷新、视图切换两档都管用；
+            排序与筛选按通道换值域 —— Strata 那档排的是引擎侧 config（没有收藏、按上下文长度），
+            刷新按钮改成重扫 strata-*.json；preset 下拉是 llama.cpp 侧的事，只在那一档显示。 */}
         <div className="top-actions">
-          <div className="search-box" style={{ flexShrink: 0, width: 220 }}>
+          <div className="search-box search-box--fixed">
             <i className="fas fa-search search-icon" />
             <input
               type="text"
@@ -512,85 +558,100 @@ export function ModelListPanel() {
           </div>
           <button
             type="button"
-            className="btn btn-secondary"
-            style={{ flexShrink: 0 }}
-            title="刷新模型列表（重新扫描磁盘）"
+            className="btn btn-secondary no-shrink"
+            title={
+              channel === "strata"
+                ? "重新扫描 strata-*.json（上游升级后点这个）"
+                : "刷新模型（重新扫描磁盘）"
+            }
             disabled={busy}
-            onClick={() => void refreshModels(true)}
+            onClick={() => void (channel === "strata" ? refreshStrata() : refreshModels(true))}
           >
             <i className={`fas fa-sync-alt ${busy ? "fa-spin" : ""}`} />
           </button>
-          <SortMenu sortKey={sortKey} pinned={pinned} onSort={setSortKey} onPin={setPinned} />
+          {/* 排序选项两档统一（用户 m03482 第 5 点）：名称/大小，置顶开关也是同一套 */}
+          <SortMenu
+            sortKey={sortKey}
+            labels={SORT_LABELS}
+            pinned={pinned}
+            onSort={setSortKey}
+            onPin={setPinned}
+          />
           <select
-            className="form-control"
-            style={{ padding: "4px 8px", width: "auto", fontSize: "0.875rem" }}
+            className="form-control filter-select"
             title="筛选"
-            value={filter}
-            onChange={(e) => setFilter(e.target.value as Filter)}
+            value={channel === "strata" ? strataFilter : filter}
+            onChange={(e) =>
+              channel === "strata"
+                ? setStrataFilter(e.target.value as StrataFilter)
+                : setFilter(e.target.value as Filter)
+            }
           >
-            <option value="all">全部模型</option>
-            <option value="loaded">运行中</option>
-            <option value="favourite">收藏</option>
-            <option value="missing">未同步 preset</option>
+            {channel === "strata" ? (
+              STRATA_FILTERS.map((key) => (
+                <option key={key} value={key}>
+                  {STRATA_FILTER_LABELS[key]}
+                </option>
+              ))
+            ) : (
+              <>
+                <option value="all">全部模型</option>
+                <option value="loaded">运行中</option>
+                <option value="favourite">收藏</option>
+              </>
+            )}
           </select>
           <button
             type="button"
-            className="btn-icon"
-            style={{ width: 36, height: 36, flexShrink: 0 }}
+            className="btn-icon btn-icon--lg"
             title="切换卡片 / 列表视图"
             onClick={() => setGrid((v) => !v)}
           >
             <i className={`fas ${grid ? "fa-list" : "fa-th-large"}`} />
           </button>
-          <PresetMenu
-            busy={busy}
-            canSync={scanned.length > 0}
-            onSyncPreset={() => void syncPreset()}
-            onEditPreset={() => setEditingPreset(true)}
-          />
         </div>
       </div>
 
-      <div className="content-scrollable">
-        <div className="model-list-container">
-          <div id="modelsList" className={grid ? "grid-view" : undefined}>
-            {merged.length === 0 ? (
-              <div className="empty-state">
-                <div className="empty-state-icon">
-                  <i className="fas fa-box-open" />
+      {/* Strata 那档直接画 Strata 管理页（用户 m02992 第 2 点）：工具行在上面的顶栏里两档共用，
+          这里只画卡片区；代理与探测那两个按钮已按用户 m03160 第 1 点去掉（前门在侧栏管）。 */}
+      {channel === "strata" ? (
+        <StrataPanel tools={{ query, filter: strataFilter, sortKey, pinned, grid }} />
+      ) : (
+        <div className="content-scrollable">
+          <div className="model-list-container">
+            <div id="modelsList" className={grid ? "grid-view" : undefined}>
+              {merged.length === 0 ? (
+                <div className="empty-state">
+                  <div className="empty-state-icon">
+                    <i className="fas fa-box-open" />
+                  </div>
+                  <div className="empty-state-title">还没有扫描到模型</div>
+                  <div className="empty-state-text">
+                    到「设置」里添加模型根目录（例如 E:\AI\models），保存后回到本页点刷新。
+                  </div>
                 </div>
-                <div className="empty-state-title">还没有扫描到模型</div>
-                <div className="empty-state-text">
-                  到「设置」里添加模型根目录（例如 E:\AI\models），保存后回到本页点刷新。
+              ) : channelShown.length === 0 ? (
+                <div className="empty-state">
+                  <div className="empty-state-icon">
+                    <i className="fas fa-filter" />
+                  </div>
+                  <div className="empty-state-text">没有匹配的模型</div>
                 </div>
-              </div>
-            ) : shown.length === 0 ? (
-              <div className="empty-state">
-                <div className="empty-state-icon">
-                  <i className="fas fa-filter" />
-                </div>
-                <div className="empty-state-text">没有匹配的模型</div>
-              </div>
-            ) : (
-              shown.map((m) => (
-                <ModelCard
-                  key={m.id}
-                  model={m}
-                  grid={grid}
-                  webuiOff={webuiOff.has(m.section)}
-                  onConfigure={openConfig}
-                  onDetail={openDetail}
-                />
-              ))
-            )}
+              ) : (
+                channelShown.map((m) => (
+                  <ModelCard
+                    key={m.id}
+                    model={m}
+                    grid={grid}
+                    onConfigure={openConfig}
+                    onDetail={openDetail}
+                  />
+                ))
+              )}
+            </div>
           </div>
         </div>
-
-        <div className="form-text" style={{ marginTop: "0.75rem" }}>
-          {shown.length} 个模型 · 合计 {(totalMiB / 1024 ** 3).toFixed(1)} GB
-          {!status.running && " · router 未运行，用左下角的启动按钮启动"}
-        </div>
-      </div>
+      )}
 
       {configModel && (
         <ConfigSheet
@@ -602,7 +663,6 @@ export function ModelListPanel() {
         />
       )}
       {detailModel && <DetailSheet model={detailModel} onClose={() => setDetailId(null)} />}
-      {editingPreset && <PresetEditor onClose={() => setEditingPreset(false)} />}
     </main>
   );
 }

@@ -8,14 +8,23 @@ import type {
   AuxFile,
   BenchRecord,
   DeviceResult,
+  FetchPage,
   FitRow,
   HubImportReport,
+  MonitorEngine,
+  MonitorSnapshot,
   Hardware,
   LlamaCppVersion,
+  LogFileInfo,
   LogLine,
+  McpServerConfig,
+  McpToolsView,
   ModelScanResult,
-  RouterStatus,
   ScannedModel,
+  SearchConfigInput,
+  SearchConfigView,
+  SearchResponse,
+  SearchTestResult,
   Settings,
   SettingsPatch,
   StrataModelEntry,
@@ -37,10 +46,6 @@ export const ipc = {
     invoke<LlamaCppVersion[]>("versions_list", { dir: dir ?? null, probe }),
 
   deviceList: () => invoke<DeviceResult>("device_list"),
-
-  routerStatus: () => invoke<RouterStatus>("router_status"),
-  routerStart: () => invoke<RouterStatus>("router_start"),
-  routerStop: () => invoke<RouterStatus>("router_stop"),
 
   // ---- Strata 第二运行时通道 ----
   strataStatus: () => invoke<StrataStatus>("strata_status"),
@@ -70,6 +75,10 @@ export const ipc = {
 
   logsSnapshot: (limit?: number) => invoke<LogLine[]>("logs_snapshot", { limit: limit ?? null }),
   logsClear: () => invoke<void>("logs_clear"),
+  /** 这一轮的日志文件落在哪（面板显示路径、按钮打开目录用） */
+  logsInfo: () => invoke<LogFileInfo>("logs_info"),
+  /** 用系统文件管理器打开日志目录，返回目录路径 */
+  logsOpenDir: () => invoke<string>("logs_open_dir"),
 
   portInUse: (port: number) => invoke<boolean>("port_in_use", { port }),
   fixAsciiPath: (path: string) => invoke<string>("fix_ascii_path", { path }),
@@ -83,18 +92,21 @@ export const ipc = {
     invoke<FitRow[]>("fit_preview", { modelPath, params }),
 
   modelsScan: (refresh = false) => invoke<ModelScanResult>("models_scan", { refresh }),
-  presetSync: () => invoke<ModelScanResult>("preset_sync"),
-  presetRead: () => invoke<string>("preset_read"),
-  presetWrite: (content: string) => invoke<string>("preset_write", { content }),
-  presetUpsert: (section: string, entries: [string, string][]) =>
-    invoke<string>("preset_upsert", { section, entries }),
-  presetRemove: (section: string) => invoke<string>("preset_remove", { section }),
+  configSync: () => invoke<ModelScanResult>("config_sync"),
+  /** 读一份 config 的原文（JSON）。「模型详情」直接显示它（第三刀） */
+  configRead: (section: string) => invoke<string>("config_read", { section }),
+  configUpsert: (section: string, entries: [string, string][]) =>
+    invoke<void>("config_upsert", { section, entries }),
+  configRemove: (section: string) => invoke<void>("config_remove", { section }),
+  /** 把 API Key 写进所有 llama.cpp 引擎 config（空串 = 清除）；返回写入份数（用户 m06341） */
+  configSetApiKey: (key: string) => invoke<number>("config_set_api_key", { key }),
   /** 从 llama.cpp-hub 的 launch_config.json 迁移模型启动参数 */
-  presetImportHub: () => invoke<HubImportReport>("preset_import_hub"),
+  configImportHub: () => invoke<HubImportReport>("config_import_hub"),
   /** 用系统默认浏览器打开本机 http 地址（llama.cpp 自带聊天界面） */
   openLocalUrl: (url: string) => invoke<void>("open_local_url", { url }),
-  presetSectionEntries: (section: string) =>
-    invoke<[string, string][]>("preset_section_entries", { section }),
+  /** 用系统默认浏览器打开外部 http(s) 链接（聊天里的网页链接） */
+  openExternal: (url: string) => invoke<void>("open_external_url", { url }),
+  configEntries: (section: string) => invoke<[string, string][]>("config_entries", { section }),
   favouriteToggle: (modelId: string) => invoke<string[]>("favourite_toggle", { modelId }),
 
   // ---- 性能测试 ----
@@ -127,6 +139,30 @@ export const ipc = {
   benchHardware: () => invoke<Hardware>("bench_hardware"),
   saveTextFile: (path: string, content: string) =>
     invoke<string>("save_text_file", { path, content }),
+
+  /** 联网搜索：多引擎 + fallback + 冷却 + 缓存（见 `src-tauri/src/search.rs`） */
+  searchQuery: (query: string, limit?: number, timeRange?: string | null) =>
+    invoke<SearchResponse>("search_query", {
+      query,
+      limit: limit ?? null,
+      timeRange: timeRange ?? null,
+    }),
+  searchConfig: () => invoke<SearchConfigView>("search_config"),
+  searchSaveConfig: (input: SearchConfigInput) =>
+    invoke<SearchConfigView>("search_save_config", { input }),
+  searchTestEngine: (engine: string) =>
+    invoke<SearchTestResult>("search_test_engine", { engine }),
+  /** 抓网页正文（聊天工具 `web_fetch` 走这里） */
+  webFetch: (url: string, maxChars?: number) =>
+    invoke<FetchPage>("web_fetch", { url, maxChars: maxChars ?? null }),
+
+  /** MCP 工具：GUI 自己当客户端起 stdio 子进程（见 `src-tauri/src/mcp.rs`） */
+  mcpServers: () => invoke<McpServerConfig[]>("mcp_servers_list"),
+  mcpSaveServers: (servers: McpServerConfig[]) =>
+    invoke<McpServerConfig[]>("mcp_servers_save", { servers }),
+  mcpTools: () => invoke<McpToolsView>("mcp_tools_list"),
+  mcpCallTool: (server: string, tool: string, args: Record<string, unknown>) =>
+    invoke<string>("mcp_tool_call", { server, tool, arguments: args }),
 };
 
 /**
@@ -143,21 +179,16 @@ export function onModelsScanned(
   );
 }
 
-/** 订阅 router 状态变化。 */
-export function onRouterStatus(cb: (status: RouterStatus) => void): Promise<UnlistenFn> {
-  return listen<RouterStatus>("router://status", (event) => cb(event.payload));
-}
-
 /** 订阅 Strata 状态变化（启动、退出、探测刷新）。 */
 export function onStrataStatus(cb: (status: StrataStatus) => void): Promise<UnlistenFn> {
   return listen<StrataStatus>("strata://status", (event) => cb(event.payload));
 }
 
 /**
- * 订阅托盘菜单发来的命令（`start-router` / `stop-router`）。
+ * 订阅托盘菜单发来的命令（`start-service` / `stop-service`）。
  *
  * 托盘不自己调后端命令，而是把命令转给前端 —— 这样托盘按钮和界面按钮
- * 复用同一套启动流程（同步 preset、错误提示、状态刷新）。
+ * 复用同一套启动流程（前门/引擎状态、错误提示、状态刷新）。
  */
 export function onTrayCommand(cb: (command: string) => void): Promise<UnlistenFn> {
   return listen<string>("tray://command", (event) => cb(event.payload));
@@ -173,4 +204,30 @@ export function errText(err: unknown): string {
   if (typeof err === "string") return err;
   if (err instanceof Error) return err.message;
   return JSON.stringify(err);
+}
+
+/** 读监控采集层的最新快照（不触发额外采样）。 */
+export function monitorSample(): Promise<MonitorSnapshot> {
+  return invoke<MonitorSnapshot>("monitor_sample");
+}
+
+/** 立刻采一次硬件再返回快照（刚启动或极短的压测档位用）。 */
+export function monitorSampleNow(): Promise<MonitorSnapshot> {
+  return invoke<MonitorSnapshot>("monitor_sample_now");
+}
+
+/** 采引擎的 `/metrics` 与 `/slots`。调用前必须确认模型已加载，否则会把模型拉起来。 */
+export function monitorEngine(
+  port: number,
+  model?: string | null,
+  apiKey?: string | null,
+  configPath?: string | null,
+): Promise<MonitorEngine> {
+  return invoke<MonitorEngine>("monitor_engine", {
+    port,
+    model: model ?? null,
+    apiKey: apiKey ?? null,
+    // Strata 模型传配置路径：引擎自己的 api_key 只在 Rust 侧，由它读出来再用
+    configPath: configPath ?? null,
+  });
 }

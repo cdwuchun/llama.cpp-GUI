@@ -4,9 +4,14 @@ mod bench;
 mod gpu;
 mod http;
 mod idle;
+mod model_config;
 mod models;
+mod monitor;
 mod paths;
-mod router;
+mod logs;
+mod mcp;
+mod scheduler;
+mod search;
 mod settings;
 mod state;
 mod strata;
@@ -24,16 +29,18 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::gpu::{DeviceInfo, FitRow};
-use crate::router::{LogLine, RouterStatus};
+use crate::logs::LogLine;
 use crate::settings::{Settings, SettingsPatch, VersionProbe};
 use crate::state::AppState;
 use crate::versions::LlamaCppVersion;
 
-/// 应用路径信息（前端用于展示 preset/配置位置）。
+/// 应用路径信息（前端用于展示配置位置）。
 #[derive(Debug, Clone, Serialize)]
 pub struct AppPaths {
     pub config_dir: PathBuf,
-    pub preset_path: PathBuf,
+    /// 第二刀起指向**模型配置目录**（`<配置目录>\config`）。前端仍在用这个字段
+    /// 显示路径，第三刀改名成 `model_config_dir`。
+    pub model_config_dir: PathBuf,
     pub link_root: PathBuf,
 }
 
@@ -50,7 +57,7 @@ pub struct DeviceResult {
 fn app_paths(state: State<'_, AppState>) -> AppPaths {
     AppPaths {
         config_dir: state.config_dir.clone(),
-        preset_path: state.preset_path(),
+        model_config_dir: state.model_config_dir(),
         link_root: state.link_root(),
     }
 }
@@ -62,7 +69,13 @@ fn settings_get(state: State<'_, AppState>) -> Settings {
 
 #[tauri::command]
 fn settings_set(state: State<'_, AppState>, patch: SettingsPatch) -> Settings {
-    state.settings.patch(patch)
+    // 「同时加载模型上限」要**保存当时**就生效，不能等下一次加载新模型才判定（用户 m06652）。
+    let cap_changed = patch.models_max.is_some();
+    let next = state.settings.patch(patch);
+    if cap_changed {
+        crate::scheduler::enforce_capacity(&state);
+    }
+    next
 }
 
 /// 扫描 llama.cpp 版本。
@@ -107,7 +120,7 @@ async fn versions_list(
                     name,
                     VersionProbe {
                         has_router_mode: has_router,
-                        probed_at_ms: router::now_ms(),
+                        probed_at_ms: logs::now_ms(),
                     },
                 );
             });
@@ -172,163 +185,6 @@ async fn device_list(state: State<'_, AppState>) -> Result<DeviceResult, String>
             error: Some(format!("执行 --list-devices 失败: {err}")),
         }),
     }
-}
-
-#[tauri::command]
-fn router_status(state: State<'_, AppState>) -> RouterStatus {
-    state
-        .status
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-}
-
-#[tauri::command]
-async fn router_start(app: AppHandle, state: State<'_, AppState>) -> Result<RouterStatus, String> {
-    {
-        let guard = state.router_slot.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_some() {
-            return Err("router 已在运行".into());
-        }
-    }
-    // 占住「正在启动」：空槽检查到真正写槽位之间还隔着版本探测、端口分配和 spawn，
-    // 这几百毫秒里槽位一直是空的 —— 两个并发请求都能过上一关，各拉起一个 router，
-    // 而槽位只记得住后一个，先启动的那个就成了孤儿进程（见 AppState::starting）。
-    let _start_guard = match state.begin_start("router") {
-        Some(guard) => guard,
-        None => return Err("router 正在启动中，请稍候".into()),
-    };
-
-    let settings = state.settings.get();
-    let llama_dir = settings
-        .llama_cpp_dir
-        .clone()
-        .ok_or_else(|| "尚未设置 llama.cpp 目录".to_string())?;
-
-    // 版本：优先使用已选版本，其次选择支持 router mode 的版本
-    let mut found = versions::scan_versions(&llama_dir, &settings.shared_lib_dirs, &settings.version_cache);
-    if found.is_empty() {
-        return Err(format!(
-            "在 {} 下未找到 llama-server，请确认目录结构",
-            llama_dir.display()
-        ));
-    }
-    for version in found.iter_mut() {
-        if version.has_router_mode.is_none() {
-            // 探测失败（返回 None）时**不写缓存**：否则缺 DLL / 被杀软拦这类环境问题
-            // 会被永久记成"该版本不支持 router mode"，用户之后怎么修都翻不了身。
-            let Some(has_router) = versions::probe_router_mode(&version.server_bin, &version.shared_lib_dirs)
-            else {
-                continue;
-            };
-            version.has_router_mode = Some(has_router);
-            let name = version.name.clone();
-            state.settings.update(|s| {
-                s.version_cache.insert(
-                    name,
-                    VersionProbe {
-                        has_router_mode: has_router,
-                        probed_at_ms: router::now_ms(),
-                    },
-                );
-            });
-        }
-    }
-    *state.versions.lock().unwrap_or_else(|e| e.into_inner()) = found.clone();
-
-    let version = found
-        .iter()
-        .find(|v| settings.selected_version.as_deref() == Some(v.name.as_str()))
-        .or_else(|| found.iter().find(|v| v.has_router_mode == Some(true)))
-        .or_else(|| found.first())
-        .cloned()
-        .ok_or_else(|| "没有可用版本".to_string())?;
-
-    if version.has_router_mode == Some(false) {
-        return Err(format!(
-            "版本 {} 不支持 router mode（--help 中未找到 --models-dir），请升级到 2025-12 之后的构建",
-            version.name
-        ));
-    }
-
-    // 设备校验：无效设备名会让 router 直接启动失败，必须提前拦截
-    let devices = gpu::list_devices(&version).unwrap_or_default();
-    *state.devices.lock().unwrap_or_else(|e| e.into_inner()) = devices.clone();
-    let (resolved, invalid) = gpu::validate_devices(&settings.gpu.devices, &devices);
-    if !invalid.is_empty() {
-        return Err(format!(
-            "以下设备当前不可用: {}（可用: {}）",
-            invalid.join(", "),
-            if devices.is_empty() {
-                "无".to_string()
-            } else {
-                devices
-                    .iter()
-                    .map(|d| d.name.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            }
-        ));
-    }
-    if gpu::tensor_split_conflicts_with_fit(&settings.gpu) {
-        return Err("split-mode=tensor 与 --fit 不兼容，请关闭 fit 或改用 layer/row".into());
-    }
-
-    let preset = state.preset_path();
-    let link_root = state.link_root();
-    let (process, status) = router::spawn_router(
-        &app,
-        state.logs.clone(),
-        &settings,
-        &version,
-        &preset,
-        &link_root,
-        &resolved,
-    )
-    .map_err(|err| format!("{err:#}"))?;
-
-    // 端口被占用时自动顺延，写回设置以便前端显示真实端口
-    if status.port != settings.port {
-        let port = status.port;
-        state.settings.update(|s| s.port = port);
-    }
-
-    *state.router_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(process);
-    *state.status.lock().unwrap_or_else(|e| e.into_inner()) = status.clone();
-    router::spawn_monitor(app.clone(), state.router_slot.clone(), state.status.clone());
-    // 空闲释放：llama.cpp 的 sleep 只放掉权重，子进程与 CUDA context 还在（实测约 0.2 GB），
-    // 这里再补一刀，把已经休眠的模型彻底卸载。
-    if settings.sleep_idle_seconds > 0 {
-        idle::spawn_idle_unloader(
-            app.clone(),
-            state.router_slot.clone(),
-            state.logs.clone(),
-            status.port,
-            settings.api_key.clone(),
-        );
-    }
-    tray::sync_tooltip(&app, true, status.port);
-    let _ = app.emit("router://status", status.clone());
-    Ok(status)
-}
-
-#[tauri::command]
-async fn router_stop(app: AppHandle, state: State<'_, AppState>) -> Result<RouterStatus, String> {
-    let stopped = router::stop_router(&state.router_slot);
-    if let Some(pid) = stopped {
-        state
-            .logs
-            .push("system", format!("[gui] 已停止 router（pid {pid}）"));
-    }
-    let status = {
-        let mut st = state.status.lock().unwrap_or_else(|e| e.into_inner());
-        st.running = false;
-        st.pid = None;
-        st.clone()
-    };
-    tray::sync_tooltip(&app, false, status.port);
-    let _ = app.emit("router://status", status.clone());
-    Ok(status)
 }
 
 /// 按文件名在 Strata 根目录里定位一份 config（**R2：路径来自扫描结果，不硬编码**）。
@@ -504,6 +360,31 @@ async fn strata_probe(app: AppHandle, state: State<'_, AppState>) -> Result<stra
     })
     .await
     .map_err(|err| format!("Strata 状态探测失败: {err}"))?;
+
+    // 探测本身不写日志，卡片一旦闪「已停止」就无从查证（用户 m13709 报过一次没修干净）。
+    // 这里只在「上一轮还在跑、这一轮却退化」时补一行，带上引擎给不出状态的直接原因。
+    if let Some((fresh, _)) = probed.as_ref() {
+        let before = state
+            .strata_status
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_else(|e| e.into_inner().clone());
+        if before.running
+            && before.loaded == Some(true)
+            && (!fresh.running || fresh.loaded != Some(true))
+        {
+            let line = state.logs.push(
+                "system",
+                format!(
+                    "[probe] Strata 探测退化：running={} loaded={:?} 原因={}",
+                    fresh.running,
+                    fresh.loaded,
+                    fresh.last_error.as_deref().unwrap_or("引擎没给出原因")
+                ),
+            );
+            let _ = app.emit("logs://lines", vec![line]);
+        }
+    }
 
     if let Some((fresh, external_hit)) = probed {
         // GUI 自己启动的那条路径不带端口归属信息（槽位里已经有了）
@@ -719,7 +600,7 @@ pub(crate) fn strata_start_engine(
             ));
         }
     }
-    // 同 router_start：并发的第二次启动必须在这里被挡住，否则两个进程只有一个能被记住
+    // 并发的第二次启动必须在这里被挡住，否则两个进程只有一个能被记住
     let _start_guard = match state.begin_start("strata") {
         Some(guard) => guard,
         None => return Err("Strata 正在启动中，请稍候".into()),
@@ -730,19 +611,6 @@ pub(crate) fn strata_start_engine(
         .or(settings.strata_selected_config.as_deref())
         .ok_or_else(|| "尚未选择 Strata 模型（也没有设置 strata_root）".to_string())?;
     let entry = find_strata_entry(state, wanted)?;
-
-    // 显存互斥：不硬禁止（双卡用户可以共存），但要留下可见提示。
-    if state
-        .router_slot
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_some()
-    {
-        state.logs.push(
-            "system",
-            "[gui] 警告：router 正在运行，Strata 与它共用显存，加载可能失败".to_string(),
-        );
-    }
 
     // host / 端口 / 密钥全部来自 config（R2）：设置页「服务」分组是直接把这些值
     // 写进 strata-*.json，这里不追加命令行参数（用户 m01623）。
@@ -765,15 +633,11 @@ pub(crate) fn strata_start_engine(
     strata_proxy::apply_to(state, &mut status);
 
     let _ = app.emit("strata://status", status.clone());
-    // Strata 不走 router 的 `sync_tooltip`，菜单可用性得在这里自己刷一次
+    // Strata 不走前门那条 `sync_tooltip`，菜单可用性得在这里自己刷一次
     // （否则「启动服务」一直可点、「停止服务」一直是灰的）。
-    // router 侧传 `running || 槽里有进程`：两者都占 GPU 显存，不能同时启动。
-    let router_running = state
-        .status
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .running;
-    tray::sync_menu_state(app, router_running, true);
+    // 第一参数是「前门在不在跑」：前门开着也算服务在跑，两者不能同时启。
+    let service_running = strata_proxy::running_port(state).is_some();
+    tray::sync_menu_state(app, service_running, true);
     Ok(status)
 }
 
@@ -811,10 +675,9 @@ async fn strata_stop(app: AppHandle, state: State<'_, AppState>) -> Result<strat
     // 引擎停了不代表前门停了：按真实状态补 proxy / proxy_port（用户 m00798）
     strata_proxy::apply_to(&state, &mut status);
     let _ = app.emit("strata://status", status.clone());
-    // router 侧照旧从进程槽读，这里没必要为了托盘再多查一次。
-    // Strata 侧跟着判一次：前门还开着的话「停止服务」仍应可点。
-    let router_running = state.status.lock().unwrap_or_else(|e| e.into_inner()).running;
-    tray::sync_menu_state(&app, router_running, strata_busy(&state));
+    // 前门（服务）在不在跑由它自己那侧算：它退役不了，这里只补 Strata 的真实状态。
+    let service_running = strata_proxy::running_port(&state).is_some();
+    tray::sync_menu_state(&app, service_running, strata_busy(&state));
     Ok(status)
 }
 
@@ -858,12 +721,52 @@ async fn strata_config_write(
 
 #[tauri::command]
 fn logs_snapshot(state: State<'_, AppState>, limit: Option<usize>) -> Vec<LogLine> {
-    state.logs.snapshot(limit.unwrap_or(router::LOG_BUFFER_CAP))
+    state.logs.snapshot(limit.unwrap_or(logs::LOG_BUFFER_CAP))
 }
 
 #[tauri::command]
 fn logs_clear(state: State<'_, AppState>) {
     state.logs.clear();
+}
+
+/// 日志文件信息：日志页显示路径、并据此打开目录。
+#[derive(serde::Serialize)]
+pub struct LogFileInfo {
+    /// 日志目录（未落盘时为空串）。
+    pub dir: String,
+    /// 当前日志文件（未落盘时为 null）。
+    pub file: Option<String>,
+    /// 内存里现有的行数。
+    pub lines: usize,
+}
+
+#[tauri::command]
+fn logs_info(state: State<'_, AppState>) -> LogFileInfo {
+    let file = state.logs.file_path();
+    LogFileInfo {
+        dir: file
+            .as_deref()
+            .and_then(|p| p.parent())
+            .map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        file: file.map(|p| p.to_string_lossy().to_string()),
+        lines: state.logs.len(),
+    }
+}
+
+/// 用系统文件管理器打开日志目录 —— 排查问题时用户要能把文件发出来（用户 m05885）。
+#[tauri::command]
+fn logs_open_dir(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    use tauri_plugin_opener::OpenerExt;
+    let file = state
+        .logs
+        .file_path()
+        .ok_or("日志文件还没建立（这一轮没有写日志）")?;
+    let dir = file.parent().ok_or("日志路径异常")?;
+    app.opener()
+        .open_path(dir.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|err| format!("打开日志目录失败：{err}"))?;
+    Ok(dir.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -1023,56 +926,135 @@ fn position_on_some_monitor<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>,
     })
 }
 
-/// 组装扫描结果（附带 preset 中「扫描不到」的孤儿段）。
+/// llama.cpp 通道的端口起始值（只增不回收，见 `docs/archive/PROXY_SCHEDULER_PLAN.md` §3.3）。
+pub(crate) const LLAMACPP_PORT_BASE: u16 = 8211;
+
+/// 把 config 目录与扫描结果对齐。
 ///
-/// 顺序很重要：先**恢复**（新扫到的模型从归档里接回上次的配置），再**清理**
-/// （模型文件已经不存在的段删掉并归档）—— 两边共用同一个归档文件。
-fn build_scan_result(
-    models_list: Vec<models::ScannedModel>,
-    preset_path: PathBuf,
-    preset_text: String,
-    restored: Vec<String>,
-    aliases: &std::collections::HashMap<String, String>,
+/// 顺序很重要：先**归档**（模型文件已经不在的配置移进 `.orphan\`），再**还原**
+/// （模型重新出现时从 `.orphan\` 接回上次的参数）—— 两边共用同一个目录。
+/// `with_ensure` 为真时，给还没有配置的模型补一份最小 JSON：只有「同步」才传真，
+/// 否则每次刷新模型都会往磁盘写文件。
+///
+/// 返回 `(配置项, 还原的段, 归档的段, 是否跳过了归档)`。
+fn sync_model_configs(
+    dir: &Path,
+    models_list: &[models::ScannedModel],
     roots: &[PathBuf],
-) -> models::ModelScanResult {
-    // 别名反查：段名（别名）→ 扫描 id。归档 key 用扫描 id，模型重新下载回来时只按它查。
-    let alias_reverse: std::collections::HashMap<String, String> = aliases
+    with_ensure: bool,
+) -> (Vec<model_config::DirConfig>, Vec<String>, Vec<String>, bool) {
+    let mut items = model_config::load_dir(dir);
+    let mut removed: Vec<String> = Vec::new();
+    let mut restored: Vec<String> = Vec::new();
+
+    // 保护（沿用 ini 时代的判断）：根目录整个不可用（换机、拔盘、路径写错），或
+    // 「扫描结果为空但配置有一堆」，更可能是路径问题而不是用户真把模型删了 ——
+    // 这种时候一律不动配置，宁可留着失效配置也不要一次清空。
+    let root_gone = roots
         .iter()
-        .map(|(scanned, alias)| (alias.clone(), scanned.clone()))
-        .collect();
-    let mut pruned = models::prune_missing_sections(&preset_text, &alias_reverse, roots);
-    // 写回前必须过一遍 `sanitize_preset_keys`：这是**唯一**绕过命令层的 preset 写盘
-    // 路径（`preset_upsert` / `preset_remove` / `preset_import` / … 都在 lib.rs 里显式
-    // 调它）。从旧版升上来的用户配置里可能还留着 `no-mmap` 这类已被 llama.cpp 淘汰的
-    // 键，而它的后果不是「那一段失效」，是 router **整体**起不来
-    // （`failed to initialize router models: option 'no-mmap' not recognized in preset 'X'`）。
-    // 只在改动过时写盘：清洗本身是幂等的，否则每次刷新模型都会重写一遍用户文件。
-    let cleaned = models::sanitize_preset_keys(&pruned.text);
-    if !pruned.removed.is_empty() || cleaned != pruned.text {
-        if let Err(err) = models::write_preset(&preset_path, &cleaned) {
-            eprintln!("[preset] 清理失效段后写回失败: {err:#}");
-        } else {
-            // 写成功了才认清洗后的内容：前端拿到的 `preset_text` 必须与磁盘一致，
-            // 否则用户在界面上看到的是一份"已经修好"的文本，文件里还是脏的。
-            pruned.text = cleaned;
+        .any(|root| !root.as_os_str().is_empty() && !root.is_dir());
+    let all_missing = models_list.is_empty() && items.len() >= 3;
+    let skipped = root_gone || all_missing;
+
+    if !skipped {
+        let mut kept = Vec::with_capacity(items.len());
+        for item in items {
+            if models_list
+                .iter()
+                .any(|m| model_config::same_id(&m.id, &item.id))
+            {
+                kept.push(item);
+                continue;
+            }
+            match model_config::move_to_orphan(dir, &item.id) {
+                Ok(Some(_)) => removed.push(item.id),
+                Ok(None) => {}
+                Err(err) => eprintln!("[config] 归档 {} 失败: {err:#}", item.id),
+            }
+        }
+        items = kept;
+    }
+
+    // 模型在、配置不在：先从 `.orphan\` 还原（保住用户上次的调参），否则补最小配置
+    for model in models_list {
+        if items
+            .iter()
+            .any(|item| model_config::same_id(&item.id, &model.id))
+        {
+            continue;
+        }
+        match model_config::restore_from_orphan(dir, &model.id, &model.path) {
+            Ok(Some(_)) => {
+                restored.push(model.id.clone());
+                continue;
+            }
+            Ok(None) => {}
+            Err(err) => eprintln!("[config] 还原 {} 失败: {err:#}", model.id),
+        }
+        if with_ensure {
+            if let Err(err) = model_config::ensure_config(
+                dir,
+                &model.id,
+                &model.path,
+                model.mmproj.as_deref(),
+                LLAMACPP_PORT_BASE,
+            ) {
+                eprintln!("[config] 为 {} 补配置失败: {err:#}", model.id);
+            }
         }
     }
 
-    let known: HashSet<String> = models_list.iter().map(|m| m.id.clone()).collect();
-    let orphan_sections = models::list_sections(&pruned.text)
-        .into_iter()
-        .filter(|s| !known.contains(s))
-        .collect();
+    // 淘汰键（`no-mmap` 之类）的后果是整个子实例起不来，加载后统一清掉（铁律 5）；
+    // 只在真的改动过时写盘。
+    items = model_config::load_dir(dir);
+    for item in &mut items {
+        let mut cfg = item.config.clone();
+        if model_config::sanitize_config(&mut cfg) {
+            match model_config::write(&item.path, &cfg) {
+                Ok(()) => item.config = cfg,
+                Err(err) => eprintln!("[config] 清理 {} 的淘汰键失败: {err:#}", item.id),
+            }
+        }
+    }
+
+    (items, restored, removed, skipped)
+}
+
+/// 组装扫描结果。
+///
+/// `configs` 是配置目录的原生视图：前端据此算「已配置」与 WebUI 开关，
+/// 不再有 ini 文本投影（第三刀已完成）。
+fn build_scan_result(
+    models_list: Vec<models::ScannedModel>,
+    items: &[model_config::DirConfig],
+    restored: Vec<String>,
+    removed: Vec<String>,
+    skipped: bool,
+    roots: &[PathBuf],
+) -> models::ModelScanResult {
     models::ModelScanResult {
         models: models_list,
         // 投影文件 / 外挂草稿模型：不列进模型列表，但配置里要能选
         aux_files: models::scan_aux_files(roots),
-        preset_path: preset_path.to_string_lossy().to_string(),
-        preset_text: pruned.text,
-        orphan_sections,
-        removed_sections: pruned.removed,
+        // 原生视图：前端不再解析 ini 文本（第三刀）
+        configs: items
+            .iter()
+            .map(|dc| models::ConfigEntry {
+                id: model_config::id_of(&dc.path).unwrap_or_else(|| dc.config.name.clone()),
+                name: dc.config.name.clone(),
+                no_webui: dc.config.no_webui,
+                has_model: dc
+                    .config
+                    .model
+                    .as_deref()
+                    .map(|m| std::path::Path::new(m).is_file())
+                    .unwrap_or(false),
+max_context: models::context_limit(&dc.config),
+            })
+            .collect(),
+        removed_sections: removed,
         restored_sections: restored,
-        prune_skipped: pruned.skipped_all_missing,
+        prune_skipped: skipped,
     }
 }
 
@@ -1147,7 +1129,7 @@ async fn models_scan(
 ) -> Result<models::ModelScanResult, String> {
     let settings = state.settings.get();
     let roots = settings.model_roots.clone();
-    let preset_path = state.preset_path();
+    let config_dir = state.model_config_dir();
     let force = refresh.unwrap_or(false);
 
     let models_list = if !force {
@@ -1171,51 +1153,31 @@ async fn models_scan(
         scanned
     };
 
-    // preset 与归档的读-改-写要串行：这些命令可能在多个线程上并发执行
+    // 配置目录的读-改-写要串行：这些命令可能在多个线程上并发执行
     let _guard = models::preset_lock();
 
-    let mut preset_text = models::read_preset(&preset_path).map_err(err_chain)?;
-    // 模型重新下载回来的话，这里把当初的配置从归档接回来（只针对归档里有记录的段）
-    let aliases = state.settings.get().aliases;
-    let (restored_text, restored) =
-        models::restore_archived_sections(&preset_text, &models_list, &aliases);
-    if !restored.is_empty() {
-        // 归档里可能留着老版本写下的伪键（spec-type_ngram-mod / webui 之类），
-        // 接回来之前先过一遍归一化，别让它们再把 router 弄成 500
-        preset_text = models::sanitize_preset_keys(&restored_text);
-        // 顺序很重要：**先写盘成功，再消费归档**。反过来的话写盘一失败，
-        // 归档条目已经没了，用户的参数就永久丢失。
-        models::write_preset(&preset_path, &preset_text).map_err(err_chain)?;
-        for section in &restored {
-            // 归档 key 是扫描 id，restore 返回的是段名 —— 反查回 id 再消费
-            let id = aliases
-                .iter()
-                .find(|(_, alias)| *alias == section)
-                .map(|(scanned, _)| scanned.clone())
-                .unwrap_or_else(|| section.clone());
-            models::consume_archived_section(&id);
-        }
-    } else {
-        preset_text = restored_text;
-    }
+    // 刷新模型只对齐配置（归档失效的、还原回来的），不主动补新配置：
+    // 补配置会写盘，交给用户点「同步」时再做。
+    let (items, restored, removed, skipped) =
+        sync_model_configs(&config_dir, &models_list, &roots, false);
     Ok(build_scan_result(
         models_list,
-        preset_path,
-        preset_text,
+        &items,
         restored,
-        &aliases,
+        removed,
+        skipped,
         &roots,
     ))
 }
 
-/// 扫描并为缺失的模型补齐 preset 段（`model = <绝对路径>`）。
+/// 扫描并为缺失的模型补齐配置（`<配置目录>\config\llamacpp-<id>.json`）。
 #[tauri::command]
-async fn preset_sync(state: State<'_, AppState>) -> Result<models::ModelScanResult, String> {
-    // preset 的读-改-写要串行（并发命令会互相覆盖）
+async fn config_sync(state: State<'_, AppState>) -> Result<models::ModelScanResult, String> {
+    // 配置目录的读-改-写要串行（并发命令会互相覆盖）
     let _guard = models::preset_lock();
     let settings = state.settings.get();
     let roots = settings.model_roots.clone();
-    let preset_path = state.preset_path();
+    let config_dir = state.model_config_dir();
 
     let models_list = match state.cached_scan(&roots) {
         Some(cached) => cached,
@@ -1228,75 +1190,94 @@ async fn preset_sync(state: State<'_, AppState>) -> Result<models::ModelScanResu
         }
     };
 
-    let text = models::read_preset(&preset_path).map_err(err_chain)?;
-    // 改过别名的模型，其段名就是别名：同步时按别名建段，
-    // 否则会按扫描 id 再建一段，router 里就出现两个模型。
-    let aliases = state.settings.get().aliases;
-    // 先看归档里有没有这些段的旧配置（模型删了又下回来的情况）
-    let (mut text, restored) = models::restore_archived_sections(&text, &models_list, &aliases);
-    for model in &models_list {
-        let section = aliases
-            .get(&model.id)
-            .map(String::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(model.id.as_str());
-        text = models::ensure_model_section(&text, model, section);
+    // 「同步」才补配置：模型在、配置不在的，先看 `.orphan\` 有没有旧参数，没有才写最小 JSON
+    let (items, restored, removed, skipped) =
+        sync_model_configs(&config_dir, &models_list, &roots, true);
+    Ok(build_scan_result(
+        models_list,
+        &items,
+        restored,
+        removed,
+        skipped,
+        &roots,
+    ))
+}
+
+/// 读一份 config 的原文（JSON）。
+///
+/// 「模型详情」直接显示它：ini 视图退役后不再有文本投影（第三刀）。
+#[tauri::command]
+fn config_read(state: State<'_, AppState>, section: String) -> Result<String, String> {
+    let dir = state.model_config_dir();
+    for item in model_config::load_dir(&dir) {
+        if model_config::same_id(&item.id, &section) {
+            return std::fs::read_to_string(&item.path)
+                .map_err(|err| format!("读取 {} 失败：{err:#}", item.path.display()));
+        }
     }
-    text = models::sanitize_preset_keys(&text);
-    models::write_preset(&preset_path, &text).map_err(err_chain)?;
-    Ok(build_scan_result(models_list, preset_path, text, restored, &aliases, &roots))
+    // 没有配置就返回空串：界面显示「还没有配置文件」
+    Ok(String::new())
 }
 
+/// 写入某个模型的键值对（保留配置里未被涉及的键）。
 #[tauri::command]
-fn preset_read(state: State<'_, AppState>) -> Result<String, String> {
-    models::read_preset(&state.preset_path()).map_err(err_chain)
-}
-
-#[tauri::command]
-fn preset_write(state: State<'_, AppState>, content: String) -> Result<String, String> {
-    // preset 的读-改-写要串行（并发命令会互相覆盖）
-    let _guard = models::preset_lock();
-    let content = models::sanitize_preset_keys(&content);
-    models::write_preset(&state.preset_path(), &content).map_err(err_chain)?;
-    Ok(content)
-}
-
-/// 写入某个模型段的键值对（保留段内未被涉及的键与注释）。
-#[tauri::command]
-fn preset_upsert(
+fn config_upsert(
     state: State<'_, AppState>,
     section: String,
     entries: Vec<(String, String)>,
-) -> Result<String, String> {
-    // preset 的读-改-写要串行（并发命令会互相覆盖）
+) -> Result<(), String> {
+    // 配置目录的读-改-写要串行（并发命令会互相覆盖）
     let _guard = models::preset_lock();
-    let path = state.preset_path();
-    let current = models::read_preset(&path).map_err(err_chain)?;
-    let updated = models::sanitize_preset_keys(&models::upsert_entries(&current, &section, &entries));
-    models::write_preset(&path, &updated).map_err(err_chain)?;
-    Ok(updated)
+    let dir = state.model_config_dir();
+    model_config::upsert_entries_in_dir(&dir, &section, &entries).map_err(err_chain)?;
+    Ok(())
 }
 
+/// 删除某个模型的配置（用户点「删除」；模型消失是另一条路径，走归档）。
 #[tauri::command]
-fn preset_remove(state: State<'_, AppState>, section: String) -> Result<String, String> {
-    // preset 的读-改-写要串行（并发命令会互相覆盖）
+fn config_remove(state: State<'_, AppState>, section: String) -> Result<(), String> {
+    // 配置目录的读-改-写要串行（并发命令会互相覆盖）
     let _guard = models::preset_lock();
-    let path = state.preset_path();
-    let current = models::read_preset(&path).map_err(err_chain)?;
-    let updated = models::sanitize_preset_keys(&models::remove_section(&current, &section));
-    models::write_preset(&path, &updated).map_err(err_chain)?;
-    Ok(updated)
+    let dir = state.model_config_dir();
+    model_config::remove_config_file(&dir, &section).map_err(err_chain)?;
+    Ok(())
 }
 
-/// 读取某个模型段的键值对。
+/// 读取某个模型的键值对。
 #[tauri::command]
-fn preset_section_entries(
+fn config_entries(
     state: State<'_, AppState>,
     section: String,
 ) -> Result<Vec<(String, String)>, String> {
-    let text = models::read_preset(&state.preset_path()).map_err(err_chain)?;
-    Ok(models::section_entries(&text, &section))
+    let dir = state.model_config_dir();
+    for item in model_config::load_dir(&dir) {
+        if model_config::same_id(&item.id, &section) {
+            return Ok(model_config::entries_from_config(&item.config));
+        }
+    }
+    // 没有配置就返回空表：界面显示默认值，用户一保存就会生成
+    Ok(Vec::new())
+}
+
+/// 把 API Key 写进**所有** llama.cpp 引擎配置（空串 = 清除，引擎就不带 `--api-key`）。
+///
+/// 用户 m06341：这个 Key 是给各引擎用的 —— 子实例按各自 config 里的 `api_key` 加 `--api-key`
+/// （见 `scheduler::build_model_args`），只存进 GUI 设置等于没设。前门转发时会带上同一份 key。
+/// 返回写入的 config 个数（0 = 还没有模型配置）。
+#[tauri::command]
+fn config_set_api_key(state: State<'_, AppState>, key: String) -> Result<usize, String> {
+    // 配置目录的读-改-写要串行（并发命令会互相覆盖）
+    let _guard = models::preset_lock();
+    let dir = state.model_config_dir();
+    let value = key.trim().to_string();
+    let mut written = 0usize;
+    for item in model_config::load_dir(&dir) {
+        let mut cfg = item.config.clone();
+        cfg.api_key = if value.is_empty() { None } else { Some(value.clone()) };
+        model_config::write(&item.path, &cfg).map_err(err_chain)?;
+        written += 1;
+    }
+    Ok(written)
 }
 
 /// 用系统默认程序打开一个本机 http 地址（用于「开始聊天」打开 llama.cpp 自带 WebUI）。
@@ -1316,10 +1297,28 @@ fn open_local_url(app: AppHandle, url: String) -> Result<(), String> {
         .open_url(url, None::<&str>)
         .map_err(|err| format!("打开浏览器失败: {err}"))
 }
-/// 把 hub 的模型启动参数迁移进 presets.ini（每个模型的应用参数一次性搬过来）。
+
+/// 用系统默认浏览器打开外部链接（聊天里模型给出的网页地址，用户 m07200 第 2 点）。
+///
+/// 与 [`open_local_url`] 分开：那个只放行本机地址，这个只放行 http/https。
+/// 不校验的话 `file://` / 自定义协议都能从这里穿出去 —— 链接来自模型输出，
+/// 属于不可信内容。
+#[tauri::command]
+fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+
+    let ok = url.starts_with("http://") || url.starts_with("https://");
+    if !ok {
+        return Err(format!("只允许打开 http/https 链接: {url}"));
+    }
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|err| format!("打开浏览器失败: {err}"))
+}
+/// 把 hub 的模型启动参数迁移进模型配置（每个模型的应用参数一次性搬过来）。
 /// hub 根目录由 `llama_cpp_dir` 推断：它通常形如 `<hub>/llamacpp`。
 #[tauri::command]
-fn preset_import_hub(state: State<'_, AppState>) -> Result<models::HubImportReport, String> {
+fn config_import_hub(state: State<'_, AppState>) -> Result<models::HubImportReport, String> {
     let dir = state
         .settings
         .get()
@@ -1333,15 +1332,14 @@ fn preset_import_hub(state: State<'_, AppState>) -> Result<models::HubImportRepo
             hub_config.display()
         ));
     }
-    let path = state.preset_path();
-    // preset 的读-改-写要串行（并发命令会互相覆盖）。
-    // 这条路径以前是唯一漏了锁的写入者：与 `preset_upsert` / `preset_sync` 撞上时，
+    let config_dir = state.model_config_dir();
+    // 配置目录的读-改-写要串行（并发命令会互相覆盖）。
+    // 这条路径以前是唯一漏了锁的写入者：与 `preset_upsert` / `config_sync` 撞上时，
     // 后写的一方会拿着旧全文把对方的改动整段抹掉。
     let _guard = models::preset_lock();
-    let current = models::read_preset(&path).map_err(err_chain)?;
-    let (updated, report) = models::import_hub_presets(&current, &hub_config).map_err(err_chain)?;
-    let updated = models::sanitize_preset_keys(&updated);
-    models::write_preset(&path, &updated).map_err(err_chain)?;
+    // 第三刀：hub 的参数现在直接写进 config JSON，不再渲染一份 ini 文本当中间层
+    // （导入只增不减：配置目录里没有的段不动）。
+    let report = models::import_hub_into_dir(&config_dir, &hub_config).map_err(err_chain)?;
     Ok(report)
 }
 
@@ -1398,9 +1396,66 @@ fn create_main_window(app: &AppHandle, webview_data_dir: Option<PathBuf>) -> Res
     if let Some(dir) = webview_data_dir {
         builder = builder.data_directory(dir);
     }
-    builder.build().map_err(|e| e.to_string())?;
+    let window = builder.build().map_err(|e| e.to_string())?;
+    strip_caption_chrome(&window);
     Ok(())
 }
+
+/// 去掉系统标题栏左边的图标与文字（用户 m10631 / m10727）。
+///
+/// 侧栏顶部已经有 logo 和「llama.cpp GUI」，标题栏再来一遍是重复的。
+/// 文字那半在 `tauri.conf.json` 的窗口定义里已经改成空串（`index.html` 的
+/// `<title>` 也一并清空 —— 网页的标题有可能反过来盖住窗口标题），这里只剩图标。
+///
+/// Windows 的窗口图标分大小两个：`ICON_BIG` 给任务栏和 Alt+Tab，`ICON_SMALL`
+/// 给标题栏。**只动小的那个**，任务栏图标保持原样。
+///
+/// 只发 `WM_SETICON(ICON_SMALL, NULL)` 是不够的：窗口自己没有小图标时，系统会回退到
+/// **窗口类**的小图标（`GCLP_HICONSM`，tao 注册窗口类时写进去的），也就是用户 m10727
+/// 截图里那个还在的图标。所以两处一起清：
+///   1. `SetClassLongPtrW(GCLP_HICONSM, 0)` 掐掉回退源；
+///   2. `WM_SETICON(ICON_SMALL, …)` 换成一张 1×1 全透明图标 —— 比传 NULL 稳，
+///      「NULL 是不画还是回退」在不同 Windows 版本上并不一致。
+///
+/// Tauri 自己的 `set_icon` 走不通：tao 只在 `Some(icon)` 时下发 `WM_SETICON`，传 `None`
+/// 什么都不做，而给一张透明图又会把大小两个一起换掉（任务栏就空了）。
+#[cfg(windows)]
+fn strip_caption_chrome<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateIcon, SendMessageW, SetClassLongPtrW, GCLP_HICONSM, ICON_SMALL, WM_SETICON,
+    };
+
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let hwnd = hwnd.0 as _;
+
+    // 1×1 单色图标：AND 掩码全 1（该像素完全透明），XOR 掩码全 0。
+    // 1bpp 位图的行要按 WORD 对齐，1 像素宽于是一行 2 字节。
+    let and_bits: [u8; 2] = [0xFF, 0x00];
+    let xor_bits: [u8; 2] = [0x00, 0x00];
+
+    // SAFETY: hwnd 取自刚建好的窗口，句柄有效；`GCLP_HICONSM` 与
+    // `WM_SETICON`/`ICON_SMALL` 都是「换掉标题栏图标」的常规用法。
+    // 图标句柄刻意不 `DestroyIcon`：它要活到窗口销毁，进程退出时由系统回收。
+    unsafe {
+        SetClassLongPtrW(hwnd, GCLP_HICONSM, 0);
+        let blank = CreateIcon(
+            std::ptr::null_mut(),
+            1,
+            1,
+            1,
+            1,
+            and_bits.as_ptr(),
+            xor_bits.as_ptr(),
+        );
+        let icon = if blank.is_null() { 0 } else { blank as isize };
+        SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon);
+    }
+}
+
+#[cfg(not(windows))]
+fn strip_caption_chrome<R: tauri::Runtime>(_window: &tauri::WebviewWindow<R>) {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -1427,6 +1482,8 @@ pub fn run() {
                 .map_err(|err| format!("无法确定配置目录: {err}"))?;
             let (config_dir, portable) = paths::resolve_config_dir(&system_dir);
             std::fs::create_dir_all(&config_dir)?;
+            // 监控采集层（P4）：常驻线程 1 秒采一次，环形缓冲 60 点
+            monitor::start_sampler();
             // webview 的数据（localStorage / 缓存）也跟着 exe 走。
             // 必须在建窗口之前定下来：WebView2 建立环境时就锁定了这个目录。
             let webview_data_dir = if portable {
@@ -1441,10 +1498,51 @@ pub fn run() {
             // 扫描结果也落盘：启动时先用上次的结果秒开列表，后台再重扫
             models::set_scan_cache_path(Some(config_dir.join("models-scan-cache.json")));
             // 被自动清理掉的 preset 段归档在这里：模型重新下载回来时按段名接回配置
-            models::set_archive_path(Some(config_dir.join("removed-preset-sections.json")));
+            // 模型消失时的参数归档现在走 `<配置目录>\config\.orphan\`（一个模型一份 JSON 之后，
+            // 按段名维度的 `removed-preset-sections.json` 不再写了）。
             let autostart_wanted = store.get().autostart;
             let saved_window = store.get().window;
-            app.manage(AppState::new(config_dir, store));
+            let state = AppState::new(config_dir.clone(), store);
+            // 日志同时落盘到 `<配置目录>\logs\gui-<启动时间>.log`，一次运行一个文件：
+            // 内存环形缓冲一关应用就没了，用户报的现场事后无从查起（用户 m05885）。
+            state.logs.attach_file(config_dir.join("logs"));
+            // 前门与调度器里的诊断函数拿不到 AppState，靠这个全局句柄写日志（用户 m05816）
+            logs::register_global(std::sync::Arc::clone(&state.logs));
+            app.manage(state);
+
+            // 一次性迁移：老的 `presets.ini` → `<配置目录>\config\llamacpp-<id>.json`。
+            // 幂等（ini 不存在就直接跳过）；**全部段成功才**把 ini 改名成 `.bak-<时间戳>`，
+            // 有失败段就原样留着，下次启动接着迁。
+            {
+                let state = app.state::<AppState>();
+                let ini_path = state.preset_path();
+                if ini_path.is_file() {
+                    let config_dir = state.model_config_dir();
+                    match model_config::migrate_from_ini(&ini_path, &config_dir, LLAMACPP_PORT_BASE)
+                    {
+                        Ok(outcome) if !outcome.is_noop() => {
+                            let backup = outcome
+                                .backup_path
+                                .as_deref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_else(|| "（有段没迁成功，ini 保留原样）".to_string());
+                            let message = format!(
+                                "[config] 已把 {} 个模型配置迁到 {}，备份 {}",
+                                outcome.migrated.len(),
+                                config_dir.display(),
+                                backup
+                            );
+                            state.logs.push("system", message);
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            state
+                                .logs
+                                .push("system", format!("[config] 迁移 presets.ini 失败: {err:#}"));
+                        }
+                    }
+                }
+            }
 
             // settings.json 读不出来或内容坏了，必须让用户看见：
             // 以前这两种情况都是静默回落默认值，随后一次写盘就把用户的设置覆盖掉了，
@@ -1463,6 +1561,22 @@ pub fn run() {
                     "system",
                     format!("[gui] 便携模式：配置目录 {}", state.config_dir.display()),
                 );
+            }
+
+            // 空闲释放线程常驻（用户 m06652）：每轮重新读设置，跟前门在不在无关 ——
+            // 手动停掉前门也不该让已加载的模型一直占着显存。
+            idle::spawn_idle_unloader(app.handle().clone());
+
+            // 前门随程序启动（A3：对外只留一个端口）。两通道都靠它：
+            // llama.cpp 子实例按配置目录里的 JSON 起，Strata 引擎按 config 起。
+            {
+                let state = app.state::<AppState>();
+                if let Err(err) = strata_proxy::autostart(app.handle(), &state) {
+                    state.logs.push(
+                        "system",
+                        format!("[gui] 前门没能自动启动：{err}（可在侧栏胶囊里手动启动）"),
+                    );
+                }
             }
 
             // 主窗口在这里手工创建：tauri.conf.json 里 main 标了 `"create": false`。
@@ -1634,9 +1748,6 @@ pub fn run() {
             autostart_get,
             versions_list,
             device_list,
-            router_status,
-            router_start,
-            router_stop,
             strata_status,
             strata_scan,
             strata_probe,
@@ -1652,18 +1763,33 @@ pub fn run() {
             strata::strata_load_model,
             logs_snapshot,
             logs_clear,
+            logs_info,
+            logs_open_dir,
             port_in_use,
             fix_ascii_path,
             fit_preview,
             models_scan,
-            preset_sync,
-            preset_read,
-            preset_write,
-            preset_upsert,
-            preset_import_hub,
+            config_sync,
+            config_read,
+            config_upsert,
+            config_import_hub,
             open_local_url,
-            preset_remove,
-            preset_section_entries,
+            open_external_url,
+            monitor::monitor_sample,
+        monitor::monitor_sample_now,
+        monitor::monitor_engine,
+        search::search_config,
+            search::search_save_config,
+            search::search_query,
+            search::search_test_engine,
+            search::web_fetch,
+            mcp::mcp_servers_list,
+            mcp::mcp_servers_save,
+            mcp::mcp_tools_list,
+            mcp::mcp_tool_call,
+            config_remove,
+            config_entries,
+            config_set_api_key,
             favourite_toggle,
             bench::bench_server,
             bench::bench_strata,
@@ -1694,21 +1820,25 @@ pub fn run() {
                 // （Strata 的引擎子进程占着显存，GUI 退出后不能留活口）
                 if let Some(state) = app_handle.try_state::<AppState>() {
                     persist_window_size(&state);
+                    // MCP 服务器是 stdio 子进程：GUI 退了不能留在后台
+                    // （node / python 那些还会常驻，重开 GUI 时才重新拉起）。
+                    mcp::stop_all();
                     // 前门先关：关掉它才不会在停引擎的过程中又有请求进来触发启动。
                     strata_proxy::shutdown(&state);
+                    // 前门拉起的 llama.cpp 子实例同样占着显存，退出时一并停掉。
+                    let stopped = state
+                        .scheduler
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .stop_all(&state.logs);
+                    if !stopped.is_empty() {
+                        eprintln!("[exit] 已停止 llama.cpp 子实例：{}", stopped.join("、"));
+                    }
                     // 这里只是第二道防线：`AppHandle::exit` 正常会走 `RunEvent::Exit`，
                     // 但 `request_exit` 失败时会退化成 `std::process::exit`（tauri 2.11.5
                     // src/app.rs:573）直接跳过本事件 —— 所以 tray::quit 自己也停一遍。
                     // 先判「本来在跑吗」再动手：没跑时 `stop_*` 返回 None 是正常情况，
                     // 不该刷日志；只有"在跑却停不掉"才是真问题。
-                    let router_was_running = state
-                        .router_slot
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .is_some();
-                    if router_was_running && router::stop_router(&state.router_slot).is_none() {
-                        eprintln!("[exit] router 停止失败：slot 已被清空但进程可能仍在");
-                    }
                     let strata_was_running = state
                         .strata_slot
                         .lock()

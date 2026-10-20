@@ -244,7 +244,7 @@ const PROBE_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// 从缓存里取探测结果（过期的当作没有）。
 fn cached_probe(name: &str, cache: &HashMap<String, VersionProbe>) -> Option<bool> {
     let probe = cache.get(name)?;
-    let age = crate::router::now_ms().saturating_sub(probe.probed_at_ms);
+    let age = crate::logs::now_ms().saturating_sub(probe.probed_at_ms);
     (age < PROBE_TTL_MS).then_some(probe.has_router_mode)
 }
 

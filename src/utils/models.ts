@@ -153,6 +153,10 @@ export function mergeModels(
   favourites: string[],
   sections: Set<string>,
   aliases: Record<string, string> = {},
+  // Strata 通道的模型要一起列出来（用户 m02048 第 4 点）：卡片上的量化/大小/路径在本地
+  // 扫描结果里没有对应项，这些字段留空由卡片渲染成「—」；启停要用配置文件全名，
+  // 所以这里收一份 Strata 的扫描结果（`strataEntries`），按 `model_name` 对上号。
+  strataEntries: { model_name: string | null; config_path: string }[] = [],
 ): ModelView[] {
   const byId = new Map<string, ModelView>();
   /** 段名 → 扫描 id */
@@ -192,6 +196,39 @@ export function mergeModels(
   }
 
   for (const r of routerModels) {
+    // Strata 通道（用户 m02048 第 4 点：也要列出来，卡片上标引擎）：量化、大小、路径这些
+    // 字段只存在于本地扫描结果里，strata 模型没有对应项 → 留空，卡片渲染成「—」。
+    // 启停不能走前门（`/models/unload` 只认 llama.cpp 的配置目录，strata 模型会 404），
+    // 所以带上配置文件全名，由卡片改调 Strata 接口。
+    //
+    // 对号用 `model_name`（不是文件名）：`strata-swift-iq3_xxs.json` 里的 model_name 是
+    // `swift-1.5-iq3_xxs`，从文件名反推永远对不上；前门给的 `id` 正是这个 model_name。
+    if (r.channel === "strata") {
+      const entry = strataEntries.find((e) => e.model_name === r.id);
+      byId.set(r.id, {
+        id: r.id,
+        section: r.id,
+        name: r.id,
+        quantization: null,
+        sizeBytes: null,
+        shards: 1,
+        hasMmproj: false,
+        group: "strata",
+        status: r.status?.value ?? "unloaded",
+        port: null,
+        loadProgress: null,
+        loadingStage: null,
+        source: "strata",
+        failed: false,
+        exitCode: null,
+        favourite: false,
+        inPreset: true,
+        scanned: null,
+        channel: "strata",
+        strataFile: entry ? entry.config_path.split(/[\\/]/).pop() : undefined,
+      });
+      continue;
+    }
     const status = r.status?.value ?? "unloaded";
     // 段名可能被改过：按 别名表 → 同名 id → 段里的 model 路径 依次对回扫描结果
     const matchedId =
@@ -239,9 +276,10 @@ export function mergeModels(
       ...base,
       // router 报的段名就是该模型当前的正式名字（启动/停止/聊天都要用它）
       section: r.id,
+      channel: "llamacpp",
       name: displayName,
       status,
-      port: portFromArgs(r.status?.args) ?? (status === "loaded" ? base.port : null),
+      port: r.port ?? portFromArgs(r.status?.args) ?? (status === "loaded" ? base.port : null),
       loadProgress: r.status?.progress?.value ?? null,
       loadingStage: r.status?.progress?.current ?? null,
       failed: Boolean(r.status?.failed),

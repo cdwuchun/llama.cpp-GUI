@@ -7,7 +7,7 @@
  * `src/assets/params.json`），不接受 schema 参数。Strata 的参数是 CLI flag 数组
  * 而不是 preset 的键值对，语义不同，换算必须自己写。
  *
- * 三条硬约束（对应 STRATA_INTEGRATION_PLAN.md §8.6 的 W 规则）：
+ * 三条硬约束（对应 docs/archive/STRATA_INTEGRATION_PLAN.md §8.6 的 W 规则）：
  * - 写回只动表单认识的 flag，其余 token **原样保留**（安装事实类参数是上游
  *   安装器写下的，GUI 改了就装不上模型）
  * - 保留原 args 的顺序，新启用的 flag 追加到末尾（上游 `upgrade_config` 按
@@ -113,7 +113,7 @@ const PARAM_META: Omit<ParamDef, "abbr" | "delimiter" | "mergeInto" | "mergeValu
     uiType: null,
     default: "false",
     values: [],
-    label: "KV 按需增长",
+    label: "动态增长 KV",
     desc: "K/V 只为请求真正到达的 cell 占显存，其余交给专家缓存，随上下文增长把槽位还回来。单卡、需配合 --expert-profile。默认启动时就把整个 --max-context 分配掉。",
     group: "ctx",
     order: 4,
@@ -133,7 +133,7 @@ const PARAM_META: Omit<ParamDef, "abbr" | "delimiter" | "mergeInto" | "mergeValu
       { value: "6", label: "6" },
       { value: "8", label: "8" },
     ],
-    label: "MTP 验证窗口",
+    label: "推测解码窗口",
     desc: "MTP 草稿器每次校验提议多少 token。安装器写 4；配合 --suffix-draft 可在重复概率高的位置每次加 2，最多到 8。",
     group: "speed",
     order: 1,
@@ -147,7 +147,7 @@ const PARAM_META: Omit<ParamDef, "abbr" | "delimiter" | "mergeInto" | "mergeValu
     uiType: null,
     default: "0.5",
     values: [],
-    label: "草稿续窗概率门槛",
+    label: "草稿最小概率",
     desc: "草稿层要有把握到多少概率才把验证窗口再延长一次。安装器写 0.5；--calibrate 会在这台机器上实测。",
     group: "speed",
     order: 2,
@@ -166,7 +166,7 @@ const PARAM_META: Omit<ParamDef, "abbr" | "delimiter" | "mergeInto" | "mergeValu
       { value: "12", label: "12" },
       { value: "24", label: "24" },
     ],
-    label: "会话检查点数量",
+    label: "提示词检查点数",
     desc: "serve 模式：跨请求保留 N 个会话检查点，每个约 118 MB 内存。0 表示每个 prompt 都从头 prefill。",
     group: "speed",
     order: 3,
@@ -199,7 +199,7 @@ const PARAM_META: Omit<ParamDef, "abbr" | "delimiter" | "mergeInto" | "mergeValu
     uiType: null,
     default: "false",
     values: [],
-    label: "尾部检查点",
+    label: "提示词尾部检查点",
     desc: "serve 模式、单卡：在靠近 prompt 结尾处（已有的 chunk 边界）多存一个检查点。需要 --prompt-cache 与 --prompt-cache-every > 0。",
     group: "speed",
     order: 5,
@@ -218,7 +218,7 @@ const PARAM_META: Omit<ParamDef, "abbr" | "delimiter" | "mergeInto" | "mergeValu
       { value: "auto:32768", label: "auto:32768" },
       { value: "8192", label: "8192" },
     ],
-    label: "prefill 分块",
+    label: "Prefill 分块（token）",
     desc: "分批处理 prompt，每块 CHUNK 个 token（需要 --native）。auto = 专家缓存能借出缓冲区的、不超过 8192 的最大块；auto:16384 / auto:32768 允许更大的块。",
     group: "speed",
     order: 6,
@@ -238,12 +238,71 @@ const PARAM_META: Omit<ParamDef, "abbr" | "delimiter" | "mergeInto" | "mergeValu
       { value: "512", label: "512" },
       { value: "1024", label: "1024" },
     ],
-    label: "专家缓存槽位",
+    label: "显存专家缓存槽数",
     desc: "在显存里驻留 N 个专家 blob，用 moe_hit_grouped_s2 在 GPU 上算它们的行。引擎默认 0。",
     group: "speed",
     order: 7,
     sort: 7,
     defaultEnabled: true,
+  },
+  {
+    key: "batch",
+    flag: "--batch",
+    type: "INTEGER",
+    uiType: "dropdown",
+    default: "2",
+    values: [
+      { value: "2", label: "2" },
+      { value: "4", label: "4" },
+      { value: "6", label: "6" },
+      { value: "8", label: "8" },
+    ],
+    label: "并发槽位",
+    desc: "--batch N（与 --slots N 等价）：最多 N 个请求同时解码，每个槽位有自己的 session 并占用与主 session 相当的显存（通常 2..8）。不写 = 单请求。勾选 --batch-mtp 可让每个槽位每轮多验证一个 MTP 草稿。改完要重启引擎才生效。",
+    group: "speed",
+    order: 8,
+    sort: 8,
+    defaultEnabled: false,
+  },
+  {
+    key: "conversation-cache-mib",
+    flag: "--conversation-cache-mib",
+    type: "INTEGER",
+    uiType: "dropdown",
+    default: "1024",
+    values: [
+      { value: "0", label: "0（关闭）" },
+      { value: "512", label: "512" },
+      { value: "1024", label: "1024" },
+      { value: "2048", label: "2048" },
+      { value: "4096", label: "4096" },
+    ],
+    label: "会话缓存预算（MiB）",
+    desc: "--serve：停放（park）会话占用的物理内存预算（MiB）。默认 0 表示关闭会话停放。停放后再次请求可直接恢复，省掉重新 prefill；预算用完时按先后顺序丢弃最旧的会话。改完要重启引擎才生效。",
+    group: "speed",
+    order: 9,
+    sort: 9,
+    defaultEnabled: false,
+  },
+  {
+    key: "conversation-cache-slots",
+    flag: "--conversation-cache-slots",
+    type: "INTEGER",
+    uiType: "dropdown",
+    default: "4",
+    values: [
+      { value: "1", label: "1" },
+      { value: "2", label: "2" },
+      { value: "4", label: "4（引擎默认）" },
+      { value: "8", label: "8" },
+      { value: "16", label: "16" },
+    ],
+    label: "会话缓存槽数",
+    desc: "--serve：最多同时停放的会话数（默认 4）。每个停放会话的实际内存占用仍受「会话缓存预算」约束；槽数给得比预算能装下的多时，超出部分的会话会被丢弃。改完要重启引擎才生效。",
+    group: "speed",
+    order: 10,
+    sort: 10,
+    defaultEnabled: false,
   },
   {
     key: "vram-reserve-mib",
@@ -266,7 +325,7 @@ const PARAM_META: Omit<ParamDef, "abbr" | "delimiter" | "mergeInto" | "mergeValu
     uiType: null,
     default: "0.20",
     values: [],
-    label: "PCIe 带宽份额",
+    label: "PCIe 专家比例",
     desc: "CPU/SSD 与 GPU 交换数据时允许占用的 PCIe 带宽比例。",
     group: "serve",
     order: 2,
@@ -424,7 +483,22 @@ const FLAG_TO_KEY = new Map<string, string>(
   strataParamSchema.params.map((p) => [p.flag, p.key]),
 );
 
-/** 表单认识的 flag 集合（写回时的白名单） */
+/**
+ * 同义 flag：上游 `--slots N` 与 `--batch N` 是同一个开关（见 `strata --help`，
+ * `--batch N / --slots N` 写在一行）。表单以 `--batch` 为规范写法，但读 config 时
+ * 两种写法都要认 —— 否则 `--slots` 会作为「表单不认识的 flag」被原样留下，
+ * 用户再勾选「并发槽位」就会写出两个开关。
+ */
+const FLAG_ALIASES: [alias: string, key: string][] = [["--slots", "batch"]];
+for (const [alias, key] of FLAG_ALIASES) FLAG_TO_KEY.set(alias, key);
+
+/** key → 该 key 在 args 里可能出现的所有写法（规范写法在前） */
+const KEY_FLAGS = new Map<string, string[]>();
+for (const [flag, key] of FLAG_TO_KEY) {
+  KEY_FLAGS.set(key, [...(KEY_FLAGS.get(key) ?? []), flag]);
+}
+
+/** 表单认识的 flag 集合（写回时的白名单，含同义写法） */
 export const STRATA_KNOWN_FLAGS = new Set(FLAG_TO_KEY.keys());
 
 /**
@@ -546,7 +620,10 @@ export { isFlagToken };
 export function argsToState(args: unknown[]): Record<string, ParamState> {
   const state: Record<string, ParamState> = {};
   for (const def of strataParamSchema.params) {
-    const at = args.findIndex((t) => t === def.flag);
+    // 同义写法（--slots = --batch）都算「这个参数在 args 里出现过」
+    const at = args.findIndex(
+      (t) => typeof t === "string" && FLAG_TO_KEY.get(t) === def.key,
+    );
     if (at < 0) {
       state[def.key] = { enabled: false, value: def.default };
       continue;
@@ -602,7 +679,9 @@ export function stateToArgs(args: unknown[], state: Record<string, ParamState>):
     const entry = state[def.key];
     if (!entry?.enabled) continue;
     if (TOP_LEVEL_KEYS.has(def.key)) continue; // 顶层字段永不进 args
-    if (args.includes(def.flag)) continue;
+    // 保留原 args 里的写法（--slots 仍是 --slots，顺序也不动）；只有完全没有时
+    // 才追加规范写法 --batch。
+    if (KEY_FLAGS.get(def.key)?.some((flag) => args.includes(flag))) continue;
     out.push(def.flag);
     if (!FLAG_ONLY.has(def.key) && entry.value !== "") out.push(entry.value);
   }

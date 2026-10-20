@@ -1,11 +1,11 @@
 //! 托盘图标、菜单与「关闭到托盘」（P6）。
 //!
-//! 设计取舍：托盘**不直接调用** `router_start`/`router_stop` 这两条命令 —— 它们需要
-//! `State<'_, AppState>`，在托盘回调里 spawn 出来的 async 任务中，`State` 借用
+//! 设计取舍：托盘**不直接调用** `strata_proxy_start`/`strata_proxy_stop` 这两条命令 ——
+//! 它们需要 `State<'_, AppState>`，在托盘回调里 spawn 出来的 async 任务中，`State` 借用
 //! `AppHandle` 会与「把 AppHandle 移进任务」形成自引用借用，编译器不允许。
 //! 因此托盘把命令**发给前端**（`tray://command`），由前端 store 里已有的
-//! `startRouter`/`stopRouter` 执行：窗口只是被 `hide` 而不是销毁，webview 一直活着，
-//! 于是托盘按钮与界面按钮走完全相同的代码路径、错误提示和状态刷新。
+//! `startStrataProxy`/`stopStrataProxy` 执行：窗口只是被 `hide` 而不是销毁，webview
+//! 一直活着，于是托盘按钮与界面按钮走完全相同的代码路径、错误提示和状态刷新。
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -21,7 +21,7 @@ const MENU_START: &str = "tray_start";
 const MENU_STOP: &str = "tray_stop";
 const MENU_QUIT: &str = "tray_quit";
 
-/// 托盘 → 前端的命令事件，payload 为 `start-router` / `stop-router`。
+/// 托盘 → 前端的命令事件，payload 为 `start-service` / `stop-service`。
 pub const COMMAND_EVENT: &str = "tray://command";
 
 /// 创建托盘图标（图标复用窗口图标，不额外引入图片解码 feature）。
@@ -43,11 +43,18 @@ pub fn init<R: Runtime>(app: &App<R>) -> tauri::Result<()> {
             &quit,
         ],
     )?;
-    start.set_enabled(false)?;
-    stop.set_enabled(false)?;
+    // 初值按**当前实际状态**给：前门是随程序启动的，托盘创建时它多半已经在跑，
+    // 写死「未启动」会让悬停提示与菜单可用性一开始就是错的。
+    let (service_running, service_port) = app
+        .try_state::<crate::state::AppState>()
+        .and_then(|state| crate::strata_proxy::running_port(&state))
+        .map(|port| (true, port))
+        .unwrap_or((false, crate::strata_proxy::DEFAULT_PORT));
+    start.set_enabled(!service_running)?;
+    stop.set_enabled(service_running)?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
-        .tooltip(tooltip(false, 0))
+        .tooltip(tooltip(service_running, service_port))
         .menu(&menu)
         // 左键留给「显示主窗口」，菜单只走右键
         .show_menu_on_left_click(false)
@@ -94,10 +101,10 @@ fn on_menu<R: Runtime>(app: &AppHandle<R>, id: &str) {
         MENU_START => {
             // 启动过程有日志与状态变化，把窗口叫出来让用户看到反馈
             show_main(app);
-            let _ = app.emit(COMMAND_EVENT, "start-router");
+            let _ = app.emit(COMMAND_EVENT, "start-service");
         }
         MENU_STOP => {
-            let _ = app.emit(COMMAND_EVENT, "stop-router");
+            let _ = app.emit(COMMAND_EVENT, "stop-service");
         }
         MENU_QUIT => quit(app),
         _ => {}
@@ -113,12 +120,15 @@ pub fn show_main<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-/// 托盘 tooltip：把 router 状态直接写在悬停提示里，不必打开窗口。
+/// 托盘 tooltip：把服务状态直接写在悬停提示里，不必打开窗口。
+///
+/// 「服务」= 前门（:9090）：router 退役后不再有单独的 router 进程，
+/// 对外只有这一个入口，所以这里报的是前门的监听状态。
 fn tooltip(running: bool, port: u16) -> String {
     if running {
-        format!("llama.cpp GUI — router 运行中（127.0.0.1:{port}）")
+        format!("llama.cpp GUI — 服务运行中（前门 127.0.0.1:{port}）")
     } else {
-        "llama.cpp GUI — router 未运行".to_string()
+        "llama.cpp GUI — 服务未启动".to_string()
     }
 }
 
@@ -130,19 +140,8 @@ pub fn sync_tooltip<R: Runtime>(app: &AppHandle<R>, running: bool, port: u16) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let _ = tray.set_tooltip(Some(tooltip(running, port)));
     }
-    let router_running = running || router_slot_busy(app);
     let strata_running = strata_slot_busy(app);
-    sync_menu_state(app, router_running, strata_running);
-}
-
-/// 按进程槽判断 router 是否在跑。
-///
-/// 用进程槽而不是 `running` 参数：`strata_start` 之类的路径不一定走 `sync_tooltip`，
-/// 托盘菜单的可用性只取决于「有没有进程在跑」，直接读槽最不容易和真实状态脱节。
-fn router_slot_busy<R: Runtime>(app: &AppHandle<R>) -> bool {
-    app.try_state::<AppState>()
-        .map(|state| state.router_slot.lock().unwrap_or_else(|e| e.into_inner()).is_some())
-        .unwrap_or(false)
+    sync_menu_state(app, running, strata_running);
 }
 
 /// 「Strata 在跑」：引擎槽位里有进程，**或**前门代理在监听。
@@ -156,26 +155,26 @@ fn strata_slot_busy<R: Runtime>(app: &AppHandle<R>) -> bool {
 }
 
 /// 正在跑的进程不允许再点一次「启动服务」（同理，没跑时「停止服务」是死键）。
-pub fn sync_menu_state<R: Runtime>(app: &AppHandle<R>, router_running: bool, strata_running: bool) {
+///
+/// `service_running` = 前门（统一入口 :9090）在跑。router 退役后没有第二个
+/// 「服务」进程了，前门就是那个常驻的入口。
+pub fn sync_menu_state<R: Runtime>(app: &AppHandle<R>, service_running: bool, strata_running: bool) {
     let Some(menu) = app.try_state::<TrayMenu<R>>() else {
         // 托盘没建起来（`tray::init` 失败）时这里本来就是空转，不算错误。
         return;
     };
-    // 任一进程在跑都不能再启动：router 与 Strata 抢同一批 GPU 显存。
-    if let Err(err) = menu.start.set_enabled(!(router_running || strata_running)) {
+    // 任一在跑都不能再启动：前门与 Strata 抢同一批 GPU 显存。
+    if let Err(err) = menu.start.set_enabled(!(service_running || strata_running)) {
         eprintln!("[tray] 更新「启动服务」可用性失败: {err}");
     }
-    if let Err(err) = menu.stop.set_enabled(router_running || strata_running) {
+    if let Err(err) = menu.stop.set_enabled(service_running || strata_running) {
         eprintln!("[tray] 更新「停止服务」可用性失败: {err}");
     }
 }
 
-/// 退出：先停 router（子实例会跟着退出），再走正常退出流程。
+/// 退出：先停 Strata 引擎与前门拉起的子实例（都占显存），再走正常退出流程。
 fn quit<R: Runtime>(app: &AppHandle<R>) {
     if let Some(state) = app.try_state::<AppState>() {
-        // 停 router。
-        let _ = crate::router::stop_router(&state.router_slot);
-
         // Strata 必须在这里直接停，不能只指望 `RunEvent::Exit` 兜底：
         // `AppHandle::exit` 正常会投递 `RunEvent::Exit`，但 `request_exit` 失败时
         // tauri 2.11.5 会退化成 `std::process::exit`（src/app.rs:573-580），
@@ -194,6 +193,15 @@ fn quit<R: Runtime>(app: &AppHandle<R>) {
         // 前门代理也要摘掉：它的监听线程是 GUI 进程内的，句柄不 drop 就走不到释放
         // （虽然进程退出会一起带走，但这里显式关掉，退出路径才对得上）。
         crate::strata_proxy::shutdown(&state);
+        // 前门拉起的 llama.cpp 子实例同样占显存，同样不能指望 `RunEvent::Exit` 兜底。
+        let stopped = state
+            .scheduler
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stop_all(&state.logs);
+        if !stopped.is_empty() {
+            eprintln!("[tray] 退出时已停止 llama.cpp 子实例：{}", stopped.join("、"));
+        }
     }
     app.exit(0);
 }

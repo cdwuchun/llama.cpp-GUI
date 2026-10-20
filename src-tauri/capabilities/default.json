@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "默认能力：核心 API、目录选择对话框、用系统程序打开路径",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default", "opener:default"]
+  "permissions": ["core:default", "dialog:default", "opener:default", "core:window:allow-set-theme"]
 }

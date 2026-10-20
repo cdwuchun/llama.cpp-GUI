@@ -143,23 +143,22 @@ export interface HubImportReport {
   missing: string[];
 }
 
-export interface RouterStatus {
-  running: boolean;
-  port: number;
-  pid: number | null;
-  version: string | null;
-  version_dir: string | null;
-  started_at_ms: number | null;
-  last_error: string | null;
-  ascii_fixed_from: string | null;
-}
-
 export interface LogLine {
   seq: number;
-  /** system 或 model:<端口> */
+  /** system / strata / model:<模型名>（前门化后按模型名分来源，router 时代是 model:<端口>） */
   source: string;
   ts_ms: number;
   text: string;
+}
+
+/** 日志落盘信息（`logs_info`）：面板显示路径、「打开日志目录」按钮用。 */
+export interface LogFileInfo {
+  /** 日志目录（这一轮还没落盘时为空串） */
+  dir: string;
+  /** 当前日志文件全路径（未落盘时为 null） */
+  file: string | null;
+  /** 内存里现有的行数 */
+  lines: number;
 }
 
 /**
@@ -178,7 +177,8 @@ export interface StrataModelEntry {
   engine: string | null;
   cwd: string | null;
   run_script: string | null;
-  max_context: number | null;
+  /** 上下文上限：Rust 侧是 `Option<String>`（config 里就是字符串），所以要用前先转数字 */
+  max_context: string | number | null;
   /** 原样显示，不校验（上游只认 int8/q4_0，本机在用 k8v4） */
   kv: string | null;
   kv_resident: string | null;
@@ -234,7 +234,8 @@ export interface StrataStatus {
 
 export interface AppPaths {
   config_dir: string;
-  preset_path: string;
+  /** 模型配置目录（`<配置目录>\config`，一个模型一份 JSON）；旧名 preset_path 已退役（第三刀） */
+  model_config_dir: string;
   link_root: string;
 }
 
@@ -266,12 +267,26 @@ export interface AuxFile {
   kind: "mmproj" | "draft" | string;
 }
 
+/** 配置目录里的一份 config（`llamacpp-<id>.json`）—— 原生视图，前端不再解析 ini 文本 */
+export interface ConfigEntry {
+  /** config 文件名主体；请求里 `model` 用的也是它 */
+  id: string;
+  /** 配置里的 `name`（迁移后与 id 一致） */
+  name: string;
+  /** 关掉了自带 WebUI ⇒ 卡片上的「聊天」入口要禁用 */
+  no_webui: boolean;
+  /** 配置指向的模型文件还在不在（不在就是归档/失效） */
+  has_model: boolean;
+  /** args 里 `--ctx-size` 的值（0 或没写就是 null）—— 压测页挑档位用，不必问前门 */
+  max_context?: number | null;
+}
+
 export interface ModelScanResult {
   models: ScannedModel[];
   /** 投影文件 / 外挂草稿模型：不列进模型列表，但配置里可以选 */
   aux_files?: AuxFile[];
-  preset_path: string;
-  preset_text: string;
+  /** 配置目录里的 config 清单（「已配置」与 WebUI 开关的判据） */
+  configs?: ConfigEntry[];
   /** preset 中存在但当前扫描不到的段 */
   orphan_sections: string[];
   /** 本次顺手清理掉的失效段（这些段的模型文件已经不在了） */
@@ -280,6 +295,117 @@ export interface ModelScanResult {
   restored_sections?: string[];
   /** 所有段都失效、疑似模型盘未就绪，本次跳过了清理 */
   prune_skipped?: boolean;
+}
+
+/** 联网搜索的一条结果（后端 `search_query` 的返回项） */
+export interface SearchHit {
+  title: string;
+  url: string;
+  snippet: string;
+}
+
+/** 一次搜索的结果（`src-tauri/src/search.rs` 的 `SearchResponse`） */
+export interface SearchResponse {
+  /** 最后真正给出结果的引擎 */
+  engine: string;
+  hits: SearchHit[];
+  /** 逐个引擎的尝试记录：失败的会带上分类与原因 */
+  attempts: { engine: string; error: string | null }[];
+  cached: boolean;
+  timeRange: string | null;
+  /** 已包好不可信边界的整段文本，直接拼进提示词 */
+  block: string;
+}
+
+/** 一个搜索引擎的状态 */
+export interface SearchEngineView {
+  name: string;
+  /** 不配 key 也能用 */
+  keyless: boolean;
+  hasKey: boolean;
+  /** 刚失败过，正在冷却 */
+  cooling: boolean;
+}
+
+/** 联网搜索的配置视图（不含任何 key 明文） */
+export interface SearchConfigView {
+  order: string[];
+  blockedDomains: string[];
+  timeRange: string | null;
+  maxResults: number;
+  engines: SearchEngineView[];
+}
+
+/** 保存联网搜索配置的入参；`keys` 里空串表示删除该 key */
+export interface SearchConfigInput {
+  order: string[];
+  keys: Record<string, string>;
+  blockedDomains: string[];
+  timeRange: string | null;
+  maxResults: number;
+}
+
+/** 设置页「测试」按钮的结果 */
+export interface SearchTestResult {
+  engine: string;
+  ok: boolean;
+  count: number;
+  ms: number;
+  message: string | null;
+}
+
+/** 抓一个网页的结果（后端 `web_fetch` 命令 = `search.rs::FetchPage`） */
+export interface FetchPage {
+  /** 模型给的原始地址 */
+  url: string;
+  /** 跟随重定向后的地址 */
+  finalUrl: string;
+  status: number;
+  title: string;
+  contentType: string;
+  /** 清洗后的正文字符数 */
+  chars: number;
+  truncated: boolean;
+  /** 已包好不可信边界的整段文本，直接当工具结果回填 */
+  block: string;
+  /** 抓取时的提示（如页面不是 UTF-8） */
+  note: string | null;
+}
+
+/** 一台 MCP 服务器（落在 `<配置目录>\mcp.json`，形状同 Cursor 的 `mcpServers`） */
+export interface McpServerConfig {
+  name: string;
+  /** 启动命令；Windows 上 `npx` 这类脚本要写 `npx.cmd` 或完整路径 */
+  command: string;
+  args: string[];
+  /** 追加/覆盖的环境变量（父进程环境默认继承） */
+  env: Record<string, string>;
+  enabled: boolean;
+}
+
+/** 一个 MCP 工具。`key` 是发给模型的名字（`mcp__<服务器>__<工具>`） */
+export interface McpToolView {
+  key: string;
+  /** 服务器名（原始写法，调用时回传给后端） */
+  server: string;
+  /** 服务器里的工具名（原始写法） */
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
+/** 一台服务器拉取工具的结果 */
+export interface McpServerView {
+  name: string;
+  ok: boolean;
+  count: number;
+  error: string | null;
+}
+
+/** 全部启用的 MCP 服务器的工具汇总 */
+export interface McpToolsView {
+  tools: McpToolView[];
+  servers: McpServerView[];
 }
 
 /** router `GET /models` 的状态对象 */
@@ -306,6 +432,12 @@ export interface RouterModel {
   source?: string;
   can_remove?: boolean;
   aliases?: string[];
+  /** 通道来源（前门合成的列表里才有：`strata` / `llamacpp`） */
+  channel?: string;
+  /** 已加载时子实例监听的端口（前门直接给出，不用再从 `status.args` 里解析） */
+  port?: number | null;
+  /** 调度器细粒度状态（idle/starting/ready/stopping/failed），仅 llama.cpp 通道有 */
+  state?: string;
 }
 
 export interface RouterModelsResponse {
@@ -352,6 +484,10 @@ export interface ModelView {
   favourite: boolean;
   inPreset: boolean;
   scanned: ScannedModel | null;
+  /** 通道来源：`llamacpp`（本地子实例）或 `strata`（Strata 引擎）。卡片用它显示引擎标识（用户 m02048 第 4 点）。 */
+  channel?: string;
+  /** strata 通道专用：配置文件全名（如 `strata-swift-iq3_xxs.json`）。strata 的启停走 Strata 接口，用的是它而不是 `section`。 */
+  strataFile?: string;
 }
 
 /** 性能测试：一次 API 压测的记录（来自 bench_server） */
@@ -401,4 +537,67 @@ export interface Hardware {
     n_ctx?: number;
     params?: Record<string, unknown>;
   };
+}
+
+// ---------------------------------------------------------------- 监控采集层
+
+/** 单张显卡的瞬时读数（`nvidia-smi` 口径，显存单位 MiB）。 */
+export interface MonitorGpuSample {
+  name: string;
+  utilization: number | null;
+  memUsedMib: number | null;
+  memTotalMib: number | null;
+  temperature: number | null;
+  powerW: number | null;
+  powerLimitW: number | null;
+  /** PCIe 下行/上行吞吐（MB/s），来自 NVML 的 `nvmlDeviceGetPcieThroughput`。 */
+  pcieRxMb: number | null;
+  pcieTxMb: number | null;
+  /** 当前 PCIe 链路代数与宽度（Gen4 x8 → 4 / 8）。 */
+  pcieLinkGen: number | null;
+  pcieLinkWidth: number | null;
+}
+
+/** 当前这一刻：`gpu` 是多卡聚合（显存/功耗求和、利用率平均、温度取最大），`gpus` 是明细。 */
+export interface MonitorNow {
+  cpuPercent: number | null;
+  memUsed: number | null;
+  memTotal: number | null;
+  gpu: MonitorGpuSample | null;
+  gpus: MonitorGpuSample[];
+  /** 磁盘读/写吞吐（MB/s），PDH 的 `PhysicalDisk(_Total)`。 */
+  diskReadMb: number | null;
+  diskWriteMb: number | null;
+  /** 采样时刻（Unix 毫秒）。 */
+  at: number;
+}
+
+/** 不随时间变的部分。 */
+export interface MonitorStaticInfo {
+  gpuName: string | null;
+  gpuCount: number;
+  memTotal: number | null;
+  hasGpu: boolean;
+  /** 物理核心数 / 逻辑处理器数（照上游 hardware_static.cores / threads）。 */
+  cores: number | null;
+  threads: number | null;
+}
+
+/** 最近 60 个采样点（1 秒一个）：`at` 与每个序列等长。 */
+export interface MonitorHistory {
+  at: number[];
+  series: Record<string, (number | null)[]>;
+}
+
+export interface MonitorSnapshot {
+  now: MonitorNow;
+  static: MonitorStaticInfo;
+  history: MonitorHistory;
+}
+
+/** `/metrics` 与 `/slots` 的原始 JSON（结构随引擎版本变化，前端按需取）。 */
+export interface MonitorEngine {
+  metrics: unknown;
+  slots: unknown;
+  error: string | null;
 }

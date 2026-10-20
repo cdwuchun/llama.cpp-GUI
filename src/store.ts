@@ -1,4 +1,4 @@
-/** 全局状态（Zustand）：设置、版本、设备、router 状态、模型列表与日志。 */
+/** 全局状态（Zustand）：设置、版本、设备、前门代理状态、模型列表与日志。 */
 
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { create } from "zustand";
@@ -7,23 +7,77 @@ import {
   fetchModels,
   fetchProps,
   loadModel as apiLoadModel,
-  portFromArgs,
   setRouterApiKey,
-  subscribeModelEvents,
   unloadModel as apiUnloadModel,
 } from "./api/router";
-import { errText, ipc, onLogLines, onModelsScanned, onRouterStatus, onStrataStatus } from "./ipc";
-import { presetSections } from "./utils/models";
-import { chatTargets } from "./api/router";
+import { errText, ipc, monitorSample, monitorSampleNow, onLogLines, onModelsScanned, onStrataStatus } from "./ipc";
+import type { MonitorSnapshot } from "./types";
+import { RECENT_TURN_LIMIT, type LastTurn, type RecentTurn } from "./utils/telemetry";
+import { reportFrontendError } from "./utils/frontendLog";
+import {
+  adjustRecordLines,
+  contextBenchmarkMessages,
+  DEFAULT_CONTEXT_BENCHMARK_OPTIONS,
+  estimateRecordLines,
+  ESTIMATED_RECORD_TOKENS,
+  getContextBenchmarkTiers,
+  measureTokensPerLine,
+  needsAdjustment,
+  planContextBenchmarkTiers,
+  validateContextBenchmarkOptions,
+  type ContextBenchmarkOptions,
+  type ContextBenchmarkReport,
+  type ContextBenchmarkSample,
+  type ContextBenchmarkSkippedTier,
+} from "./utils/contextBenchmark";
+import { fetchChatModelProps, streamChat, streamChatTurn, type ChatMessage, type ChatStreamResult } from "./api/chat";
+import {
+  advanceChatExecution,
+  buildChatRequest,
+  conversationTitle,
+  finishChatExecution,
+  newChatExecution,
+  newId,
+  normalizeChatOptions,
+  type ChatAttachment,
+  type ChatDelta,
+  type ChatOptions,
+  type ChatTurn,
+  type Conversation,
+  type ToolCall,
+} from "./utils/chat";
+import { buildToolSpecs, isMcpTool, mergeToolCallFragments, parseToolArguments } from "./utils/tools";
+import {
+  DEFAULT_SCENARIO_BENCH_OPTIONS,
+  estimateScenarioRequests,
+  plannedPerScenario,
+  scenarioMessages,
+  validateScenarioBenchOptions,
+  type ScenarioBenchOptions,
+  type ScenarioBenchReport,
+  type ScenarioSample,
+} from "./utils/scenarioBench";
+import {
+  LADDER_STAGE_MS,
+  ladderConclusion,
+  ladderLevels,
+  ladderRowsFromSamples,
+  type LadderConclusion,
+  type LadderRow,
+  type LadderSample,
+} from "./utils/concurrencyLadder";
 import type {
   AppPaths,
   AuxFile,
+  ConfigEntry,
   DeviceInfo,
   LlamaCppVersion,
   LogLine,
+  McpServerConfig,
+  McpToolsView,
+  McpToolView,
   ModelProps,
   RouterModel,
-  RouterStatus,
   ScannedModel,
   Settings,
   SettingsPatch,
@@ -56,6 +110,356 @@ function initialTheme(): Theme {
   return localStorage.getItem("llamacpp-gui-theme") === "dark" ? "dark" : "light";
 }
 
+/**
+ * 压测历史存在 localStorage 里（用户 m11934：重启 GUI 后上一轮的结果还能带出来）。
+ *
+ * 存之前把每条样本的输出文本清空：表格与图表都不用它，留着白占几 MB 配额。
+ * 每个模型各留 {@link BENCH_HISTORY_PER_MODEL} 份（用户 m13867：全局共用 20 条时，
+ * 跑得多的模型会把别的模型的记录挤掉）。
+ */
+const BENCH_HISTORY_KEY = "llamacpp-gui-bench-history";
+
+/** 每个模型各留几份（用户 m13867：全局 20 条会让多模型互相挤占） */
+const BENCH_HISTORY_PER_MODEL = 5;
+
+function trimBenchReport(report: ContextBenchmarkReport): ContextBenchmarkReport {
+  return { ...report, samples: report.samples.map((s) => ({ ...s, output: "" })) };
+}
+
+/**
+ * 按模型分组裁剪：每个模型只留最近的几份，合并后仍按开始时间新→旧。
+ *
+ * 不按模型分组的话，一个跑得多的模型会把别的模型的记录全挤掉（用户 m13867）。
+ */
+function pruneBenchHistory(history: ContextBenchmarkReport[]): ContextBenchmarkReport[] {
+  const byModel = new Map<string, ContextBenchmarkReport[]>();
+  for (const report of [...history].sort((a, b) => b.startedAt - a.startedAt)) {
+    const kept = byModel.get(report.model) ?? [];
+    if (kept.length >= BENCH_HISTORY_PER_MODEL) continue;
+    kept.push(report);
+    byModel.set(report.model, kept);
+  }
+  return Array.from(byModel.values())
+    .flat()
+    .sort((a, b) => b.startedAt - a.startedAt);
+}
+
+/** 压测样本时间窗内的硬件峰值（监控采集层的 1 秒环形缓冲，按 `at` 切片）。 */
+async function sampleRange(from: number, to: number): Promise<{
+  peakGpuMemory: number | null;
+  peakRam: number | null;
+  minGpuMemoryFree: number | null;
+  count: number;
+}> {
+  const empty = { peakGpuMemory: null, peakRam: null, minGpuMemoryFree: null, count: 0 };
+  try {
+    const snapshot = await monitorSample();
+    const times = snapshot.history.at;
+    if (times.length === 0) return empty;
+    const keep: number[] = [];
+    for (let index = 0; index < times.length; index += 1) {
+      const at = times[index];
+      if (at >= from && at <= to) keep.push(index);
+    }
+    if (keep.length === 0) return empty;
+    const maxOf = (name: string): number | null => {
+      const list = snapshot.history.series[name] ?? [];
+      let max: number | null = null;
+      for (const index of keep) {
+        const value = list[index];
+        if (typeof value === "number" && (max === null || value > max)) max = value;
+      }
+      return max;
+    };
+    const gpuUsedMib = maxOf("gpuMemUsed");
+    const ramUsed = maxOf("memUsed");
+    const totalMib = snapshot.now.gpu?.memTotalMib ?? null;
+    return {
+      peakGpuMemory: gpuUsedMib === null ? null : Math.round(gpuUsedMib * 1024 * 1024),
+      peakRam: ramUsed === null ? null : Math.round(ramUsed),
+      minGpuMemoryFree:
+        gpuUsedMib === null || totalMib === null
+          ? null
+          : Math.round((totalMib - gpuUsedMib) * 1024 * 1024),
+      count: keep.length,
+    };
+  } catch {
+    return empty;
+  }
+}
+function loadBenchHistory(): ContextBenchmarkReport[] {
+  try {
+    const raw = localStorage.getItem(BENCH_HISTORY_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? pruneBenchHistory(parsed as ContextBenchmarkReport[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** 写进去并把留下的那份返回，调用处可以直接当 state 用 */
+function saveBenchHistory(history: ContextBenchmarkReport[]): ContextBenchmarkReport[] {
+  const kept = pruneBenchHistory(history);
+  try {
+    localStorage.setItem(BENCH_HISTORY_KEY, JSON.stringify(kept.map(trimBenchReport)));
+  } catch {
+    // 配额满 / 隐私模式下写不进去：历史只是便利功能，不打扰用户
+  }
+  return kept;
+}
+
+/* -------------------------------------------------------------------------
+ * 场景测试的历史：和上下文档位那套同一个思路，但存单独的 key
+ * （两边的样本结构不同，混在一起没法反序列化）
+ * ---------------------------------------------------------------------- */
+
+const SCENARIO_HISTORY_KEY = "llamacpp-gui-scenario-bench-history";
+
+/** 每个模型各留几份，理由同 BENCH_HISTORY_PER_MODEL */
+const SCENARIO_HISTORY_PER_MODEL = 5;
+
+/** 落盘前把模型输出清掉：表格不用它，几十条上千字的输出会撑爆配额 */
+function trimScenarioReport(report: ScenarioBenchReport): ScenarioBenchReport {
+  return { ...report, samples: report.samples.map((s) => ({ ...s, output: "" })) };
+}
+
+function pruneScenarioHistory(history: ScenarioBenchReport[]): ScenarioBenchReport[] {
+  const byModel = new Map<string, ScenarioBenchReport[]>();
+  for (const report of [...history].sort((a, b) => b.startedAt - a.startedAt)) {
+    const kept = byModel.get(report.model) ?? [];
+    if (kept.length >= SCENARIO_HISTORY_PER_MODEL) continue;
+    kept.push(report);
+    byModel.set(report.model, kept);
+  }
+  return Array.from(byModel.values())
+    .flat()
+    .sort((a, b) => b.startedAt - a.startedAt);
+}
+
+function loadScenarioHistory(): ScenarioBenchReport[] {
+  try {
+    const raw = localStorage.getItem(SCENARIO_HISTORY_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? pruneScenarioHistory(parsed as ScenarioBenchReport[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveScenarioHistory(history: ScenarioBenchReport[]): ScenarioBenchReport[] {
+  const kept = pruneScenarioHistory(history);
+  try {
+    localStorage.setItem(SCENARIO_HISTORY_KEY, JSON.stringify(kept.map(trimScenarioReport)));
+  } catch {
+    // 配额满 / 隐私模式：历史只是便利功能，不打扰用户
+  }
+  return kept;
+}
+
+/* ----------------------------------------------------------------------
+ * 并发阶梯的历史：上游 `concurrencyLadderV1` 保留最近 5 份（全局，不分模型）
+ * ---------------------------------------------------------------------- */
+
+const LADDER_HISTORY_KEY = "llamacpp-gui-concurrency-ladder";
+
+/** 上游 `KEEP = 5` */
+const LADDER_HISTORY_KEEP = 5;
+
+/** 落盘前清掉逐条样本：图表和结论只用 rows，几百条样本会撑爆配额 */
+function trimLadderRun(run: LadderRun): LadderRun {
+  return { ...run, samples: [] };
+}
+
+function loadLadderHistory(): LadderRun[] {
+  try {
+    const raw = localStorage.getItem(LADDER_HISTORY_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as LadderRun[]).slice(0, LADDER_HISTORY_KEEP) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveLadderHistory(history: LadderRun[]): LadderRun[] {
+  const kept = history.slice(0, LADDER_HISTORY_KEEP);
+  try {
+    localStorage.setItem(LADDER_HISTORY_KEY, JSON.stringify(kept.map(trimLadderRun)));
+  } catch {
+    // 配额满 / 隐私模式：历史只是便利功能，不打扰用户
+  }
+  return kept;
+}
+
+/* ----------------------------------------------------------------------
+ * 原生聊天页：会话落盘 + 采样选项落盘
+ *
+ * 上游用 SQLite（`kv` / `attachments` / `attachment_refs` 三张表），本工程没有数据库，
+ * 只能用 localStorage。附件内容（尤其图片的 base64）动辄几百 KB，直接存会撑爆 5 MB 配额，
+ * 所以**写盘前把每条附件的 `content` 清空**，只留名字与类型：重新打开历史会话时图片
+ * 位置留空（消息文本照常显示），不影响继续对话。
+ * ---------------------------------------------------------------------- */
+
+const CHAT_CONVERSATIONS_KEY = "llamacpp-gui-chat-conversations";
+const CHAT_OPTIONS_KEY = "llamacpp-gui-chat-options";
+
+/** 会话条数上限与单会话消息上限：聊天记录是便利功能，不能让 localStorage 无限涨 */
+const CHAT_CONVERSATION_LIMIT = 30;
+const CHAT_MESSAGE_LIMIT = 200;
+/** 工具结果落盘时保留的字符数：模型已经拿到全文，历史里留一份完整副本只会把 5 MB 配额吃光 */
+const TOOL_RESULT_KEEP = 2_000;
+
+function trimConversation(item: Conversation): Conversation {
+  const messages = item.messages.slice(-CHAT_MESSAGE_LIMIT).map((message) => ({
+    ...message,
+    // 附件正文（图片 base64 / 文本原文）不落盘
+    attachments: message.attachments?.map((file) => ({ ...file, content: "" })),
+    // 工具结果（读网页动辄上万字符）落盘只留开头：写满配额会让设置、主题一起存不进去
+    tools: message.tools?.map((tool) =>
+      typeof tool.result === "string" && tool.result.length > TOOL_RESULT_KEEP
+        ? {
+            ...tool,
+            result: `${tool.result.slice(0, TOOL_RESULT_KEEP)}\n…（历史记录只保留前 ${TOOL_RESULT_KEEP} 字符，完整内容当时已交给模型）`,
+          }
+        : tool,
+    ),
+  }));
+  return { ...item, messages };
+}
+
+function loadConversations(): Conversation[] {
+  try {
+    const raw = localStorage.getItem(CHAT_CONVERSATIONS_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as Conversation[]).slice(0, CHAT_CONVERSATION_LIMIT) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveConversations(conversations: Conversation[]): Conversation[] {
+  const kept = [...conversations]
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .slice(0, CHAT_CONVERSATION_LIMIT)
+    .map(trimConversation);
+  try {
+    localStorage.setItem(CHAT_CONVERSATIONS_KEY, JSON.stringify(kept));
+  } catch {
+    // 配额满 / 隐私模式：不打扰用户
+  }
+  return kept;
+}
+
+function loadChatOptions(): ChatOptions {
+  try {
+    const raw = localStorage.getItem(CHAT_OPTIONS_KEY);
+    return normalizeChatOptions(raw ? (JSON.parse(raw) as unknown) : null);
+  } catch {
+    return normalizeChatOptions(null);
+  }
+}
+
+function saveChatOptions(options: ChatOptions): void {
+  try {
+    localStorage.setItem(CHAT_OPTIONS_KEY, JSON.stringify(options));
+  } catch {
+    // 同上
+  }
+}
+
+/** 聊天页的界面状态 */
+export interface ChatState {
+  conversations: Conversation[];
+  /** 当前会话 id；null = 还没选（聊天页显示空态） */
+  activeId: string | null;
+  draft: string;
+  attachments: ChatAttachment[];
+  streaming: boolean;
+  options: ChatOptions;
+  error: string | null;
+}
+
+/** 上下文档位压测的界面状态（放 store：切页面不丢，见 HANDOVER §8 第 1 项） */
+export interface ContextBenchState {
+  running: boolean;
+  /** 正在跑的档位（进度显示用） */
+  currentTier: number | null;
+  /** 已完成 / 失败 / 被停止的请求数，总数是 total */
+  completed: number;
+  failed: number;
+  cancelled: number;
+  total: number;
+  /** 本次开跑的时刻（epoch 毫秒），进度里的用时按它算 */
+  startedAt: number | null;
+  /** 逐条结果，随跑随追加（不必等全部结束才看得到） */
+  samples: ContextBenchmarkSample[];
+  /** 跑过的报告，最新的在最前（上游最多留 20 份） */
+  history: ContextBenchmarkReport[];
+  /** 结果面板正在看哪一份报告（null = 看最新跑完的那份） */
+  selectedId: string | null;
+  error: string | null;
+}
+
+
+/** 场景测试的界面状态（与 contextBench 同一套思路：切页面不丢） */
+export interface ScenarioBenchState {
+  running: boolean;
+  /** 正在跑的「场景 / 第几轮」，进度显示用 */
+  current: { scenario: string; round: number; total: number } | null;
+  completed: number;
+  failed: number;
+  cancelled: number;
+  total: number;
+  /** 本次开跑的时刻（epoch 毫秒） */
+  startedAt: number | null;
+  /** 逐条结果，随跑随追加 */
+  samples: ScenarioSample[];
+  /** 跑过的报告，最新的在最前 */
+  history: ScenarioBenchReport[];
+  /** 结果面板正在看哪一份（null = 最新） */
+  selectedId: string | null;
+  error: string | null;
+}
+
+
+/** 并发阶梯的一次完整结果 */
+export interface LadderRun {
+  id: string;
+  model: string;
+  /** 跑的时候读到的槽数（拿不到就是 null，按 4 级压） */
+  slots: number | null;
+  /** 走过的级别：1、2、4 … */
+  levels: number[];
+  rows: LadderRow[];
+  /** 逐条样本（落盘前清掉，只留内存）；用来在图上标出待跑的级别 */
+  samples: LadderSample[];
+  conclusion: LadderConclusion;
+  startedAt: number;
+  finishedAt: number;
+  elapsedMs: number;
+}
+
+/** 并发阶梯的界面状态（与另两个压测同一套思路：切页面不丢） */
+export interface LadderState {
+  running: boolean;
+  /** 压到第几级（从 1 起）与这一级同时挂几个请求 */
+  stage: number;
+  concurrency: number;
+  levels: number[];
+  slots: number | null;
+  completed: number;
+  failed: number;
+  startedAt: number | null;
+  /** 本次的逐条样本，随跑随追加 */
+  samples: LadderSample[];
+  history: LadderRun[];
+  selectedId: string | null;
+  error: string | null;
+}
+
 interface AppStore {
   initialized: boolean;
   error: string | null;
@@ -68,7 +472,6 @@ interface AppStore {
   devices: DeviceInfo[];
   cudaReady: boolean;
   deviceError: string | null;
-  status: RouterStatus;
   logs: LogLine[];
   logFilter: string;
 
@@ -76,14 +479,12 @@ interface AppStore {
   scanned: ScannedModel[];
   /** 扫描到的辅助文件：多模态投影（mmproj）/ 外挂草稿模型（draft），不列进模型列表 */
   auxFiles: AuxFile[];
-  presetText: string;
-  presetPath: string;
-  orphanSections: string[];
-  /** router 返回的模型状态 */
+  /** 配置目录里的 config 清单（原生视图：「已配置」与 WebUI 开关的判据） */
+  configs: ConfigEntry[];
+  /** 前门合成的模型状态（llama.cpp 与 Strata 两通道） */
   routerModels: RouterModel[];
   /** 已拉取过的模型详情缓存 */
   modelProps: Record<string, ModelProps>;
-  sseClose: (() => void) | null;
 
   /** Strata 运行状态（第二运行时通道） */
   strataStatus: StrataStatus;
@@ -91,6 +492,16 @@ interface AppStore {
   strataEntries: StrataModelEntry[];
   /** 正在启动中的 config 文件名（卡片显示「加载中」用；启动结束即清空） */
   strataStarting: string | null;
+  /** 正在卸载中的 config 文件名（卡片显示「卸载中」用；卸载结束即清空，用户 m04854） */
+  strataStopping: string | null;
+  /**
+   * 正在启停的 llama.cpp 模型（卡片立刻给反馈用，用户 m03482 第 3 点）。
+   *
+   * 前门那侧的 `/models/load` 要等子实例 `/health` 就绪（几十秒）才返回，
+   * 光靠轮询的话点下去这一两秒里卡片毫无变化，比 Strata 那边（有 `strataStarting`）
+   * 显得迟钝。这里在发请求前先记下 id，卡片据此马上显示「加载中」。
+   */
+  modelPending: { id: string; stop: boolean } | null;
 
   init: () => Promise<void>;
   /** 允许重新走一遍 init（初始化失败后重试用；订阅不会因此重复注册） */
@@ -105,9 +516,6 @@ interface AppStore {
   refreshVersions: (probe?: boolean) => Promise<void>;
   refreshDevices: () => Promise<void>;
   saveSettings: (patch: SettingsPatch) => Promise<boolean>;
-  startRouter: () => Promise<void>;
-  stopRouter: () => Promise<void>;
-  restartRouter: () => Promise<void>;
   clearLogs: () => Promise<void>;
   fixAscii: (path: string) => Promise<string | null>;
 
@@ -117,8 +525,6 @@ interface AppStore {
   /** 打开某个模型的 llama.cpp 自带聊天界面；多个在跑时不传 id 会返回 false 让界面去问用户 */
   openModelChat: (id?: string) => Promise<boolean>;
   refreshRouterModels: (reload?: boolean) => Promise<void>;
-  startRouterWatch: (port: number) => void;
-  stopRouterWatch: () => void;
 
   /** 重扫 Strata 根目录下的 config 列表 */
   refreshStrata: () => Promise<void>;
@@ -131,10 +537,8 @@ interface AppStore {
   startStrataModel: (configFile?: string | null) => Promise<void>;
   /** 卡片「停止模型」：POST /unload 卸模型，引擎进程留着 */
   stopStrataModel: (configFile: string) => Promise<void>;
-  /** 确保 config 顶层 lazy_load=true（胶囊只启引擎时用） */
-  ensureStrataLazy: (configFile: string) => Promise<boolean>;
   stopStrata: () => Promise<void>;
-  /** 显存互斥：卸掉 router 里占显存的模型，返回被卸的模型名（启动 Strata 前调用） */
+  /** 显存互斥（用户 m03160 第 2 点）：卸掉 llama.cpp 侧（前门）已加载的模型，返回被卸的模型名 */
   unloadRouterLoaded: () => Promise<string[]>;
   /** 拉一次运行时状态（生效上下文 / 加载状态 / token 占用） */
   probeStrata: () => Promise<void>;
@@ -152,20 +556,79 @@ interface AppStore {
   // （保存失败还接着删旧段/启动模型，就会把用户原来的配置也弄丢）
   saveModelSection: (section: string, entries: [string, string][]) => Promise<boolean>;
   removeModelSection: (section: string) => Promise<void>;
-  writePreset: (content: string) => Promise<void>;
   loadModelProps: (id: string) => Promise<ModelProps | null>;
+  /** 上下文档位压测（移植上下文基准）：跑哪个模型、结果如何都记在这里 */
+  contextBench: ContextBenchState;
+  runContextBench: (
+    model: string,
+    options?: Partial<ContextBenchmarkOptions>,
+    knownMaxContext?: number | null,
+  ) => Promise<void>;
+  cancelContextBench: () => void;
+  /** 删掉指定的那份记录（不传 id 就只清当前显示），剩下最近的会自动接手 */
+  clearContextBench: (id?: string) => void;
+  /** 结果面板切换要看的报告（null = 回到最新那一份） */
+  selectContextBench: (id: string | null) => void;
+  /** 场景测试（照上游 suite 模式）：一次跑多个场景 */
+  scenarioBench: ScenarioBenchState;
+  runScenarioBench: (
+    model: string,
+    options?: Partial<ScenarioBenchOptions>,
+  ) => Promise<void>;
+  cancelScenarioBench: () => void;
+  /** 删掉指定记录（不传 id 只清当前显示），剩下最近的自动接手 */
+  clearScenarioBench: (id?: string) => void;
+  /** 结果面板切换要看的报告（null = 回到最新那一份） */
+  selectScenarioBench: (id: string | null) => void;
+  /** 并发阶梯（照上游 stress 的 ramp 模式）：1 → 2 → 4 逐级加压 */
+  ladder: LadderState;
+  runLadder: (model: string, slots?: number | null) => Promise<void>;
+  cancelLadder: () => void;
+  /** 删掉指定记录（不传 id 只清当前显示），剩下最近的自动接手 */
+  clearLadder: (id?: string) => void;
+  /** 切换要看的记录（null = 回到最新那一份） */
+  selectLadder: (id: string | null) => void;
+  /** 原生聊天页（照上游 ChatPage 搬）：会话列表、草稿、采样选项、流式状态 */
+  chat: ChatState;
+  /** 发一轮对话：把草稿变成用户消息 + 流式生成助手消息 */
+  sendChat: () => Promise<void>;
+  /** 停掉正在生成的那一轮（保留已生成的内容） */
+  stopChat: () => void;
+  /** 新建空会话并切过去 */
+  newConversation: () => void;
+  selectConversation: (id: string) => void;
+  renameConversation: (id: string, title: string) => void;
+  deleteConversation: (id: string) => void;
+  setChatDraft: (value: string) => void;
+  addChatAttachments: (files: File[]) => Promise<void>;
+  removeChatAttachment: (id: string) => void;
+  setChatOptions: (patch: Partial<ChatOptions>) => void;
+  /** 清掉聊天页的错误条 */
+  dismissChatError: () => void;
+  /** 监控采集层的最新快照（底部状态栏 / 弹层用） */
+  monitor: MonitorSnapshot | null;
+  /** 快照时刻（Unix 毫秒） */
+  monitorAt: number;
+  /** 速度折线的前端兜底序列（Llama 引擎不带 history，只能自己累积；Strata 走 /metrics.history）。 */
+  speedSeries: { tokS: (number | null)[]; prefillTokS: (number | null)[] };
+  /** 最近一次完成的请求（速度与上下文占用） */
+  lastTurn: LastTurn | null;
+  /** 最近若干次请求（监控页「最近请求」表，上游 req-card 的 9 列）。 */
+  recentTurns: RecentTurn[];
+  refreshMonitor: () => Promise<void>;
+  /** MCP 服务器清单（聊天设置里编辑，后端落在 `mcp.json`） */
+  mcpServers: McpServerConfig[];
+  /** 已拉到的 MCP 工具；聊天设置里打开「MCP 工具」时才走 `mcp_tools_list` */
+  mcpTools: McpToolView[];
+  /** 拉取工具时的问题（逐台服务器的失败原因拼成一段） */
+  mcpError: string | null;
+  /** 重新读服务器清单（打开设置面板时） */
+  refreshMcpServers: () => Promise<McpServerConfig[]>;
+  /** 保存清单；后端会停掉已启动的进程，所以保存后要重新 `refreshMcpTools` */
+  saveMcpServers: (next: McpServerConfig[]) => Promise<void>;
+  /** 启动启用的服务器并拉工具，返回逐台状态（设置面板的「重新检测」用） */
+  refreshMcpTools: () => Promise<McpToolsView | null>;
 }
-
-const emptyStatus: RouterStatus = {
-  running: false,
-  port: 8080,
-  pid: null,
-  version: null,
-  version_dir: null,
-  started_at_ms: null,
-  last_error: null,
-  ascii_fixed_from: null,
-};
 
 const emptyStrataStatus: StrataStatus = {
   running: false,
@@ -190,6 +653,41 @@ const emptyStrataStatus: StrataStatus = {
 
 /** 运行时状态轮询句柄（Strata 没有 SSE，用定时探测代替） */
 let strataTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * 上一次 Strata 探测还在路上的标志。
+ *
+ * 一次探测最长要走两个超时（首探 3 秒 + 复探 3 秒），比 5 秒轮询周期还长，
+ * 放任并发就会出现「旧的慢探测晚返回、把更新的好结果覆盖成已停止」——
+ * 卡片于是「运行中 → 已停止 → 运行中」闪一下（用户 m13709）。所以撞上就跳过这一轮。
+ */
+let strataProbing = false;
+
+/**
+ * 模型列表轮询句柄。
+ *
+ * router 时代这个 5 秒轮询挂在「router 状态变成 running」上（`startRouterWatch`）；前门化
+ * 之后前门随程序常开，没有那个状态变化可挂，于是改成 init 里无条件起一个（幂等，只起一次）——
+ * 否则别人（DSH 等客户端）通过前门加载模型时，GUI 卡片的状态不会跟着变。
+ */
+let modelsTimer: ReturnType<typeof setInterval> | null = null;
+/** 已经弹过「加载成功」的模型 id：同一次加载只提示一次（用户 m05033 第 1 点） */
+const notifiedLoaded = new Set<string>();
+/**
+ * 「读前门列表」的请求序号。
+ *
+ * 1.5 秒的加载轮询、5 秒的常驻轮询、加载/卸载后的即时刷新是并发的，先发的请求可能后返回。
+ * 只让最新一次的结果落到 store —— 否则一份「加载中」的旧快照会把已经拿到的「运行中」盖回去，
+ * 卡片就停在「加载中」，要等下一次轮询才纠正（用户 m05562）。
+ */
+let modelsSeq = 0;
+/**
+ * 「读前门列表」是否已经记过一次失败日志。
+ *
+ * 前门不回包时这个循环每 5 秒（不成功还带 5 次重试）就跑一遍，每次都往日志里写会刷屏。
+ * 只在「开始失败」和「恢复正常」两个瞬间各记一行，事后翻日志能看出故障区间（用户 m05885）。
+ */
+let modelsFailLogged = false;
 
 /** config 路径 → 文件名（store 里比对「运行的是哪个 config」用） */
 function strataBaseName(path: string): string {
@@ -261,7 +759,6 @@ async function registerListeners(
 interface EssentialSnapshot {
   settings: Settings;
   paths: AppPaths;
-  status: RouterStatus;
 }
 
 /** 关键快照的重试次数与间隔（启动瞬间 IPC 还没就绪是最常见的瞬时失败原因） */
@@ -280,12 +777,8 @@ async function loadEssentialSnapshot(): Promise<EssentialSnapshot> {
   let lastErr: unknown = null;
   for (let attempt = 1; attempt <= INIT_SNAPSHOT_ATTEMPTS; attempt += 1) {
     try {
-      const [settings, paths, status] = await Promise.all([
-        ipc.settingsGet(),
-        ipc.appPaths(),
-        ipc.routerStatus(),
-      ]);
-      return { settings, paths, status };
+      const [settings, paths] = await Promise.all([ipc.settingsGet(), ipc.appPaths()]);
+      return { settings, paths };
     } catch (err) {
       lastErr = err;
       if (attempt < INIT_SNAPSHOT_ATTEMPTS) {
@@ -308,21 +801,76 @@ export const useApp = create<AppStore>((set, get) => ({
   devices: [],
   cudaReady: false,
   deviceError: null,
-  status: emptyStatus,
   logs: [],
   logFilter: "all",
 
   scanned: [],
   auxFiles: [],
-  presetText: "",
-  presetPath: "",
-  orphanSections: [],
+  configs: [],
   routerModels: [],
   modelProps: {},
-  sseClose: null,
   strataStatus: emptyStrataStatus,
   strataEntries: [],
   strataStarting: null,
+  strataStopping: null,
+  modelPending: null,
+  contextBench: {
+    running: false,
+    currentTier: null,
+    completed: 0,
+    failed: 0,
+    cancelled: 0,
+    total: 0,
+    startedAt: null,
+        samples: [],
+        history: loadBenchHistory(),
+        selectedId: null,
+    error: null,
+  },
+  scenarioBench: {
+    running: false,
+    current: null,
+    completed: 0,
+    failed: 0,
+    cancelled: 0,
+    total: 0,
+    startedAt: null,
+    samples: [],
+    history: loadScenarioHistory(),
+    selectedId: null,
+    error: null,
+  },
+  ladder: {
+    running: false,
+    stage: 0,
+    concurrency: 0,
+    levels: ladderLevels(4),
+    slots: null,
+    completed: 0,
+    failed: 0,
+    startedAt: null,
+    samples: [],
+    history: loadLadderHistory(),
+    selectedId: null,
+    error: null,
+  },
+  chat: {
+    conversations: loadConversations(),
+    activeId: null,
+    draft: "",
+    attachments: [],
+    streaming: false,
+    options: loadChatOptions(),
+    error: null,
+  },
+  monitor: null,
+  monitorAt: 0,
+  speedSeries: { tokS: [], prefillTokS: [] },
+  lastTurn: null,
+  recentTurns: [],
+  mcpServers: [],
+  mcpTools: [],
+  mcpError: null,
 
   async init() {
     // 幂等：成功过就直接返回；正在初始化时复用同一次调用
@@ -333,27 +881,18 @@ export const useApp = create<AppStore>((set, get) => ({
       // 本次初始化里「界面能用、但用户该知道」的问题，最后一次性报出来
       const problems: string[] = [];
 
+      // 模型列表的状态轮询：前门随程序常开，没有「router 起来了」这个事件可挂，所以无条件起一个。
+      // 幂等（模块级句柄判空），resetInit 之后重跑 init 也不会叠加定时器。
+      // 放在 init 最前面而不是尾部：后面任何一步抛错都不该让状态轮询失效 —— 少了它，
+      // 卡片会停在最后一次刷新的状态上（用户 m05562：加载完仍显示「加载中」）。
+      if (modelsTimer === null) {
+        modelsTimer = window.setInterval(() => void get().refreshRouterModels(false), 5000);
+      }
+
       // 1) 订阅先注册、且只注册一次（见 ensureListener / registerListeners）。
       //    它和下面的快照是两件事：快照失败时订阅也该在跑 —— 后端一恢复，
       //    实时状态 / 日志 / 扫描结果就自己回来，不必重启应用。
       const subs: { name: string; start: () => Promise<UnlistenFn> }[] = [
-        {
-          name: "router 状态",
-          start: () =>
-            onRouterStatus((s) => {
-              const prev = get().status;
-              set({ status: s });
-              if (s.running) {
-                if (!prev.running || prev.port !== s.port) {
-                  get().startRouterWatch(s.port);
-                  void get().refreshRouterModels(false);
-                }
-              } else if (prev.running) {
-                get().stopRouterWatch();
-                set({ routerModels: [], modelProps: {} });
-              }
-            }),
-        },
         {
           name: "日志",
           start: () =>
@@ -380,17 +919,17 @@ export const useApp = create<AppStore>((set, get) => ({
             onModelsScanned(({ models, aux_files }) => {
               set({ scanned: models, auxFiles: aux_files ?? [] });
               // 后台重扫也可能清理了失效段（模型被删掉时），同样要让 router 重读 preset
-              if (get().status.running) void get().refreshRouterModels(true);
+              if (get().strataStatus.proxy) void get().refreshRouterModels(true);
             }),
         },
       ];
       problems.push(...(await registerListeners(subs)));
 
       try {
-        // 2) 关键快照：设置 / 路径 / router 状态缺了界面基本没法用，所以失败 = 这次 init 失败
+        // 2) 关键快照：设置 / 路径缺了界面基本没法用，所以失败 = 这次 init 失败
         //    （内部已重试；仍失败时 initialized 保持 false，下次调用 init() 还能重来）。
-        const { settings, paths, status } = await loadEssentialSnapshot();
-        set({ settings, paths, status, presetPath: paths.preset_path });
+        const { settings, paths } = await loadEssentialSnapshot();
+        set({ settings, paths });
 
         // 3) 可选项各自独立：日志 / Strata 状态读失败只记一笔，不拖垮整次初始化。
         //    读不到就不覆盖 —— 别用默认值盖掉订阅已经推过来的实时数据。
@@ -406,9 +945,9 @@ export const useApp = create<AppStore>((set, get) => ({
         else problems.push(`Strata 状态读取失败：${errText(strataResult.reason)}`);
         if (problems.length > 0) set({ error: problems.join("；") });
 
-        // 4) 快照到位之后的动作
-        if (status.running) {
-          get().startRouterWatch(status.port);
+        // 4) 快照到位之后的动作：前门在跑就先拉一次模型状态
+        //    （router 那个 status 字段已随退役删除，判据换成前门代理在不在监听）。
+        if (strataStatus.proxy) {
           void get().refreshRouterModels(false);
         }
 
@@ -433,11 +972,9 @@ export const useApp = create<AppStore>((set, get) => ({
           })();
         }
 
-        // 打开程序就把服务拉起来（可在「设置 → 启动与托盘」关掉）。
-        // 放在最后：启动 router 要读 preset，得等设置与模型列表先就位。
-        if (settings.auto_start_router && !status.running && settings.llama_cpp_dir) {
-          void get().startRouter();
-        }
+        // 打开程序不再自动启动 router（用户 m02352）：统一入口是前门（:9090），router 正在
+        // 退役 —— 它自启会让日志里混进 router 自己的「Available models」段落，还可能和
+        // llama.cpp 子实例抢显存。模型改由前门调度器按需拉起（容量上限仍是 `models_max`）。
 
         // Strata：扫一次 config 列表（根目录没设置时后端直接返回空，不报错）。
         // 探测定时器**常驻**：Strata 可以由用户自己跑 run-<model>.bat 拉起来，
@@ -449,18 +986,15 @@ export const useApp = create<AppStore>((set, get) => ({
         }
         // Strata 状态这次没读到就别做这个判断：那样会把「其实在运行」当成未运行，
         // 白白再启一次（探测轮询随后会把真实状态补上）。
-        if (
-          strataResult.status === "fulfilled" &&
-          !strataStatus.proxy &&
-          settings.auto_start_strata &&
-          settings.strata_root
-        ) {
-          // 「打开程序就自动启动 strata」现在拉起的是**前门**（用户 m00798）：一个端口挂全部
-          // config，DSH 里选中哪个模型都能直接用；引擎由前门在首次请求时按需起，所以不必
-          // 先启引擎、也不用依赖某个选中的 config（也不再有写 config 的副作用）。
+        // 前门随程序常开（后端 setup 里已经 autostart 过一次），这里只是兜底：那次若失败
+        // （比如端口被占），前端初始化后再补一次。前门不加载模型、不占显存 —— 模型由客户端
+        // 的第一个请求或卡片上的「加载」按需拉起（用户 m02258 第 2 点：引擎不再默认启动）。
+        if (strataResult.status === "fulfilled" && !strataStatus.proxy && settings.strata_root) {
           void get().startStrataProxy();
         }
 
+        // 模型列表的状态轮询：前门常开，没有「router 起来了」这个事件可挂，所以无条件起一个。
+        // 幂等（模块级句柄判空），resetInit 之后重跑 init 也不会叠加定时器。
         // 5) 全部就位才算初始化成功：失败时 initialized 保持 false，下次调用 init() 能重来
         //    （订阅不会重复注册，见 ensureListener）。
         set({ initialized: true });
@@ -542,72 +1076,6 @@ export const useApp = create<AppStore>((set, get) => ({
     }
   },
 
-  async startRouter() {
-    set({ busy: true, error: null, notice: null });
-    try {
-      // preset 里一个模型段都没有时，router 起来也是空列表（等于没法启动任何模型）。
-      // 扫描到了模型就先把它们同步进去，省得用户先手动点一次「同步 preset」。
-      const sections = presetSections(get().presetText);
-      if (sections.size === 0 && get().scanned.length > 0) {
-        const synced = await ipc.presetSync();
-        set({
-          scanned: synced.models,
-          auxFiles: synced.aux_files ?? [],
-          presetText: synced.preset_text,
-          presetPath: synced.preset_path,
-          orphanSections: synced.orphan_sections,
-        });
-        set({ notice: `presets.ini 原本没有模型，已自动同步 ${synced.models.length} 个模型段` });
-      }
-
-      const status = await ipc.routerStart();
-      set({ status });
-      const settings = await ipc.settingsGet();
-      set({ settings });
-      get().startRouterWatch(status.port);
-      await get().refreshRouterModels(true);
-    } catch (err) {
-      set({ error: errText(err) });
-    } finally {
-      set({ busy: false });
-    }
-  },
-
-  async stopRouter() {
-    set({ busy: true, error: null });
-    try {
-      const status = await ipc.routerStop();
-      get().stopRouterWatch();
-      set({ status, routerModels: [], modelProps: {} });
-    } catch (err) {
-      set({ error: errText(err) });
-    } finally {
-      set({ busy: false });
-    }
-  },
-
-  /**
-   * 重启 router。
-   *
-   * 端口 / 同时加载上限 / API Key 都是 router 的**启动参数**：设置页改完只写盘，
-   * 运行中的 router 还在用旧值，而界面已经按新值请求 —— 端口对不上就整个连不上，
-   * key 对不上就全是 401。所以设置页会问用户要不要立刻重启。
-   *
-   * 没在跑的时候直接启动即可（语义上等价，调用方不必区分）。
-   */
-  async restartRouter() {
-    if (!get().status.running) {
-      await get().startRouter();
-      return;
-    }
-    set({ notice: "正在重启 router…" });
-    await get().stopRouter();
-    // 停是强杀，同步返回；但监听套接字要一点时间才真正释放，
-    // 立刻 bind 同一个端口偶发失败（那样 router 会顺延到别的端口）。
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    await get().startRouter();
-  },
-
   async clearLogs() {
     await ipc.logsClear();
     set({ logs: [] });
@@ -637,9 +1105,7 @@ export const useApp = create<AppStore>((set, get) => ({
       set({
         scanned: result.models,
         auxFiles: result.aux_files ?? [],
-        presetText: result.preset_text,
-        presetPath: result.preset_path,
-        orphanSections: result.orphan_sections,
+        configs: result.configs ?? [],
       });
 
       // 扫描时后端会顺手清掉「模型文件已经不在了」的 preset 段，这里如实告诉用户
@@ -647,7 +1113,7 @@ export const useApp = create<AppStore>((set, get) => ({
       const restored = result.restored_sections ?? [];
       if (removed.length > 0) {
         set({
-          notice: `已自动清理 ${removed.length} 个失效的 preset 段（模型文件已不存在，配置已存档）：${removed
+          notice: `已自动清理 ${removed.length} 个失效的模型配置（模型文件已不存在，配置已存档）：${removed
             .slice(0, 5)
             .join("、")}${removed.length > 5 ? " …" : ""}`,
         });
@@ -659,11 +1125,11 @@ export const useApp = create<AppStore>((set, get) => ({
         });
       } else if (result.prune_skipped && !silent) {
         set({
-          notice: "preset 里的模型文件全都不存在，可能是模型盘没挂上或目录未就绪，已跳过自动清理",
+          notice: "配置里的模型文件全都不存在，可能是模型盘没挂上或目录未就绪，已跳过自动清理",
         });
-      }
 
-      if (get().status.running) {
+      }
+      if (get().strataStatus.proxy) {
         // 必须带 reload：扫描时会顺手清理"模型文件已不存在"的 preset 段，
         // 而 router 的 preset 是启动时读进内存的 —— 不重读的话，删掉的模型会被它继续报回来，
         // 列表里就留着一个点不动也用不了的幽灵条目。
@@ -679,16 +1145,14 @@ export const useApp = create<AppStore>((set, get) => ({
   async syncPreset() {
     set({ busy: true, error: null, notice: null });
     try {
-      const result = await ipc.presetSync();
+      const result = await ipc.configSync();
       set({
         scanned: result.models,
         auxFiles: result.aux_files ?? [],
-        presetText: result.preset_text,
-        presetPath: result.preset_path,
-        orphanSections: result.orphan_sections,
-        notice: `已同步 ${result.models.length} 个模型到 presets.ini`,
+        configs: result.configs ?? [],
+        notice: `已同步 ${result.models.length} 个模型的配置文件`,
       });
-      if (get().status.running) {
+      if (get().strataStatus.proxy) {
         await get().refreshRouterModels(true);
       }
     } catch (err) {
@@ -701,15 +1165,14 @@ export const useApp = create<AppStore>((set, get) => ({
   async importHubPresets() {
     set({ busy: true, error: null, notice: null });
     try {
-      const report = await ipc.presetImportHub();
-      // 参数写进了 presets.ini，重新读一遍让界面拿到最新文本
-      const text = await ipc.presetRead();
-      set({ presetText: text });
+      const report = await ipc.configImportHub();
+      // 参数已写进 config JSON（第三刀），重扫一遍让界面拿到最新的配置清单
+      await get().refreshModels(false);
       const missing = report.missing.length ? `，${report.missing.length} 个模型在 hub 里没有配置` : "";
       set({
         notice: `已从 hub 迁移 ${report.matched}/${report.total} 个模型的参数（共 ${report.entries} 项）${missing}`,
       });
-      if (get().status.running) {
+      if (get().strataStatus.proxy) {
         await get().refreshRouterModels(true);
       }
     } catch (err) {
@@ -722,39 +1185,37 @@ export const useApp = create<AppStore>((set, get) => ({
   /**
    * 打开 llama.cpp 自带的聊天界面。
    *
-   * 两种入口，语义不同：
-   * - **不指定模型**（侧栏「开始聊天」）→ 打开 **router 自己的** WebUI。
-   *   llama.cpp 的 WebUI 内置了 router 支持（LIST=`/v1/models`、LOAD=`/models/load`、
-   *   SSE=`/models/sse`），所以这一个界面里就能看到全部模型、按需加载并切换着聊。
-   * - **指定模型**（模型卡片上的 💬）→ 打开该模型**子实例**的 WebUI，进去就是它，
-   *   不用在列表里再选一次（代价是那个界面只服务这一个模型）。
+   * 前门化（P1）之后两个入口都指向前门 —— 统一入口只留 :9090，router 即将退役：
+   * - **不指定模型**（侧栏「开始聊天」）→ 打开前门根路径。界面里的模型列表来自前门
+   *   合成的 `/v1/models`（两通道都有），在里面换模型后请求仍回到前门，由它按 `model` 路由。
+   * - **指定模型**（模型卡片上的 💬）→ 带上 `?model=<id>`，前门把根路径转给那个子实例，
+   *   进去就是它（代价是那个界面只服务这一个模型）。
    */
   async openModelChat(id) {
-    const { status, routerModels } = get();
-    if (!status.running) {
-      set({ error: "router 未运行，请先在顶部启动" });
-      return false;
+    const { strataStatus, routerModels } = get();
+    if (!strataStatus.proxy) {
+      set({ error: "前门未运行，请先在侧栏左下角启动前门" });
     }
+    const port = strataStatus.proxy_port ?? 9090;
     const keyHint = chatKeyHint(get().settings?.api_key);
-    if (!id) {
-      try {
-        await ipc.openLocalUrl(`http://127.0.0.1:${status.port}/`);
-        set({ notice: `已在浏览器打开 llama.cpp 的聊天界面（在里面可以切换模型）${keyHint}` });
-        return true;
-      } catch (err) {
-        set({ error: errText(err) });
-        return false;
-      }
+    // 判「这个模型在不在跑」直接看前门给的合成列表：router 时代那套靠 `status.args`
+    // 解析端口的 chatTargets 在前门化之后拿不到 args，恒为空，会让 💬 永远报「不在运行中」。
+    if (
+      id &&
+      !routerModels.some((m) => m.id === id && (m.status?.value ?? "unloaded") === "loaded")
+    ) {
+      set({ error: `${id} 当前不在运行中，无法打开聊天界面（先在卡片上点「加载」）` });
     }
-
-    const target = chatTargets(routerModels).find((t) => t.id === id);
-    if (!target) {
-      set({ error: `${id} 当前不在运行中，无法打开聊天界面` });
-      return false;
-    }
+    const url = id
+      ? `http://127.0.0.1:${port}/?model=${encodeURIComponent(id)}`
+      : `http://127.0.0.1:${port}/`;
     try {
-      await ipc.openLocalUrl(`http://127.0.0.1:${target.port}/`);
-      set({ notice: `已在浏览器打开 ${id} 的聊天界面（该界面只服务这一个模型）${keyHint}` });
+      await ipc.openLocalUrl(url);
+      set({
+        notice: id
+          ? `已在浏览器打开 ${id} 的聊天界面（该界面只服务这一个模型）${keyHint}`
+          : `已在浏览器打开 llama.cpp 的聊天界面（在里面可以切换模型）${keyHint}`,
+      });
       return true;
     } catch (err) {
       set({ error: errText(err) });
@@ -763,98 +1224,69 @@ export const useApp = create<AppStore>((set, get) => ({
   },
 
   async refreshRouterModels(reload = false) {
-    const { status, settings } = get();
-    // router 带 --api-key 时所有端点都要鉴权，请求前先保证 key 是最新的
+    const { settings, strataStatus } = get();
+    // 本次刷新的序号：晚到的旧响应要靠它认出来并丢掉（见 modelsSeq）
+    const seq = (modelsSeq += 1);
+    // 前门带 --api-key 时所有端点都要鉴权，请求前先保证 key 是最新的
     setRouterApiKey(settings?.api_key);
-    if (!status.running) {
+    // 数据源是**前门**：它合成的 `/v1/models` 同时列 llama.cpp 与 Strata 两通道
+    if (!strataStatus.proxy) {
       set({ routerModels: [] });
       return;
     }
+    const port = strataStatus.proxy_port ?? 9090;
     // 端口就绪后偶发的一次超时/抖动不该直接报错，重试几次再放弃
     let lastErr: unknown = null;
+    // 「加载成功」的提示以前由 router 的 SSE（`model_status` / `status_change`）推；
+    // 前门化成轮询后没有事件了，靠两次快照对比补回来（用户 m02048 第 3 点）。
+    const before = get().routerModels;
     for (let attempt = 0; attempt < 5; attempt += 1) {
       try {
-        const models = await fetchModels(status.port, reload);
+        const models = await fetchModels(port, reload);
+        // 这一次 await 期间可能已有更新的刷新跑完并落了状态，别拿旧快照盖回去（用户 m05562）
+        if (seq !== modelsSeq) return;
         set({ routerModels: models });
+        if (before.length > 0) {
+          const wasLoaded = new Set(
+            before.filter((m) => (m.status?.value ?? "unloaded") === "loaded").map((m) => m.id),
+          );
+          // 只报 llama.cpp 通道：Strata 的加载完成提示由 startStrataModel 自己给，
+          // 这里再报一次就成了同一次加载弹两条（用户 m03482 第 4 点）。
+          const freshIds = models
+            .filter(
+              (m) =>
+                m.channel !== "strata" &&
+                (m.status?.value ?? "unloaded") === "loaded" &&
+                !wasLoaded.has(m.id) &&
+                !notifiedLoaded.has(m.id),
+            )
+            .map((m) => m.id);
+          // 同一个模型只提示一次：加载期间「1.5 秒的加载轮询」和「5 秒的常驻轮询」是并发的，
+          // 两次调用可能都基于同一份旧快照算出「刚加载」，于是同一次加载弹好几条
+          // （用户 m05033 第 1 点：一张卡弹了 4 次）。
+          for (const id of freshIds) notifiedLoaded.add(id);
+          const fresh = freshIds.map((id) => id.split("/").pop() || id);
+          if (fresh.length > 0) set({ notice: `模型加载\n模型 ${fresh.join("、")} 加载成功` });
+        }
+        // 回到未加载就把名字放开，下次加载还会提示
+        for (const m of models) {
+          if ((m.status?.value ?? "unloaded") !== "loaded") notifiedLoaded.delete(m.id);
+        }
+        if (modelsFailLogged) {
+          modelsFailLogged = false;
+          reportFrontendError("info", "前门模型列表恢复正常");
+        }
         return;
       } catch (err) {
         lastErr = err;
         await new Promise((resolve) => setTimeout(resolve, 300));
       }
     }
-    set({ error: `读取 router 模型列表失败：${errText(lastErr)}` });
-  },
-
-  startRouterWatch(port) {
-    get().stopRouterWatch();
-    const close = subscribeModelEvents(
-      port,
-      (evt) => {
-        const { routerModels } = get();
-        if (evt.event === "models_reload") {
-          void get().refreshRouterModels(false);
-          return;
-        }
-        if (evt.event === "model_remove") {
-          set({ routerModels: routerModels.filter((m) => m.id !== evt.model) });
-          return;
-        }
-        // status_change 携带 progress（stages/current/value），model_status 只有状态。
-        // 之前只处理 model_status，界面上就一直是"加载中"没有百分比，看着像卡住。
-        if (evt.event !== "model_status" && evt.event !== "status_change") return;
-
-        if (!routerModels.some((m) => m.id === evt.model)) {
-          void get().refreshRouterModels(false);
-          return;
-        }
-        // 加载失败要有明确提示，否则界面上只看到"加载中"停住
-        if (evt.data?.status === "failed") {
-          set({
-            error: `${evt.model} 加载失败。子实例的报错见「系统日志」页 →「模型子实例」来源。`,
-          });
-        }
-        const before = routerModels.find((m) => m.id === evt.model)?.status.value;
-        const after = evt.data?.status ?? before;
-        const next = routerModels.map((m) =>
-          m.id === evt.model
-            ? {
-                ...m,
-                status: {
-                  ...m.status,
-                  value: evt.data?.status ?? m.status.value,
-                  progress: evt.data?.progress ?? m.status.progress,
-                  failed: evt.data?.status === "failed" ? true : m.status.failed,
-                },
-              }
-            : m,
-        );
-        set({ routerModels: next });
-
-        // 加载完成给一条提示：加载一个 20GB 的模型要等几十秒，这期间用户往往已经翻到别的页面，
-        // 没有反馈就不知道什么时候能开始用。只在"变成 loaded"时提示，重复事件不会刷屏。
-        if (after === "loaded" && before !== "loaded") {
-          const short = evt.model.split("/").pop() || evt.model;
-          set({ notice: `模型加载\n模型 ${short} 加载成功` });
-        }
-      },
-      () => {
-        /* 重连由 subscribeModelEvents 负责；真的放弃了才提示，
-           否则"界面看着正常、加载进度却永远不动"这种静默失效很难查 */
-        set({
-          notice:
-            "与 router 的状态订阅已断开，模型加载进度可能不再更新；重启 router 或刷新界面可恢复",
-        });
-      },
-    );
-    set({ sseClose: close });
-  },
-
-  stopRouterWatch() {
-    const close = get().sseClose;
-    if (close) {
-      close();
-      set({ sseClose: null });
+    if (!modelsFailLogged) {
+      modelsFailLogged = true;
+      reportFrontendError("error", `读取前门模型列表失败：${errText(lastErr)}`);
     }
+    set({ error: `读取前门模型列表失败：${errText(lastErr)}` });
   },
 
   // ---- Strata（第二运行时通道）----
@@ -876,11 +1308,11 @@ export const useApp = create<AppStore>((set, get) => ({
   async startStrataProxy() {
     set({ busy: true, error: null, notice: null });
     try {
-      // 显存互斥（用户 m03342）：前门会按需拉起引擎，先把 router 里占显存的模型卸掉
+      // 显存互斥（用户 m03160 第 2 点）：前门会按需拉起引擎，先把 llama.cpp 侧占显存的模型卸掉
       let mutexNote = "";
       if (get().settings?.strata_router_mutex) {
         const unloaded = await get().unloadRouterLoaded();
-        if (unloaded.length) mutexNote = `\n显存互斥：已卸载 router 的 ${unloaded.join("、")}`;
+        if (unloaded.length) mutexNote = `\n显存互斥：已卸载 llama.cpp 的 ${unloaded.join("、")}`;
       }
       const status = await ipc.strataProxyStart();
       set({ strataStatus: status });
@@ -915,40 +1347,25 @@ export const useApp = create<AppStore>((set, get) => ({
     const startingFile = configFile ?? get().settings?.strata_selected_config ?? null;
     set({ busy: true, error: null, notice: null, strataStarting: startingFile });
     try {
-      // 显存互斥（用户 m03342）：先把 router 里占显存的模型卸掉，再启动 Strata。
-      let mutexNote = "";
+      // 显存互斥（用户 m03160 第 2 点）：先把 llama.cpp 侧占显存的模型卸掉，再启动 Strata。
+      // 卸载结果不在这里播报（用户 m03482 第 4 点）：这一步只是把引擎拉起来，模型还没加载，
+      // 弹提示会被当成「启动成功」，紧接着加载完又弹一条，同一次启动两条提示。
       if (get().settings?.strata_router_mutex) {
-        const unloaded = await get().unloadRouterLoaded();
-        if (unloaded.length) mutexNote = `\n显存互斥：已卸载 router 的 ${unloaded.join("、")}`;
+        await get().unloadRouterLoaded();
       }
-      // 胶囊只启引擎（用户 m03572）：强制 lazy_load=true，模型交给卡片或首次请求拉起
-      if (startingFile) await get().ensureStrataLazy(startingFile);
       const status = await ipc.strataStart(configFile ?? null);
       set({ strataStatus: status });
       get().startStrataPolling();
       // 选中的 config 已落盘，把设置取回来保持一致
       set({ settings: await ipc.settingsGet() });
-      const name = status.model_name || status.config_path || "";
-      set({ notice: `Strata 引擎已启动\n${name} · :${status.port} · 模型按需加载${mutexNote}` });
+      // 引擎起来不弹提示（用户 m03482 第 4 点）：这一步模型还没加载，
+      // 提示「引擎已启动」看起来就是「启动成功」，随后加载完还会再弹一条。
+      // 启动结果只由真正加载完（startStrataModel）的那一处报。
     } catch (err) {
       set({ error: errText(err) });
     } finally {
       set({ busy: false, strataStarting: null });
-    }
-  },
 
-  /** 确保 config 顶层有 lazy_load=true（上游 server.py:5403 `lazy = a.lazy or cfg.get("lazy_load") is True`）。
-   *  这样「启动 Strata」胶囊只拉起引擎不加载模型，与 router 的「进程在、模型按需加载」一致。 */
-  async ensureStrataLazy(configFile) {
-    try {
-      const cfg = JSON.parse(await ipc.strataConfigRead(configFile));
-      if (cfg.lazy_load === true) return true;
-      cfg.lazy_load = true;
-      await ipc.strataConfigWrite(configFile, JSON.stringify(cfg, null, 1));
-      return true;
-    } catch (err) {
-      set({ error: `设置 lazy_load 失败：${errText(err)}` });
-      return false;
     }
   },
 
@@ -969,7 +1386,7 @@ export const useApp = create<AppStore>((set, get) => ({
       set({ error: "当前运行的是其他模型，请先停止它" });
       return;
     }
-    set({ busy: true, error: null, notice: null });
+    set({ busy: true, error: null, notice: null, strataStopping: configFile });
     try {
       await ipc.strataUnloadModel(root, configFile);
       set({ notice: "已卸载 Strata 模型（引擎仍在运行，显存已释放）" });
@@ -977,7 +1394,15 @@ export const useApp = create<AppStore>((set, get) => ({
     } catch (err) {
       set({ error: errText(err) });
     } finally {
-      set({ busy: false });
+      // 「卸载中」只在**真的还在卸**的时候挂着（用户 m04998）：Rust 侧 /unload 超时只有 60 秒，
+      // 大模型卸载慢过它时会先报错，而引擎其实还在卸 —— 探测仍读到 loaded 就继续显示，
+      // 最多再等 15 秒（免得引擎卡死时按钮永远点不动）。卸载快时这里一轮都不进，徽标立刻变「已停止」。
+      const deadline = Date.now() + 15_000;
+      while (get().strataStatus.loaded && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        await get().probeStrata();
+      }
+      set({ busy: false, strataStopping: null });
     }
   },
 
@@ -1000,14 +1425,12 @@ export const useApp = create<AppStore>((set, get) => ({
     }
     set({ busy: true, error: null, notice: null, strataStarting: file });
     try {
-      // 显存互斥（用户 m03342）：先卸 router 里 loaded 的模型，再加载 Strata 模型
+      // 显存互斥（用户 m03160 第 2 点）：先卸 llama.cpp 侧 loaded 的模型，再加载 Strata 模型
       let mutexNote = "";
       if (get().settings?.strata_router_mutex) {
         const unloaded = await get().unloadRouterLoaded();
-        if (unloaded.length) mutexNote = `\n显存互斥：已卸载 router 的 ${unloaded.join("、")}`;
+        if (unloaded.length) mutexNote = `\n显存互斥：已卸载 llama.cpp 的 ${unloaded.join("、")}`;
       }
-      // 强制 lazy_load=true：引擎启动不会顺带把模型吃满显存
-      await get().ensureStrataLazy(file);
       const st = get().strataStatus;
       const runningFile = st.config_path ? strataBaseName(st.config_path) : null;
       const runningName = st.model_name || runningFile || "另一个模型";
@@ -1027,6 +1450,9 @@ export const useApp = create<AppStore>((set, get) => ({
       }
       if (!st.running || runningFile !== file) {
         // 引擎没跑，或跑的是别的模型：重启引擎（一个引擎只服务一份 config）
+        // 首次启动要等 python 起来（实测几十秒，里面还要初始化 CUDA），这段时间必须给一句
+        // 阶段提示，否则用户只看到「加载中」却不知道在等什么（用户 m05033 第 2 点）。
+        set({ notice: `正在启动 Strata 引擎…\n${strataBaseName(file)}` });
         const status = await ipc.strataStart(file);
         set({ strataStatus: status });
         get().startStrataPolling();
@@ -1034,6 +1460,7 @@ export const useApp = create<AppStore>((set, get) => ({
       }
       // 卡片按钮的语义是「启动并加载这个模型」：两条分支都要走到 /load，
       // 否则引擎起来了模型还是没加载，卡片一直显示「已停止」= 看起来启动失败
+      set({ notice: `引擎已就绪，正在加载模型…\n${strataBaseName(file)}` });
       await ipc.strataLoadModel(root, file);
       const name = strataBaseName(file);
       set({
@@ -1064,29 +1491,64 @@ export const useApp = create<AppStore>((set, get) => ({
   async probeStrata() {
     // 无守卫：未运行时也要探测（后端对「没有选中 config / 端口为 0」直接回快照，不发请求），
     // 这样外部启动的实例能被轮询发现。
+    // 唯一例外是「上一轮还没回来」：见 strataProbing 的注释，并发会让慢的旧结果盖掉新结果。
+    if (strataProbing) return;
+    strataProbing = true;
     try {
+      // 单轮探测不应答不再由前端去抖：Rust 的 `strata::probe` 自己会在退化时复探一次，
+      // 单轮抖动被复探吸收，而真停立刻反映 —— 本机关闭端口是即时 RST，复探几乎不花时间
+      // （用户 m12735 要抖动消失，m13216 第 2 点要求真停不能延迟显示）。
       set({ strataStatus: await ipc.strataProbe() });
     } catch (err) {
       set({ error: errText(err) });
+    } finally {
+      strataProbing = false;
     }
   },
 
+  /** 显存互斥（用户 m03160 第 2 点）：加载 Strata 模型前先卸掉 llama.cpp 侧已加载的模型。
+   *
+   *  router 退役前这里判的是 `status.running`（router 在不在跑），前门化后那个字段恒为 false，
+   *  于是整段静默返回空数组 —— 互斥等于没开。现在改判前门在不在跑，卸载请求也发给前门
+   *  （`POST /models/unload` 按 model 路由到对应子实例）。 */
   async unloadRouterLoaded() {
-    const { status, routerModels } = get();
-    if (!status.running) return [];
-    // 只卸占显存的 loaded：sleeping 的显存已被 router 释放，loading 中的卸不掉。
-    const loaded = routerModels.filter((m) => m.status.value === "loaded");
+    const { strataStatus, routerModels } = get();
+    if (!strataStatus.proxy) return [];
+    // 只卸 llama.cpp 侧占显存的 loaded：strata 那档的 loaded 是引擎自己的状态，
+    // 发给前门只会 404（前门只认配置目录里的模型）；sleeping 的显存已释放，loading 中的卸不掉。
+    const loaded = routerModels.filter(
+      (m) => m.channel !== "strata" && m.status.value === "loaded",
+    );
     if (!loaded.length) return [];
+    const port = strataStatus.proxy_port ?? 9090;
     const unloaded: string[] = [];
     for (const m of loaded) {
       try {
-        await apiUnloadModel(status.port, m.id);
+        // 挂待停标记：卸载期间卡片显示「卸载中」。前门把 stopping 也报成 loading，光看状态分不出
+        // 方向，会被渲染成「加载中」（用户 m05592）。
+        set({ modelPending: { id: m.id, stop: true } });
+        await apiUnloadModel(port, m.id);
         unloaded.push(m.id);
       } catch (err) {
         set({ error: `显存互斥：卸载 ${m.id} 失败：${errText(err)}` });
       }
     }
-    if (unloaded.length) await get().refreshRouterModels(false);
+    if (unloaded.length) {
+      // 前门返回时子实例可能刚收到停止信号，状态还是 stopping（前端映射为 loading），而常驻轮询
+      // 5 秒才拍一次 —— 卡片会多停好几拍，显存其实早就放掉了（用户 m05592：卸载很快，显示明显滞后）。
+      // 这里短轮询到前门报 unloaded 为止，8 秒兜底。
+      const ids = new Set(unloaded);
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline) {
+        await get().refreshRouterModels(false);
+        const still = get().routerModels.some(
+          (m) => ids.has(m.id) && (m.status?.value ?? "unloaded") !== "unloaded",
+        );
+        if (!still) break;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    }
+    set({ modelPending: null });
     return unloaded;
   },
 
@@ -1152,14 +1614,19 @@ export const useApp = create<AppStore>((set, get) => ({
   },
 
   async startModel(id) {
-    const { status } = get();
-    if (!status.running) {
-      set({ error: "router 未运行，请先在顶部启动" });
+    const { strataStatus } = get();
+    if (!strataStatus.proxy) {
+      set({ error: "前门未运行，请先在侧栏左下角启动前门" });
       return;
     }
-    set({ error: null });
-    // 显存互斥（用户 m03342 / m03572）：加载 router 模型前先卸掉 Strata 的模型 ——
+    // 先给卡片一个立刻的反馈（用户 m03482 第 3 点）：前门的 `/models/load` 要等子实例
+    // `/health` 就绪才返回，只靠下面那 1.5 秒的轮询，点下去这一两秒里按钮毫无变化，
+    // 比 Strata 那边（前端有 `strataStarting`）显得迟钝。
+    set({ error: null, modelPending: { id, stop: false } });
+    // 显存互斥（用户 m03342 / m03572）：加载模型前先卸掉 Strata 的模型 ——
     // 只卸模型释放显存，引擎进程与 WebUI 留着（卸的是模型，不是停进程）。
+    // 反方向（先加载 Strata 模型 → 卸 llama.cpp 侧的模型）在 unloadRouterLoaded 里，
+    // 两向合起来才是用户 m03160 第 2 点要的「Strata 与 llama.cpp 显存互斥」。
     const st = get().strataStatus;
     const strataRoot = get().settings?.strata_root;
     if (get().settings?.strata_router_mutex && st.running && strataRoot && st.loaded) {
@@ -1174,23 +1641,73 @@ export const useApp = create<AppStore>((set, get) => ({
         }
       }
     }
+      // 加载/卸载都走**前门**：它按 `model` 路由，命中 llama.cpp 通道时由调度器起子实例
+      // （`POST /models/load` 会等到 `/health` 就绪才返回）。
+      // 「加载中」徽标（用户 m03333 第 3 点）：上面这个 await 要等子实例 /health 就绪
+      // （实测几十秒）才返回，期间一次都不刷新状态的话，卡片整段都停在「已停止」。
+      // 所以起个短轮询，把前门报的 `state=starting`（前端映射成 loading）拉回来。
     try {
-      await apiLoadModel(status.port, id);
+      const tick = window.setInterval(() => void get().refreshRouterModels(false), 1500);
+      try {
+        await apiLoadModel(strataStatus.proxy_port ?? 9090, id);
+      } finally {
+        window.clearInterval(tick);
+      }
+      // 「加载成功」的提示在这里给：上面这个 await 返回就意味着子实例 `/health` 已就绪，
+      // 这一行是「确已加载完成」的时刻。不再只靠轮询两次快照对比 —— GUI 刚起来时首帧
+      // 快照还是空的（`refreshRouterModels` 里 `before.length > 0` 那条守卫会跳过对比），
+      // 于是本次会话里**第一个**加载的模型没有提示，第二个才正常（用户 m05562）。
+      // 先登记再提示：轮询那边同一 id 就不会再报一次。
+      notifiedLoaded.add(id);
+      set({ notice: `模型加载\n模型 ${id.split("/").pop() || id} 加载成功` });
       await get().refreshRouterModels(false);
+      // 上面这次刷新之后卡片就该是「运行中」。可并发轮询里更早发出的请求可能这会儿才回来，
+      // 拿「加载中」的旧快照把状态盖回去（用户 m05562：提示弹了、卡片还是加载中）。像
+      // stopModel 那样盯到前门报 loaded 再收工，8 秒兜底 —— 前门确实已就绪时第一轮检查就过，
+      // 不额外等（用户 m04998：不做人为拖延）。
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline) {
+        const m = get().routerModels.find((x) => x.id === id);
+        if (m && (m.status?.value ?? "unloaded") === "loaded") break;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        await get().refreshRouterModels(false);
+      }
     } catch (err) {
       set({ error: errText(err) });
+    } finally {
+      set({ modelPending: null });
     }
   },
 
   async stopModel(id) {
-    const { status } = get();
-    if (!status.running) return;
-    set({ error: null });
+    const { strataStatus } = get();
+    if (!strataStatus.proxy) return;
+    // 「卸载中」只在**真的还在卸**的时候显示（用户 m04998）：卸载快就直接变「已停止」，
+    // 不人为拖时间；卸载慢（前门要等子实例退出）时这段窗口自然看得见。
+    set({ error: null, modelPending: { id, stop: true } });
     try {
-      await apiUnloadModel(status.port, id);
+      // 卸载同样有一段「卸载中」窗口（前门要等子实例退出），一并轮询
+      const tick = window.setInterval(() => void get().refreshRouterModels(false), 1500);
+      try {
+        await apiUnloadModel(strataStatus.proxy_port ?? 9090, id);
+      } finally {
+        window.clearInterval(tick);
+      }
       await get().refreshRouterModels(false);
+      // 前门返回时状态可能还是 stopping（前端映射为 loading），而常驻轮询 5 秒才拍一次 —— 立刻清掉
+      // 待停标记会让卡片先闪回「加载中」再变「已停止」（用户 m05592）。等前门报 unloaded 再放手，
+      // 8 秒兜底；卸载失败会走 catch，不在这里白等。
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline) {
+        const m = get().routerModels.find((x) => x.id === id);
+        if (!m || (m.status?.value ?? "unloaded") === "unloaded") break;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        await get().refreshRouterModels(false);
+      }
     } catch (err) {
       set({ error: errText(err) });
+    } finally {
+      set({ modelPending: null });
     }
   },
 
@@ -1209,9 +1726,9 @@ export const useApp = create<AppStore>((set, get) => ({
   async saveModelSection(section, entries) {
     set({ busy: true, error: null, notice: null });
     try {
-      const presetText = await ipc.presetUpsert(section, entries);
-      set({ presetText, notice: `已保存 [${section}]` });
-      if (get().status.running) {
+      await ipc.configUpsert(section, entries);
+      set({ notice: `已保存配置「${section}」` });
+      if (get().strataStatus.proxy) {
         await get().refreshRouterModels(true);
       }
       return true;
@@ -1226,9 +1743,9 @@ export const useApp = create<AppStore>((set, get) => ({
   async removeModelSection(section) {
     set({ busy: true, error: null, notice: null });
     try {
-      const presetText = await ipc.presetRemove(section);
-      set({ presetText, notice: `已删除 [${section}]` });
-      if (get().status.running) {
+      await ipc.configRemove(section);
+      set({ notice: `已删除配置「${section}」` });
+      if (get().strataStatus.proxy) {
         await get().refreshRouterModels(true);
       }
       await get().refreshModels();
@@ -1239,26 +1756,12 @@ export const useApp = create<AppStore>((set, get) => ({
     }
   },
 
-  async writePreset(content) {
-    set({ busy: true, error: null, notice: null });
-    try {
-      const saved = await ipc.presetWrite(content);
-      set({ presetText: saved, notice: "presets.ini 已保存" });
-      if (get().status.running) {
-        await get().refreshRouterModels(true);
-      }
-    } catch (err) {
-      set({ error: errText(err) });
-    } finally {
-      set({ busy: false });
-    }
-  },
-
   async loadModelProps(id) {
-    const { status } = get();
-    if (!status.running) return null;
+    const { strataStatus } = get();
+    // 前门化后端点在前门上（router 那个 status 字段已随退役删除）
+    if (!strataStatus.proxy) return null;
     try {
-      const props = await fetchProps(status.port, id);
+      const props = await fetchProps(strataStatus.proxy_port ?? 9090, id);
       set({ modelProps: { ...get().modelProps, [id]: props } });
       return props;
     } catch (err) {
@@ -1266,11 +1769,1194 @@ export const useApp = create<AppStore>((set, get) => ({
       return null;
     }
   },
+  /**
+   * 上下文档位压测（移植 strata-manager 的 context benchmark）。
+   * 与上游唯一的差别在分词：llama.cpp 没有 `/v1/messages/count_tokens`，
+   * 所以输入长度先按「每行约 28 token」估算，再用第一趟 usage 里的真实
+   * prompt_tokens 修正一次行数（见 docs/archive/STRATA_MANAGER_PORT_ASSESSMENT.md §6 P1）。
+   * 取消走模块级的 `benchAbort`：点「停止」中断当前请求，跑完的档位留在 samples 里。
+   */
+  async runContextBench(model, options, knownMaxContext) {
+    if (get().contextBench.running) return;
+    const port = get().strataStatus.proxy_port ?? 9090;
+    const opts: ContextBenchmarkOptions = { ...DEFAULT_CONTEXT_BENCHMARK_OPTIONS, ...options };
+    const controller = new AbortController();
+    benchAbort = controller;
+    const samples: ContextBenchmarkSample[] = [];
+    const startedAt = Date.now();
+    set({
+      contextBench: {
+        ...get().contextBench,
+        running: true,
+        currentTier: null,
+        completed: 0,
+        failed: 0,
+        cancelled: 0,
+        total: 0,
+        startedAt,
+        samples: [],
+        error: null,
+      },
+    });
+    // 每跑完一条就同步一次：不必等全部结束才看得到结果（HANDOVER §8 第 1 项）
+    const sync = () =>
+      set({
+        contextBench: {
+          ...get().contextBench,
+          samples: [...samples],
+          completed: samples.filter((s) => s.state === "completed").length,
+          failed: samples.filter((s) => s.state === "failed").length,
+          cancelled: samples.filter((s) => s.state === "cancelled").length,
+        },
+      });
+    let maxContext: number | null = null;
+    let skipped: ContextBenchmarkSkippedTier[] = [];
+    let stopReason: ContextBenchmarkReport["stopReason"] = "completed";
+    try {
+      validateContextBenchmarkOptions(opts);
+      // 组件已经从模型配置里读到了上限就直接用：Strata 引擎没有 /props 端点
+      // （返回网页，JSON 解析失败会把整个压测打断），llama.cpp 那边发了还会把模型拉起来
+      // （用户 m11407）。只有拿不到时才退回问前门（用户 m12533 第 2 点）。
+      maxContext = knownMaxContext ?? null;
+      if (maxContext === null) {
+        ({ maxContext } = await fetchChatModelProps(port, model));
+      }
+      const wanted = opts.tiers.length > 0 ? opts.tiers : getContextBenchmarkTiers(maxContext);
+      const plan = planContextBenchmarkTiers(wanted, maxContext, opts.maxTokens);
+      skipped = plan.skipped;
+      if (plan.supported.length === 0) {
+        throw new Error(plan.skipped[0]?.reason ?? "没有可跑的档位");
+      }
+      set({ contextBench: { ...get().contextBench, total: plan.supported.length * opts.rounds } });
+      let stop = false;
+      // 这个模型「每行合成记录到底多少 token」。首档用常量估，量出来之后立刻换成实测值，
+      // 后面几档首发就够准、不必再校正重发（用户 m13507 第 4 点）。
+      let tokensPerLine = ESTIMATED_RECORD_TOKENS;
+      for (const tier of plan.supported) {
+        for (let round = 1; round <= opts.rounds; round += 1) {
+          if (controller.signal.aborted) {
+            stopReason = "cancelled";
+            stop = true;
+            break;
+          }
+          set({ contextBench: { ...get().contextBench, currentTier: tier } });
+          const nonceBase = `${Date.now()}-${tier}-${round}`;
+          let lines = estimateRecordLines(tier, tokensPerLine);
+          let method: ContextBenchmarkSample["tokenCountMethod"] = "estimated";
+          let reason = `没有分词计数端点，按每行约 ${tokensPerLine.toFixed(1)} token 估算`;
+          let result: ChatStreamResult | null = null;
+          let failure: string | undefined;
+          const sampleStart = Date.now();
+          // 先手动采一次硬件（采集线程 1 秒一次，极短的档位可能覆盖不到窗口）
+          await monitorSampleNow();
+          try {
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+              result = await streamChat({
+                port,
+                model,
+                messages: contextBenchmarkMessages(lines, `${nonceBase}-${attempt}`),
+                maxTokens: opts.maxTokens,
+                temperature: 0,
+                timeoutMs: opts.timeoutMs,
+                signal: controller.signal,
+              });
+              const promptTokens = result.usage.promptTokens;
+              // 先把这个模型真实的「每行多少 token」记下来，供后面几档首发用
+              if (promptTokens && promptTokens > 0) {
+                tokensPerLine = measureTokensPerLine(lines, promptTokens);
+              }
+              if (attempt === 0 && needsAdjustment(tier, promptTokens)) {
+                const next = adjustRecordLines(tier, lines, promptTokens ?? 0);
+                if (next !== lines) {
+                  lines = next;
+                  method = "adjusted";
+                  reason = `按实际 usage 校正到约 ${promptTokens} token 后重发`;
+                  continue;
+                }
+              }
+              break;
+            }
+          } catch (err) {
+            failure = errText(err);
+          }
+          const cancelled = controller.signal.aborted;
+          const promptTokens = result?.usage.promptTokens ?? null;
+          const completion = result?.usage.completionTokens ?? null;
+          const decodeMs = result
+            ? Math.max(1, result.wallMs - (result.firstTokenMs ?? result.wallMs))
+            : 0;
+          // 速度优先用 llama.cpp 自己报的 timings：那是纯计算时间，不含排队、前门转发
+          // 与客户端解析；按到达时刻自己估会被这些环节污染（用户 m11542 第 3 点）。
+          const timings = result?.timings ?? null;
+          const draftN = timings?.draftN ?? null;
+          const draftHits = timings?.draftNAccepted ?? null;
+          const usage = await sampleRange(sampleStart, Date.now());
+          samples.push({
+            index: samples.length,
+            tier,
+            round,
+            targetTokens: tier,
+            lines,
+            model,
+            state: failure ? (cancelled ? "cancelled" : "failed") : "completed",
+            startedAt: sampleStart,
+            tokenCountMethod: method,
+            calibrationReason: reason,
+            promptTokens,
+            completionTokens: completion,
+            cachedTokens: result?.usage.cachedTokens ?? null,
+            prefillTokS:
+              timings?.promptPerSecond ??
+              (result?.firstTokenMs && promptTokens
+                ? promptTokens / (result.firstTokenMs / 1000)
+                : null),
+            decodeTokS:
+              timings?.predictedPerSecond ?? (completion ? completion / (decodeMs / 1000) : null),
+            ttftMs: result?.ttfbMs ?? null,
+            wallMs: result ? Math.round(result.wallMs) : Date.now() - sampleStart,
+            finishReason: result?.finishReason ?? null,
+            output: result?.output.slice(0, 2000) ?? "",
+            peakGpuMemory: usage.peakGpuMemory,
+            peakRam: usage.peakRam,
+            minGpuMemoryFree: usage.minGpuMemoryFree,
+            resourceSamples: usage.count,
+            draftAccept:
+              draftN !== null && draftN > 0 && draftHits !== null ? draftHits / draftN : null,
+            error: failure,
+          });
+          sync();
+          if (cancelled) {
+            stopReason = "cancelled";
+            stop = true;
+            break;
+          }
+          if (failure && opts.stopOnError) {
+            stopReason = "error";
+            stop = true;
+            break;
+          }
+        }
+        if (stop) break;
+      }
+      const finishedAt = Date.now();
+      const failed = samples.some((s) => s.state === "failed");
+      const report: ContextBenchmarkReport = {
+        schemaVersion: 3,
+        id: `${finishedAt.toString(36)}-${samples.length}`,
+        model,
+        maxContext,
+        options: opts,
+        samples,
+        skipped,
+        state: stopReason === "cancelled" ? "cancelled" : failed ? "failed" : "completed",
+        stopReason,
+        startedAt,
+        finishedAt,
+        elapsedMs: finishedAt - startedAt,
+      };
+      set({
+        contextBench: {
+          ...get().contextBench,
+          running: false,
+          currentTier: null,
+          // 上游最多留 20 份报告
+          history: saveBenchHistory([report, ...get().contextBench.history]),
+          selectedId: report.id,
+        },
+      });
+    } catch (err) {
+      const message = errText(err);
+      const cancelled = controller.signal.aborted;
+      set({
+        contextBench: {
+          ...get().contextBench,
+          running: false,
+          currentTier: null,
+          error: cancelled ? null : message,
+        },
+      });
+      // 用户自己点的取消不算错误，不弹提示
+      if (!cancelled) set({ error: `上下文档位压测失败：${message}` });
+    } finally {
+      benchAbort = null;
+    }
+  },
+
+
+  cancelContextBench() {
+    benchAbort?.abort();
+  },
+
+  clearContextBench(id) {
+    const bench = get().contextBench;
+    // 「清空」= 删掉当前这一份记录（用户 m13216 第 3 点：只清屏不删记录，下拉里还留着它），
+    // 删完 selectedId 置空，组件自然回落到这个模型剩下的最近一份；没有剩的就显示空表。
+    const history = id ? bench.history.filter((r) => r.id !== id) : bench.history;
+    saveBenchHistory(history);
+    set({
+      contextBench: {
+        ...bench,
+        currentTier: null,
+        completed: 0,
+        failed: 0,
+        cancelled: 0,
+        total: 0,
+        startedAt: null,
+        samples: [],
+        selectedId: null,
+        history,
+        error: null,
+      },
+    });
+  },
+
+  selectContextBench(id) {
+    set({ contextBench: { ...get().contextBench, selectedId: id } });
+  },
+
+  async runScenarioBench(model, options) {
+    if (get().scenarioBench.running) return;
+    const port = get().strataStatus.proxy_port ?? 9090;
+    const opts: ScenarioBenchOptions = { ...DEFAULT_SCENARIO_BENCH_OPTIONS, ...options };
+    const controller = new AbortController();
+    scenarioAbort = controller;
+
+    const samples: ScenarioSample[] = [];
+    const startedAt = Date.now();
+    // 每跑完一条就同步一次，不必等全部结束才看得到结果
+    const sync = (patch?: Partial<ScenarioBenchState>): void => {
+      let completed = 0;
+      let failed = 0;
+      let cancelled = 0;
+      for (const s of samples) {
+        if (s.warmup) continue;
+        if (s.state === "completed") completed += 1;
+        else if (s.state === "failed") failed += 1;
+        else cancelled += 1;
+      }
+      set({ scenarioBench: { ...get().scenarioBench, completed, failed, cancelled, ...patch } });
+    };
+
+    set({
+      scenarioBench: {
+        ...get().scenarioBench,
+        running: true,
+        current: null,
+        completed: 0,
+        failed: 0,
+        cancelled: 0,
+        total: 0,
+        startedAt,
+        samples: [],
+        error: null,
+      },
+    });
+
+    let stopReason: ScenarioBenchReport["stopReason"] = "completed";
+
+    try {
+      validateScenarioBenchOptions(opts);
+      const total = estimateScenarioRequests(opts);
+      set({ scenarioBench: { ...get().scenarioBench, total } });
+
+      // 多轮对话要把之前每轮的问答带上（上游 conversation 场景的同一做法）
+      const conversation: ChatMessage[] = [];
+      let stop = false;
+      // 重复模式：整轮都用第一轮的输入，才测得出前缀缓存
+      const fixedRound = 1;
+
+      for (const scenario of opts.scenarios) {
+        if (stop) break;
+        const rounds = opts.rounds;
+        const turns = scenario === "conversation" ? opts.conversationTurns : 1;
+        // 热身：每个场景先空跑一次，不进汇总
+        const passes = opts.warmup ? 2 : 1;
+        for (let pass = 0; pass < passes && !stop; pass += 1) {
+          const warmup = opts.warmup && pass === 0;
+          for (let round = 1; round <= rounds && !stop; round += 1) {
+            const useRound = opts.mode === "repeat" ? fixedRound : round;
+            for (let turn = 1; turn <= turns; turn += 1) {
+              if (controller.signal.aborted) {
+                stopReason = "cancelled";
+                stop = true;
+                break;
+              }
+              set({
+                scenarioBench: {
+                  ...get().scenarioBench,
+                  current: {
+                    scenario,
+                    round: useRound,
+                    total: plannedPerScenario(opts, scenario),
+                  },
+                },
+              });
+              const messages = scenarioMessages(scenario, opts, useRound, turn, conversation);
+              const sampleStart = Date.now();
+              let result: ChatStreamResult | null = null;
+              let failure: string | undefined;
+              try {
+                result = await streamChat({
+                  port,
+                  model,
+                  messages,
+                  maxTokens: opts.maxTokens,
+                  temperature: 0,
+                  timeoutMs: opts.timeoutMs,
+                  signal: controller.signal,
+                });
+              } catch (err) {
+                failure = errText(err);
+              }
+              const cancelled = controller.signal.aborted;
+              const sample: ScenarioSample = {
+                index: samples.length,
+                scenario,
+                warmup,
+                turn,
+                state: failure ? (cancelled ? "cancelled" : "failed") : "completed",
+                startedAt: sampleStart,
+                ttftMs: result?.ttfbMs ?? null,
+                wallMs: result?.wallMs ?? Math.max(0, Date.now() - sampleStart),
+                promptTokens: result?.usage.promptTokens ?? null,
+                completionTokens: result?.usage.completionTokens ?? null,
+                cachedTokens: result?.usage.cachedTokens ?? null,
+                // 速度一律用 llama.cpp 自己报的 timings（纯计算时间，不含排队与转发）
+                prefillTokS: result?.timings?.promptPerSecond ?? null,
+                decodeTokS: result?.timings?.predictedPerSecond ?? null,
+                finishReason: result?.finishReason ?? null,
+                output: result?.output.slice(0, 2000) ?? "",
+                error: failure,
+              };
+              samples.push(sample);
+              // 多轮对话：把本轮的问答接进去，下一轮才有上下文
+              if (scenario === "conversation" && result && !failure) {
+                conversation.push(...messages);
+                conversation.push({ role: "assistant", content: result.output });
+              }
+              sync();
+              if (cancelled) {
+                stopReason = "cancelled";
+                stop = true;
+                break;
+              }
+              if (failure && !warmup && opts.stopOnError) {
+                stopReason = "error";
+                stop = true;
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      const finishedAt = Date.now();
+      const failed = samples.some((s) => s.state === "failed");
+      const report: ScenarioBenchReport = {
+        schemaVersion: 1,
+        id: `${finishedAt.toString(36)}-${samples.length}`,
+        model,
+        options: opts,
+        samples,
+        state: stopReason === "cancelled" ? "cancelled" : failed ? "failed" : "completed",
+        stopReason,
+        startedAt,
+        finishedAt,
+        elapsedMs: finishedAt - startedAt,
+      };
+      set({
+        scenarioBench: {
+          ...get().scenarioBench,
+          running: false,
+          current: null,
+          samples,
+          history: saveScenarioHistory([report, ...get().scenarioBench.history]),
+          selectedId: report.id,
+        },
+      });
+    } catch (err) {
+      const message = errText(err);
+      const cancelled = controller.signal.aborted;
+      set({
+        scenarioBench: {
+          ...get().scenarioBench,
+          running: false,
+          current: null,
+          samples,
+          // 用户自己点的取消不算错误，不弹提示
+          error: cancelled ? null : `场景测试失败：${message}`,
+        },
+      });
+    } finally {
+      scenarioAbort = null;
+    }
+  },
+
+  cancelScenarioBench() {
+    scenarioAbort?.abort();
+  },
+
+  clearScenarioBench(id) {
+    const bench = get().scenarioBench;
+    const history =
+      id === undefined
+        ? bench.history
+        : saveScenarioHistory(bench.history.filter((r) => r.id !== id));
+    set({
+      scenarioBench: {
+        running: bench.running,
+        current: null,
+        completed: 0,
+        failed: 0,
+        cancelled: 0,
+        total: 0,
+        startedAt: null,
+        samples: [],
+        selectedId: null,
+        history,
+        error: null,
+      },
+    });
+  },
+
+  selectScenarioBench(id) {
+    set({ scenarioBench: { ...get().scenarioBench, selectedId: id } });
+  },
+
+  async runLadder(model, slots) {
+    if (get().ladder.running) return;
+    const port = get().strataStatus.proxy_port ?? 9090;
+
+    // 槽数决定压到第几级：llama.cpp `/props` 的 `total_slots`（`--parallel` 决定的）。
+    // 这是「点开始」时才问的 —— 它会把模型拉起来，但那本来就是要跑的（用户 m11407 只禁「选模型就加载」）。
+    let slotCount = slots ?? null;
+    if (slotCount === null) {
+      try {
+        slotCount = (await fetchChatModelProps(port, model)).totalSlots;
+      } catch {
+        slotCount = null;
+      }
+    }
+    const levels = ladderLevels(slotCount ?? 4);
+
+    const controller = new AbortController();
+    ladderAbort = controller;
+    const samples: LadderSample[] = [];
+    const startedAt = Date.now();
+
+    const sync = (): void => {
+      let completed = 0;
+      let failed = 0;
+      for (const s of samples) {
+        if (s.state === "completed") completed += 1;
+        else if (s.state === "failed") failed += 1;
+      }
+      set({ ladder: { ...get().ladder, completed, failed } });
+    };
+
+    set({
+      ladder: {
+        ...get().ladder,
+        running: true,
+        stage: 0,
+        concurrency: 0,
+        levels,
+        slots: slotCount,
+        completed: 0,
+        failed: 0,
+        startedAt,
+        samples: [],
+        error: null,
+      },
+    });
+
+    // 阶梯的每题都用「长输出」场景：256 token 的持续生成最能反映并发下的产出
+    const ladderOptions: ScenarioBenchOptions = {
+      ...DEFAULT_SCENARIO_BENCH_OPTIONS,
+      scenarios: ["decode"],
+      mode: "unique",
+    };
+    let seq = 0;
+
+    const runOne = async (stage: number, concurrency: number): Promise<void> => {
+      const round = (seq += 1);
+      const sampleStart = Date.now();
+      let result: ChatStreamResult | null = null;
+      let failure: string | undefined;
+      try {
+        result = await streamChat({
+          port,
+          model,
+          messages: scenarioMessages("decode", ladderOptions, round, 1, []),
+          maxTokens: 256,
+          temperature: 0,
+          timeoutMs: 180_000,
+          signal: controller.signal,
+        });
+      } catch (err) {
+        failure = errText(err);
+      }
+      const cancelled = controller.signal.aborted;
+      samples.push({
+        stage,
+        concurrency,
+        state: failure ? (cancelled ? "cancelled" : "failed") : "completed",
+        startedAt: sampleStart,
+        wallMs: result?.wallMs ?? Math.max(0, Date.now() - sampleStart),
+        ttftMs: result?.ttfbMs ?? null,
+        completionTokens: result?.usage.completionTokens ?? null,
+        decodeTokS: result?.timings?.predictedPerSecond ?? null,
+        error: failure,
+      });
+      sync();
+      set({ ladder: { ...get().ladder, samples: [...samples] } });
+    };
+
+    try {
+      for (let i = 0; i < levels.length; i += 1) {
+        if (controller.signal.aborted) break;
+        const stage = i + 1;
+        const concurrency = levels[i];
+        set({ ladder: { ...get().ladder, stage, concurrency } });
+        const stageEnd = Date.now() + LADDER_STAGE_MS;
+        const inflight = new Set<Promise<void>>();
+        const spawn = (): void => {
+          const task = runOne(stage, concurrency).finally(() => inflight.delete(task));
+          inflight.add(task);
+        };
+        // 固定时长内一直保持 N 个在飞：完成一个立刻补一个
+        while (Date.now() < stageEnd && !controller.signal.aborted) {
+          while (inflight.size < concurrency) spawn();
+          if (inflight.size === 0) break;
+          await Promise.race(inflight);
+        }
+        // 到点了：这一批还挂着的请求属于本级，等它们收尾再进下一级
+        await Promise.all(inflight);
+      }
+
+      const finishedAt = Date.now();
+      const rows = ladderRowsFromSamples(samples);
+      const conclusion = ladderConclusion(rows);
+      const run: LadderRun = {
+        id: `${finishedAt.toString(36)}-${samples.length}`,
+        model,
+        slots: slotCount,
+        levels,
+        rows,
+        samples,
+        conclusion,
+        startedAt,
+        finishedAt,
+        elapsedMs: finishedAt - startedAt,
+      };
+      set({
+        ladder: {
+          ...get().ladder,
+          running: false,
+          stage: 0,
+          concurrency: 0,
+          samples,
+          history: saveLadderHistory([run, ...get().ladder.history]),
+          selectedId: run.id,
+        },
+      });
+    } catch (err) {
+      const cancelled = controller.signal.aborted;
+      set({
+        ladder: {
+          ...get().ladder,
+          running: false,
+          stage: 0,
+          concurrency: 0,
+          samples,
+          // 用户自己点的停止不算错误
+          error: cancelled ? null : `并发阶梯失败：${errText(err)}`,
+        },
+      });
+    } finally {
+      ladderAbort = null;
+    }
+  },
+
+  cancelLadder() {
+    ladderAbort?.abort();
+  },
+
+  clearLadder(id) {
+    const state = get().ladder;
+    const history =
+      id === undefined ? state.history : saveLadderHistory(state.history.filter((r) => r.id !== id));
+    set({
+      ladder: {
+        running: state.running,
+        stage: 0,
+        concurrency: 0,
+        levels: state.levels,
+        slots: state.slots,
+        completed: 0,
+        failed: 0,
+        startedAt: null,
+        samples: [],
+        history,
+        selectedId: null,
+        error: null,
+      },
+    });
+  },
+
+  selectLadder(id) {
+    set({ ladder: { ...get().ladder, selectedId: id } });
+  },
+
+  async sendChat() {
+    const state = get().chat;
+    if (state.streaming) return;
+    const draft = state.draft.trim();
+    if (!draft && state.attachments.length === 0) return;
+
+    // 模型：采样选项里选的那个，但它必须**仍在运行**，否则退回已加载的第一个。
+    // 判据要与输入框的显示（ChatPanel 的 activeModel）完全一致 —— 只认持久化值会出现
+    // 「输入框显示 Sharp、请求打的是上次记住的另一个模型」：前门按请求体点名换模型，
+    // 用户看到的就是模型自己乱换（用户 m01516）。
+    const loaded = get()
+      .routerModels.filter((m) => m.status.value === "loaded")
+      .map((m) => m.id)
+      .sort((a, b) => a.localeCompare(b));
+    const remembered = state.options.model.trim();
+    const model = remembered && loaded.includes(remembered) ? remembered : loaded[0] || "";
+
+    if (!model) {
+      set({ chat: { ...state, error: "还没有可用的模型，请先在模型页加载一个" } });
+      return;
+    }
+
+    // 会话：没有就新建一份，标题取首句前 42 字
+    const now = Date.now();
+    const existing = state.conversations.find((c) => c.id === state.activeId);
+    const conversationId = existing?.id ?? newId();
+    const user: ChatTurn = {
+      id: newId(),
+      role: "user",
+      content: draft,
+      attachments: state.attachments.length ? [...state.attachments] : undefined,
+      createdAt: now,
+    };
+    const assistant: ChatTurn = {
+      id: newId(),
+      role: "assistant",
+      content: "",
+      createdAt: now,
+      execution: newChatExecution(newId()),
+    };
+    const previous = existing?.messages ?? [];
+
+    const base: Conversation = existing ?? {
+      id: conversationId,
+      model,
+      title: conversationTitle(draft, state.attachments[0]?.name),
+      messages: [],
+      createdAt: now,
+      updatedAt: now,
+    };
+    const withTurn: Conversation = {
+      ...base,
+      model,
+      messages: [...previous, user, assistant],
+      updatedAt: now,
+    };
+    set({
+      chat: {
+        ...state,
+        conversations: saveConversations([
+          withTurn,
+          ...state.conversations.filter((c) => c.id !== conversationId),
+        ]),
+        activeId: conversationId,
+        draft: "",
+        attachments: [],
+        streaming: true,
+        options: { ...state.options, model },
+        error: null,
+      },
+    });
+
+    const controller = new AbortController();
+    chatAbort = controller;
+    const started = performance.now();
+    let firstTokenMs: number | undefined;
+    let reasoningStartedAt: number | undefined;
+    let reasoningMs: number | undefined;
+
+
+    /** 只改这一条助手消息（其余会话原样） */
+    const patchAssistant = (patch: (message: ChatTurn) => ChatTurn) => {
+      const current = get().chat;
+      const list = current.conversations.map((item) =>
+        item.id === conversationId
+          ? {
+              ...item,
+              updatedAt: Date.now(),
+              messages: item.messages.map((m) => (m.id === assistant.id ? patch(m) : m)),
+            }
+          : item,
+      );
+      set({ chat: { ...current, conversations: list } });
+    };
+
+    /** 跑一次工具调用，把结果整理成喂回模型的文本 */
+    const runTool = async (
+      call: ToolCall,
+    ): Promise<{ text: string; ok: boolean; note?: string }> => {
+      const args = parseToolArguments(call.arguments);
+      if (call.name === "web_search") {
+        const query = typeof args.query === "string" ? args.query.trim() : "";
+        if (!query) return { text: "搜索词是空的", ok: false };
+        const limit = typeof args.limit === "number" ? args.limit : undefined;
+        try {
+          // 走后端的多引擎搜索（`src-tauri/src/search.rs`）：前端不再自己拼结果，
+          // 拿回来的是已经包好「不可信网页内容」边界的整段文本
+          const result = await ipc.searchQuery(query, limit);
+          // 卡片上写清实际用的引擎、以及哪些引擎被跳过（失败原因），
+          // 否则用户只看到「用了 Tavily」，没法知道排前面的 AnySearch 为什么没上
+          const skipped = result.attempts
+            .filter((item) => item.engine !== result.engine)
+            .map((item) => `${item.engine}（${item.error ?? "跳过"}）`)
+            .join("、");
+          const note = skipped
+            ? `${result.engine} · 跳过 ${skipped}`
+            : `${result.engine}${result.cached ? " · 缓存" : ""}`;
+          if (result.hits.length === 0) return { text: "没有搜到结果", ok: false, note };
+          return { text: result.block, ok: true, note };
+        } catch (error) {
+          return { text: errText(error), ok: false };
+        }
+      }
+      if (call.name === "web_fetch") {
+        const url = typeof args.url === "string" ? args.url.trim() : "";
+        if (!url) return { text: "url 是空的", ok: false };
+        const maxChars = typeof args.maxChars === "number" ? args.maxChars : undefined;
+        try {
+          // 后端用系统 curl 抓回来、抽成正文并包好「不可信网页内容」边界
+          const page = await ipc.webFetch(url, maxChars);
+          const host = page.finalUrl.replace(/^https?:\/\//, "").split("/")[0];
+          const tail = page.truncated ? " · 已截断" : "";
+          const note = `${host} · ${page.chars} 字符${tail}${page.note ? ` · ${page.note}` : ""}`;
+          return { text: page.block, ok: true, note };
+        } catch (error) {
+          return { text: errText(error), ok: false };
+        }
+      }
+      if (isMcpTool(call.name)) {
+        // 工具名只能反查回「哪台服务器的哪个工具」—— 服务器列表改过之后旧名字就失效了
+        const target = get().mcpTools.find((item) => item.key === call.name);
+        if (!target) {
+          return { text: `找不到工具 ${call.name}，MCP 服务器可能改过了，请在聊天设置里重新检测`, ok: false };
+        }
+        try {
+          const text = await ipc.mcpCallTool(target.server, target.name, args);
+          return { text, ok: true, note: `${target.server} · ${target.name}` };
+        } catch (error) {
+          return { text: errText(error), ok: false, note: `${target.server} · ${target.name}` };
+        }
+      }
+      return { text: `未知工具：${call.name}`, ok: false };
+    };
+
+    try {
+      // MCP 工具要现拉：首次打开开关、或刚保存过服务器配置时，store 里还是空的
+      let mcpTools = get().mcpTools;
+      if (state.options.mcpTools && mcpTools.length === 0) {
+        const view = await get().refreshMcpTools();
+        mcpTools = view?.tools ?? [];
+      }
+      const tools = buildToolSpecs(state.options.webSearch, mcpTools);
+      // 模型可以连续要工具：每要一次就执行、回填，再要一次，最多 5 轮（防死循环）
+      let history = [...previous.filter((m) => !m.error), user];
+      let calls: ToolCall[] = [];
+      /** 本轮回答的正文（含工具轮之间的过渡文字），用来判断要不要收尾 */
+      let answer = "";
+      /** 本次发送里已经搜过的关键词，用来挡掉重复搜索 */
+      const searched = new Set<string>();
+      /** 本次发送里已经读过的网页，用来挡掉重复抓取 */
+      const fetched = new Set<string>();
+      const onDelta = (delta: ChatDelta) => {
+        if (delta.reasoning && reasoningStartedAt === undefined) reasoningStartedAt = performance.now();
+        if (delta.content) {
+          answer += delta.content;
+          if (firstTokenMs === undefined) {
+            firstTokenMs = performance.now() - started;
+            if (reasoningStartedAt !== undefined) reasoningMs = performance.now() - reasoningStartedAt;
+          }
+        }
+        if (delta.toolCalls) calls = mergeToolCallFragments(calls, delta.toolCalls);
+        patchAssistant((message) => {
+          const next: ChatTurn = {
+            ...message,
+            content: message.content + (delta.content ?? ""),
+            reasoning: (message.reasoning ?? "") + (delta.reasoning ?? ""),
+            execution: advanceChatExecution(message.execution ?? assistant.execution!, delta),
+          };
+          if (delta.usage) next.usage = { ...message.usage, ...delta.usage };
+          if (delta.timings) {
+            next.speed = { ...message.speed, ...delta.timings };
+            // 底部状态栏的速度/上下文取自最近一次请求（用户 m05241 照搬上游的口径）。
+            set({
+              lastTurn: {
+                at: Date.now(),
+                promptTokens: next.usage?.prompt_tokens ?? null,
+                outputTokens: next.usage?.completion_tokens ?? null,
+                decodeTokS: next.speed?.decodeTokS ?? null,
+                prefillTokS: next.speed?.prefillTokS ?? null,
+              },
+            });
+
+          }
+          if (delta.error) next.error = delta.error;
+          return next;
+        });
+      };
+      const port = get().strataStatus.proxy_port ?? 9090;
+      for (let round = 0; round < 5; round += 1) {
+        if (controller.signal.aborted) break;
+        calls = [];
+        await streamChatTurn(port, buildChatRequest(history, { ...state.options, model }, false, tools), onDelta, controller.signal);
+        // 没有工具调用就结束了
+        if (calls.length === 0 || controller.signal.aborted) break;
+
+        // 先把「要调用什么」画出来（状态 running），再一个个执行
+        for (const call of calls) {
+          const args = parseToolArguments(call.arguments);
+          patchAssistant((message) => ({
+            ...message,
+            tools: [
+              ...(message.tools ?? []),
+              {
+                id: call.id,
+                name: call.name,
+                status: "running",
+                arguments: args,
+                result: null,
+                // 卡片插在这一轮正文之后（`at` 是字符下标，见 ChatMessageView）
+                at: message.content.length,
+              },
+            ],
+          }));
+        }
+
+        const results: ChatTurn[] = [];
+        for (const call of calls) {
+          // 同一个搜索词第二次直接挡掉：模型会反复搜同一句，五轮全耗在这上面，
+          // 结果一样还占满上下文（用户 m07347 截图里 5 张卡片同一个 query）
+          const callArgs = parseToolArguments(call.arguments);
+          const asked = typeof callArgs.query === "string" ? callArgs.query.trim() : "";
+          const target = typeof callArgs.url === "string" ? callArgs.url.trim() : "";
+          const repeated =
+            (call.name === "web_search" && asked !== "" && searched.has(asked)) ||
+            (call.name === "web_fetch" && target !== "" && fetched.has(target));
+          const outcome = repeated
+            ? {
+                text:
+                  call.name === "web_fetch"
+                    ? `已经读过 ${target}，正文就在上面的工具结果里。请直接基于已有资料回答，不要再重复抓取。`
+                    : `已经搜过「${asked}」，结果就在上面的工具结果里。请直接基于已有资料回答，不要再重复搜索。`,
+                ok: true,
+                note: "重复调用已跳过",
+              }
+            : await runTool(call);
+          if (call.name === "web_search" && asked !== "" && !repeated) searched.add(asked);
+          if (call.name === "web_fetch" && target !== "" && !repeated) fetched.add(target);
+          patchAssistant((message) => ({
+            ...message,
+            tools: (message.tools ?? []).map((item) =>
+              item.id === call.id
+                ? {
+                    ...item,
+                    status: outcome.ok ? "done" : "error",
+                    result: outcome.text,
+                    ok: outcome.ok,
+                    note: outcome.note,
+                  }
+                : item,
+            ),
+          }));
+          results.push({
+            id: newId(),
+            role: "tool",
+            content: outcome.text,
+            createdAt: Date.now(),
+            toolCallId: call.id,
+          });
+        }
+
+        // 模型需要看到自己刚发出的工具调用，才能把结果对上去
+        history = [
+          ...history,
+          { id: newId(), role: "assistant", content: "", createdAt: Date.now(), toolCalls: calls },
+          ...results,
+        ];
+      }
+
+      // 轮次用尽还在要工具时，正文是空的 —— 再发一次「不许再调工具」的收尾请求，
+      // 否则界面上只有一串工具卡片、没有答案（用户 m07347「没有回答」）
+      if (!controller.signal.aborted && answer.trim() === "") {
+        calls = [];
+        await streamChatTurn(
+          port,
+          buildChatRequest(
+            [
+              ...history,
+              {
+                id: newId(),
+                role: "user",
+                content: "工具调用次数已经用完了。请直接根据上面拿到的资料回答问题，不要再调用任何工具。",
+                createdAt: Date.now(),
+              },
+            ],
+            { ...state.options, model },
+            false,
+            [],
+          ),
+          onDelta,
+          controller.signal,
+        );
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        // 开了联网搜索 / MCP 工具却报 tools 相关错误，多半是模型的 chat template 不认工具调用
+        const hint =
+          state.options.webSearch || state.options.mcpTools
+            ? "\n（提示：如果上面说 tools 不受支持，是这个模型的 chat template 不支持工具调用 —— 关掉「联网搜索」和「MCP 工具」，或在模型参数里加 --jinja）"
+            : "";
+        patchAssistant((message) => ({ ...message, error: errText(error) + hint }));
+      }
+    } finally {
+      patchAssistant((message) => ({
+        ...message,
+        execution: finishChatExecution(
+          message.execution ?? assistant.execution!,
+          controller.signal.aborted,
+          Boolean(message.error),
+        ),
+        elapsedMs: performance.now() - started,
+        firstTokenMs,
+        reasoningMs: reasoningMs ?? (reasoningStartedAt === undefined ? undefined : performance.now() - reasoningStartedAt),
+        stopped: controller.signal.aborted,
+      }));
+      chatAbort = null;
+      const after = get().chat;
+      // 追加一行「最近请求」（监控页 req-card）。失败也记 —— 上游那列有「失败」状态。
+      const elapsedMs = performance.now() - started;
+      // 数据从这条助手消息本身读（闭包里攒的变量在收尾处会被 TS 收窄成 null）。
+      const finished = after.conversations
+        .find((item) => item.id === conversationId)
+        ?.messages.at(-1);
+      const failed = Boolean(finished?.error);
+      const row: RecentTurn = {
+        id: newId(),
+        model,
+        at: Date.now(),
+        promptTokens: finished?.usage?.prompt_tokens ?? null,
+        outputTokens: finished?.usage?.completion_tokens ?? null,
+        decodeTokS: finished?.speed?.decodeTokS ?? null,
+        prefillTokS: finished?.speed?.prefillTokS ?? null,
+        cacheTokens: finished?.speed?.cacheTokens ?? null,
+        elapsedMs: controller.signal.aborted ? null : elapsedMs,
+        ok: !failed,
+        error: failed ? finished?.error ?? "请求失败" : null,
+      };
+      set({
+        chat: {
+          ...after,
+          streaming: false,
+          conversations: saveConversations(after.conversations),
+        },
+        recentTurns: [row, ...get().recentTurns].slice(0, RECENT_TURN_LIMIT),
+      });
+    }
+  },
+
+  stopChat() {
+    chatAbort?.abort();
+  },
+
+  newConversation() {
+    const state = get().chat;
+    set({ chat: { ...state, activeId: null, draft: "", attachments: [], error: null } });
+  },
+
+  selectConversation(id) {
+    const state = get().chat;
+    set({ chat: { ...state, activeId: id, draft: "", attachments: [], error: null } });
+  },
+
+  renameConversation(id, title) {
+    const state = get().chat;
+    const clean = title.trim();
+    if (!clean) return;
+    set({
+      chat: {
+        ...state,
+        conversations: saveConversations(
+          state.conversations.map((item) =>
+            item.id === id ? { ...item, title: clean, updatedAt: Date.now() } : item,
+          ),
+        ),
+      },
+    });
+  },
+
+  deleteConversation(id) {
+    const state = get().chat;
+    set({
+      chat: {
+        ...state,
+        conversations: saveConversations(state.conversations.filter((item) => item.id !== id)),
+        activeId: state.activeId === id ? null : state.activeId,
+      },
+    });
+  },
+
+  setChatDraft(value) {
+    set({ chat: { ...get().chat, draft: value } });
+  },
+
+  async addChatAttachments(files) {
+    const added: ChatAttachment[] = [];
+    const problems: string[] = [];
+    for (const file of files) {
+      if (file.size > 20e6) {
+        problems.push(`${file.name}: 单个附件不能超过 20 MB`);
+        continue;
+      }
+      if (/^image\/(png|jpeg|webp|gif)$/i.test(file.type)) {
+        const content = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result));
+          reader.onerror = () => reject(new Error(`${file.name} 读取失败`));
+          reader.readAsDataURL(file);
+        });
+        added.push({ id: newId(), name: file.name, type: "image", mimeType: file.type, content });
+      } else if (
+        file.type.startsWith("text/") ||
+        /\.(txt|md|json|csv|tsv|xml|yaml|yml|py|js|ts|tsx|jsx|html|css|log|sql|sh|ps1|c|cpp|h|rs)$/i.test(file.name)
+      ) {
+        if (file.size > 512 * 1024) {
+          problems.push(`${file.name}: 文本附件不能超过 512 KB`);
+          continue;
+        }
+        added.push({
+          id: newId(),
+          name: file.name,
+          type: "text",
+          mimeType: file.type || "text/plain",
+          content: await file.text(),
+        });
+      } else {
+        problems.push(`${file.name}: 只支持文本文件和 png/jpeg/webp/gif 图片`);
+      }
+    }
+    const state = get().chat;
+    set({
+      chat: {
+        ...state,
+        attachments: [...state.attachments, ...added],
+        error: problems.length ? problems.join("；") : state.error,
+      },
+    });
+  },
+
+  removeChatAttachment(id) {
+    const state = get().chat;
+    set({ chat: { ...state, attachments: state.attachments.filter((file) => file.id !== id) } });
+  },
+
+  setChatOptions(patch) {
+    const state = get().chat;
+    const options = normalizeChatOptions({ ...state.options, ...patch });
+    saveChatOptions(options);
+    set({ chat: { ...state, options } });
+  },
+
+  dismissChatError() {
+    set({ chat: { ...get().chat, error: null } });
+  },
+
+  /** 抓一次采集快照；状态栏 1 秒调一次，失败就把 metric 置空（界面显示「监控不可用」）。 */
+  async refreshMonitor() {
+    try {
+      const snapshot = await monitorSample();
+      // 每秒推一个速度点，给监控页的速度折线兜底（只在生成时有值，与上游 history.tok_s 语义一致）
+      const turn = get().lastTurn;
+      const streaming = get().chat.streaming;
+      const prev = get().speedSeries;
+      const push = (list: (number | null)[], value: number | null) => [...list, value].slice(-60);
+      set({
+        monitor: snapshot,
+        monitorAt: snapshot.now.at,
+        speedSeries: {
+          tokS: push(prev.tokS, streaming ? (turn?.decodeTokS ?? null) : null),
+          prefillTokS: push(prev.prefillTokS, turn?.prefillTokS ?? null),
+        },
+      });
+    } catch (error) {
+      reportFrontendError("warn", `刷新监控失败：${errText(error)}`);
+      set({ monitor: null, monitorAt: 0 });
+    }
+  },
+
+  async refreshMcpServers() {
+    try {
+      const servers = await ipc.mcpServers();
+      set({ mcpServers: servers });
+      return servers;
+    } catch (error) {
+      reportFrontendError("warn", `读取 MCP 配置失败：${errText(error)}`);
+      throw error;
+    }
+  },
+
+  async saveMcpServers(next) {
+    // 后端会停掉所有已启动的进程（命令改了必须重连才生效），所以这里顺手把工具清空，
+    // 免得聊天页还拿着一批已经走不通的工具名
+    const servers = await ipc.mcpSaveServers(next);
+    set({ mcpServers: servers, mcpTools: [], mcpError: null });
+  },
+
+  async refreshMcpTools() {
+    try {
+      const view = await ipc.mcpTools();
+      // 失败的服务器单独拼成一句：面板上要能看到「哪台起不来、为什么」
+      const failed = view.servers.filter((item) => !item.ok);
+      set({
+        mcpTools: view.tools,
+        mcpError: failed.length
+          ? failed.map((item) => `${item.name}：${item.error ?? "未知原因"}`).join("；")
+          : null,
+      });
+      return view;
+    } catch (error) {
+      reportFrontendError("warn", `拉取 MCP 工具失败：${errText(error)}`);
+      set({ mcpTools: [], mcpError: errText(error) });
+      return null;
+    }
+  },
 }));
 
-/** router 状态 → 端口（用于卡片显示） */
+/** 聊天页的取消句柄 */
+let chatAbort: AbortController | null = null;
+
+/** 压测的取消句柄：点「停止」时中断当前请求 */
+let benchAbort: AbortController | null = null;
+
+/** 场景测试的取消句柄 */
+let scenarioAbort: AbortController | null = null;
+
+/** 并发阶梯的取消句柄 */
+let ladderAbort: AbortController | null = null;
+
+/** 模型端口（卡片显示用）。前门合成的列表直接带 `port`，不再从 `status.args` 里解析。 */
 export function modelPort(model: RouterModel): number | null {
-  return portFromArgs(model.status.args);
+  return model.port ?? null;
 }
 
 /** 单行摘要：用于列表页标题栏 */

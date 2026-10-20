@@ -5,17 +5,21 @@
 > （Tauri 2 + Rust + React），并保留对其 `config/launch_config.json` 的迁移支持。
 > 上游以 **MIT** 许可发布，本项目的版权与许可声明见 [`LICENSE`](./LICENSE)。
 
-Tauri 2 桌面外壳，用 **llama.cpp 原生 router mode** 管理多个模型：不重复实现进程池 / LRU / 自动加载，
-只做「版本发现 + 进程管理 + 环境注入 + 日志 + 性能测试 + 托盘」。
+Tauri 2 桌面外壳，管理本机全部 llama.cpp 模型：统一入口（前门 ≥9090 一个端点）、模型扫描与配置（一个模型一份 JSON）、
+多模型驻留与容量闸、日志、原生聊天（联网搜索 / 读网页正文 / MCP 工具）、监控、性能测试、托盘。推理本身全部交给
+llama-server，GUI 只做进程管理、配置与观测。
 
 设计文档：
 
 - `HANDOVER.md` —— **交接说明**：llama.cpp 行为约束、代码地图、验证手段、坑与未决项（接手先读这份）
-- `REFACTORING_PLAN.md` —— 整体实施方案（v2.1，含 GPU 多卡与共享 CUDA 运行时）
-- `REFACTORING_REVIEW.md` —— 方案的真机实测审查（含 v1 被否掉的理由与全部实测证据）
-- `STRATA_INTEGRATION_PLAN.md` —— **Strata 第二运行时通道**：调研、方案与逐轮实现记录（已全部落地，§11 起是实现记录）
-- `KVMEM_INTEGRATION_PLAN.md` —— **kvmem 第二运行时通道**：调研与方案（**未实施**；与 Strata 通道同构，落地时复用同一套骨架）
-- `CODE_REVIEW.md` —— 全仓代码审查报告：分级问题清单、修复记录与遗留项
+- `docs/archive/ITERATION_LOG.md` —— 0.1.x → 0.2.0 的逐轮实现日志：每次改动的起因、实测证据、踩过的坑
+- `docs/archive/DECISIONS-2026-10.md` —— 2026-10 的关键决策与落地结果
+- `docs/archive/PROXY_SCHEDULER_PLAN.md` —— **前门调度与配置层**：统一入口、按请求停旧起新、容量策略、`config\llamacpp-<id>.json` 规格（已落地）
+- `docs/archive/STRATA_INTEGRATION_PLAN.md` —— **Strata 第二运行时通道**：调研、方案与逐轮实现记录（已全部落地，§11 起是实现记录）
+- `docs/archive/STRATA_MANAGER_PORT_ASSESSMENT.md` —— 上游 strata-manager 的能力移植评估（聊天 / 监控 / 压测，含 P1–P8 与决策记录）
+- `docs/archive/WEB_SEARCH_PLAN.md` —— 联网搜索方案：五引擎测速与选型、Rust 重写决策、`search.json` 规格
+- `docs/archive/UI_STYLE_BASELINE.md` —— 样式基座：Strata 色板 / 字体 / 图标与 S1–S8 实施分解（已落地，S4 已回退保留 FontAwesome）
+- 历史存档（**不要按里面的行号回查**）：`docs/archive/REFACTORING_PLAN.md`、`docs/archive/REFACTORING_REVIEW.md`（0.1.x 的 router + `presets.ini` 设计基线）、`docs/archive/CODE_REVIEW.md`（0.1.x 静态审查，多数已修）
 
 ---
 
@@ -30,6 +34,11 @@ Tauri 2 桌面外壳，用 **llama.cpp 原生 router mode** 管理多个模型�
 | **P5** | API 压测（原 `llama-bench` 面板已移除，见下方说明） | ✅ |
 | **P6** | 托盘常驻 + 开机自启 + 打包 | ✅ |
 | **P7** | Strata 第二运行时通道（引擎启停、模型选择、参数编辑、显存互斥、压测） | ✅ |
+| **P8** | 原生聊天（SSE + 联网搜索 + 读网页正文）与 MCP 工具接入（GUI 当 MCP 客户端） | ✅ |
+
+> 下面「P2 / P3 已实现的能力」是 0.1.x 时期的实现描述：**router mode 与 `presets.ini` 已在 0.2.0 退役**
+> （换成前门调度 + `config\llamacpp-<id>.json`，一个模型一份 JSON），扫模型、日志、进程生命周期这些能力仍在，
+> 只是配置载体变了。0.2.0 的现状以 `HANDOVER.md` 为准。
 
 P2 已实现的能力：
 
@@ -132,8 +141,32 @@ P7 已实现的能力（Strata 第二运行时通道）：
 - **脱离宿主节流**：拉起 Strata 引擎时给它加 `CREATE_BREAKAWAY_FROM_JOB`（`winfix::no_throttle`，
   见 `src-tauri/src/winfix.rs:183`），避免 GUI 被后台化时推理进程跟着被 Job Object 限速；
   父 Job 没开 `BREAKAWAY_OK` 时去掉该 flag 重试。
+- **MCP 工具接入**（2026-10-20，build135）：聊天设置里的「MCP 工具」开关打开后，GUI 按
+  `<配置目录>\mcp.json` 的清单以 **stdio 子进程**拉起 MCP 服务器，把它们的工具
+  （`mcp__<服务器>__<工具>`）与联网搜索一起放进 `tools` 数组；模型请求调用时由 GUI 执行
+  `tools/call`，再把文本结果作为 `role:"tool"` 消息喂回去。服务器清单在聊天设置弹层里编辑
+  （命令 / 参数 / 环境变量 / 启用），文件形状与 Cursor 的 `mcpServers` 一致。实现见
+  `src-tauri/src/mcp.rs`；不用 llama.cpp 自带的 `--mcp-servers-config`，因为那套工具在
+  `llama-server` 进程内部执行、GUI 看不到调用也管不了清单。
+- **网页正文抓取与全文搜索**（2026-10-20，build136）：联网搜索不再只给一两句摘要 ——
+  tavily / firecrawl / exa 都改成要整页正文（`include_raw_content` / `scrapeOptions.markdown` /
+  `contents.text`），单条上限 800 → 4 千字符、整轮预算 2.4 万字符；另新增聊天工具
+  `web_fetch(url)`，模型可以挑最相关的一条链接再读整页（`search.rs::fetch_page`：系统 curl 取
+  HTML → 去脚本/导航 → 优先只取 `<article>`/`<main>` → 纯文本，单页上限 1.2 万字符，同样包
+  `<untrusted-web-content>` 边界）。两者都跟着聊天设置里的「联网搜索」开关一起出现。
+  build137 又修了一层：「条数凑满」不再等于「够了」—— 默认排第一的 anysearch 只给 10 条、
+  每条一两百字符，以前它一装满 `limit` 就收工，后面能返回整页正文的引擎永远轮不到；现在
+  同 URL 留**正文更长**的那条，且平均每条的正文不到 800 字符就继续叠下一个引擎
+  （`search.rs::rich_enough`）。代价是每次搜索多打一个引擎，延迟多 1–2 秒。
 
-界面细节（按实机反馈调整过）：
+- **AnySearch 提取兜底**（2026-10-20，build138）：AnySearch 确实能提取网页正文，但那是
+  **独立端点** `POST /v1/extract`（`{"url": ...}` → markdown），`/v1/search` 没有取正文的参数
+  （它回的 `content` 仍是清洗过的片段）。现在 `web_fetch` 在自己用 curl 抓失败、或洗出来的
+  正文短于 400 字符时，会再请它提取一次，取正文更长的那份并在工具卡片上标「正文由 AnySearch
+  提取」。匿名可用（按 IP 限额）；它不做 JS 渲染，纯 SPA 也只给占位文本。
+
+界面细节（按实机反馈调整过；**侧栏已改为 模型 / 聊天 / 监控 / 性能测试 / 系统日志 / 设置 六页**，
+下列个别描述早于这次改版）：
 
 - **侧栏**：`模型列表 / 性能测试 / 运行环境 / Strata / 系统日志 / 设置` 六个页面，外加一个
   「开始聊天」按钮（不是页面，直接打开 llama.cpp 自带聊天界面）；底部把 router 状态与
@@ -246,6 +279,16 @@ cargo test
 沙箱内启动应用时 WebView2 起不来，窗口不会正常显示 —— 这不是应用本身的缺陷。
 打包产物请在资源管理器里双击运行验证。
 
+还有一处容易误判成「测试坏了」：沙箱会给 `%TEMP%` 下的目录写限制性 ACL / 低完整性标签，
+后端单测里有 20 来个用例要往 `%TEMP%\llamacpp-gui-*-test` 写文件，这时会成片报
+`拒绝访问 (os error 5)` 并连带断言失败（数值读回默认值）。**把 TEMP 指到工作区内再跑**即可，
+不需要改测试：
+
+```powershell
+$env:TEMP='E:\Code\llama.cpp-GUI\tmp\temp'; $env:TMP=$env:TEMP
+npm test          # 期望 119 passed / 8 ignored
+```
+
 ---
 
 ## 目录结构
@@ -285,7 +328,14 @@ cargo test
         ├── state.rs              # 共享状态
         ├── settings.rs           # settings.json 持久化
         ├── versions.rs           # 版本扫描 + --help 探测 + 共享 CUDA 匹配
-        ├── models.rs             # 模型递归扫描 + presets.ini 读写 + hub 配置迁移
+        ├── models.rs             # 模型递归扫描 + GGUF 元数据缓存 + hub 配置迁移
+        ├── model_config.rs       # 一个模型一份 JSON：读写/最小化写入/失效归档与恢复
+        ├── scheduler.rs          # 多模型驻留：容量闸、端口分配、启动参数组装、空闲卸载
+        ├── strata_proxy.rs       # 前门：一个端口挂全部 config，按请求体 model 停旧起新并转发
+        ├── strata.rs             # Strata 第二通道：引擎启停、/status 探测、显存互斥
+        ├── monitor.rs            # 硬件与引擎指标采集（sysinfo / NVML / PDH / Prometheus 文本）
+        ├── search.rs             # 联网搜索五引擎 + 网页正文抓取（web_fetch，AnySearch 兜底）
+        ├── mcp.rs                # MCP 客户端（stdio/NDJSON）：服务器管理、工具列表与调用
         ├── gpu.rs                # 设备枚举/校验 + GPU 参数组装 + 显存预估
         ├── bench.rs              # API 压测（Rust 侧并发）+ 记录落盘 + 硬件信息
         ├── http.rs               # 极简本机 HTTP 客户端（压测与空闲卸载共用）
@@ -293,23 +343,26 @@ cargo test
         ├── tray.rs               # 托盘图标/菜单/关闭隐藏
         ├── winfix.rs             # ASCII 链接、端口检测
         ├── paths.rs              # 配置目录解析（便携绿色版 / 回退 %APPDATA%）
-        └── router.rs             # router 生命周期 + 环境注入 + 日志采集
+        └── logs.rs               # 日志环形缓冲 + 批推 + 落盘 + 进程树强杀
 ```
 
 配置文件放在 **exe 同目录**（便携绿色版）：
 
 ```
 settings.json                 # 用户设置
-presets/presets.ini           # 交给 router 的原生 preset（P3 起由应用生成）
+config/llamacpp-<id>.json     # 一个模型一份配置（name/model/args/port/api_key…）
+config/.orphan/               # 模型文件消失后归档的 config（模型回来时恢复参数）
+logs/gui-<启动时间>.log       # 运行日志（超 8 MB 分卷，只留最近 12 个）
 runtime/                      # 非 ASCII 路径的链接目录
 webview/                      # WebView2 数据（localStorage / 缓存）
-bench/records.json            # API 压测记录
+bench/records.json            # API 压测记录（导出文本也在 bench/）
+mcp.json                      # MCP 服务器清单
+search.json                   # 联网搜索：引擎 key / order / 屏蔽域名 / 条数
 gguf-meta-cache.json          # gguf 元数据（架构/量化）缓存
 models-scan-cache.json        # 模型扫描缓存
-removed-preset-sections.json  # 失效 preset 段的归档
 ```
 
-> - 从把数据放在 `%APPDATA%\dev.llamacpp.gui\` 的旧版本升级上来**不会自动搬配置**（按全新安装处理，需要重设 llama.cpp 目录、模型目录与 preset）。
+> - 从把数据放在 `%APPDATA%\dev.llamacpp.gui\` 的旧版本升级上来**不会自动搬配置**（按全新安装处理，需要重设 llama.cpp 目录、模型目录与模型配置）。
 > - 装在 `C:\Program Files` 这类不可写位置时，自动退回 `%APPDATA%\dev.llamacpp.gui\`。
 > - 开发模式（`npm run tauri dev`）始终用 `%APPDATA%`，不会把配置写进 `target/debug`。
 > - 安装版同样走便携；**卸载时会询问是否同时删除这些用户数据**（默认"否"= 保留，重装到同一目录即可继续用）。
@@ -318,26 +371,25 @@ removed-preset-sections.json  # 失效 preset 段的归档
 
 ## 首次使用流程
 
-1. **设置 → llama.cpp 目录**：填 `E:\AI\llama.cpp-hub\llamacpp`，点「保存并扫描」
-   → 版本表会显示每个版本是否支持 router mode、是否匹配到共享 CUDA 运行时、路径是否纯 ASCII；设备表列出可用 GPU。
-2. **设置 → 模型根目录**：填 `E:\AI\models`，点「保存并扫描模型」→ 递归扫描出所有模型（含多模态与分片分组）。
-3. **模型管理 → 同步到 presets.ini**：把扫描到的模型写入 `presets.ini`（每个模型一段 `model = <绝对路径>`）。
-4. **顶部「启动」**：拉起 llama-server（router mode）。状态条会显示实际端口与 `http://127.0.0.1:<port>/v1`。
-5. **模型管理**：对任意模型点「启动/停止」；点「配置」调整该模型参数（保存后自动 `?reload=1` 生效）；
-   「详情」查看运行态量化/上下文/模态。
+1. **设置 → llama.cpp 目录**：填版本目录的根（如 `E:\AI\llamacpp`，下面是一层 `llama-bNNNNN-…`），点「保存并扫描」
+   → 版本表显示每个版本、共享 CUDA 匹配情况、路径是否纯 ASCII；设备表列出可用 GPU。
+2. **设置 → 模型根目录**：填模型所在目录，点「保存并扫描模型」→ 递归扫描（含多模态与分片分组），GGUF 元数据进缓存。
+3. **模型页 → 配置**：每张卡点「配置」写一份 `config\llamacpp-<id>.json`（一个模型一份；`name` 就是请求用的模型名）。
+4. **模型页 → 启动**：起该模型的子实例，端口由调度器从号段分配；容量闸按 `models_max`（默认 4）执行，满了先卸最久未用的。
+5. **前门**（侧栏左下的胶囊）是统一入口：默认 9090 一个端口挂全部 config，请求体里的 `model` 决定用哪个。
 
-> 实测确认：本机 17 个模型扫描 → 生成 preset → router 全部识别（段名含 `/` 与 `.` 均合法），
-> 并可直接用 `OpenBMB/MiniCPM5-2B` 这样的 id 发起 `/v1/chat/completions` 请求。
+> 聊天、监控、性能测试、日志各页按需用；聊天设置里可开「联网搜索」与「MCP 工具」，工具一律由 GUI 执行（llama.cpp 自己不联网）。
 
 ---
 
 ## 给 dsh 等客户端使用
 
-router 启动后直接提供 OpenAI 兼容端点（状态条会显示实际端口）：
+前门起来后就是一个 OpenAI 兼容端点：
 
 ```
-base_url = http://127.0.0.1:<port>/v1
-api_key  = 任意（除非在设置里配置了 --api-key）
+base_url = http://127.0.0.1:9090/v1     # 端口看侧栏前门胶囊 / 设置里的「前门端口」
+api_key  = 配置里设的 key（没设就不带）
 ```
 
-`GET /v1/models` 会列出全部模型（含未加载的），首次请求会自动加载对应模型。
+`GET /v1/models` 列出全部 config 的 `name`（含未加载的），首次请求会自动拉起对应模型（冷启动约 3–6 秒）。
+配了 key 时除 `/health` 全要鉴权，且**只认请求头**（`Authorization: Bearer` / `x-api-key`），SSE 不能用 `EventSource`。

@@ -3,6 +3,9 @@ node_modules/
 dist/
 src-tauri/target/
 
+# 仓库根目录的本地杂物（bak-*.rs 手动备份、build-tmp 之类），不是工程产物
+/target/
+
 # 本机 cargo / npm 缓存（为避免写入用户目录，构建时指向仓库内）
 .cargo-home/
 .npm-cache/

@@ -11,7 +11,6 @@ use std::process::Command;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::settings::GpuSettings;
 use crate::versions::{compose_path_env, LlamaCppVersion};
 
 /// 一个可用的推理设备。
@@ -120,103 +119,6 @@ pub fn list_devices(version: &LlamaCppVersion) -> Result<Vec<DeviceInfo>> {
         );
     }
     Ok(parse_devices(&text))
-}
-
-/// 用实时枚举结果校验用户配置的设备名，返回 `(有效, 无效)`。
-///
-/// 有效项使用枚举得到的规范大小写；这样历史配置里的 `cuda0` 会被纠正为 `CUDA0`。
-pub fn validate_devices(requested: &[String], available: &[DeviceInfo]) -> (Vec<String>, Vec<String>) {
-    let mut ok = Vec::new();
-    let mut bad = Vec::new();
-    for want in requested {
-        match available
-            .iter()
-            .find(|d| d.name.eq_ignore_ascii_case(want.trim()))
-        {
-            Some(found) => {
-                if !ok.contains(&found.name) {
-                    ok.push(found.name.clone());
-                }
-            }
-            None => bad.push(want.clone()),
-        }
-    }
-    (ok, bad)
-}
-
-/// 组装 GPU 相关命令行参数。
-///
-/// 遵循「默认什么都不传」的原则，让 llama.cpp 的原生 `--fit` 完成多卡自动分配：
-/// - `devices` 为空 → 不传 `--device`（使用全部可见设备）；
-/// - `n_gpu_layers` 为 `None` → 不传 `-ngl`（保留 `--fit` 的自动层分配）；
-/// - `tensor_split` 为 `None` → 不传 `-ts`（由 `--fit` 自动生成）；
-/// - `fit == true` → 不传 `--fit`（默认即 on，且兼容不支持该参数的旧版本）；
-/// - `fit == false` → 显式传 `--fit off`。
-pub fn build_gpu_args(gpu: &GpuSettings, resolved_devices: &[String]) -> Vec<String> {
-    let mut args: Vec<String> = Vec::new();
-
-    if !resolved_devices.is_empty() {
-        args.push("--device".into());
-        args.push(resolved_devices.join(","));
-    }
-
-    if let Some(ngl) = gpu.n_gpu_layers.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        args.push("--n-gpu-layers".into());
-        args.push(ngl.to_string());
-    }
-
-    let split = gpu.split_mode.trim();
-    if !split.is_empty() && split != "layer" {
-        args.push("--split-mode".into());
-        args.push(split.to_string());
-    }
-
-    if let Some(ts) = &gpu.tensor_split {
-        if !ts.is_empty() {
-            args.push("--tensor-split".into());
-            args.push(
-                ts.iter()
-                    .map(|v| {
-                        if v.fract() == 0.0 {
-                            format!("{}", *v as i64)
-                        } else {
-                            format!("{v}")
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-        }
-    }
-
-    if let Some(mg) = gpu.main_gpu {
-        args.push("--main-gpu".into());
-        args.push(mg.to_string());
-    }
-
-    if !gpu.fit {
-        args.push("--fit".into());
-        args.push("off".into());
-    }
-
-    if let Some(ft) = &gpu.fit_target {
-        if !ft.is_empty() {
-            args.push("--fit-target".into());
-            args.push(
-                ft.iter()
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-        }
-    }
-
-    args
-}
-
-/// `split-mode=tensor` 与 `--fit` 不兼容（llama.cpp 会中止 fit）。
-pub fn tensor_split_conflicts_with_fit(gpu: &GpuSettings) -> bool {
-    gpu.fit && gpu.split_mode.eq_ignore_ascii_case("tensor")
 }
 
 /// 透传给 `llama-fit-params` 的**带值**选项白名单。
@@ -416,80 +318,6 @@ mod tests {
         let devices = parse_devices("Available devices:\n  (none)\n");
         assert!(devices.is_empty());
         assert!(!cuda_ready(&devices));
-    }
-
-    #[test]
-    fn device_validation_is_case_insensitive() {
-        let available = vec![
-            DeviceInfo {
-                name: "CUDA0".into(),
-                description: "gpu".into(),
-                total_mib: Some(1),
-                free_mib: Some(1),
-            },
-            DeviceInfo {
-                name: "CUDA1".into(),
-                description: "gpu".into(),
-                total_mib: Some(1),
-                free_mib: Some(1),
-            },
-        ];
-        let (ok, bad) = validate_devices(
-            &["cuda0".into(), "CUDA1".into(), "CUDA7".into()],
-            &available,
-        );
-        assert_eq!(ok, vec!["CUDA0".to_string(), "CUDA1".to_string()]);
-        assert_eq!(bad, vec!["CUDA7".to_string()]);
-    }
-
-    #[test]
-    fn default_gpu_settings_produce_no_args() {
-        // 「默认什么都不传」是多卡自动分配的前提
-        let args = build_gpu_args(&GpuSettings::default(), &[]);
-        assert!(args.is_empty(), "unexpected args: {args:?}");
-    }
-
-    #[test]
-    fn explicit_multi_gpu_args() {
-        let gpu = GpuSettings {
-            devices: vec!["CUDA0".into(), "CUDA1".into()],
-            split_mode: "layer".into(),
-            tensor_split: Some(vec![3.0, 1.0]),
-            main_gpu: Some(0),
-            fit: true,
-            fit_target: Some(vec![2048, 512]),
-            n_gpu_layers: Some("99".into()),
-        };
-        let args = build_gpu_args(&gpu, &gpu.devices);
-        let joined = args.join(" ");
-        assert!(joined.contains("--device CUDA0,CUDA1"));
-        assert!(joined.contains("--tensor-split 3,1"));
-        assert!(joined.contains("--main-gpu 0"));
-        assert!(joined.contains("--n-gpu-layers 99"));
-        assert!(joined.contains("--fit-target 2048,512"));
-        // fit 开启时不传 --fit
-        assert!(!args.iter().any(|a| a == "--fit"));
-        // 默认 split-mode 不产生参数
-        assert!(!joined.contains("--split-mode"));
-    }
-
-    #[test]
-    fn fit_off_and_tensor_conflict() {
-        let gpu = GpuSettings {
-            fit: false,
-            split_mode: "tensor".into(),
-            ..Default::default()
-        };
-        let args = build_gpu_args(&gpu, &[]);
-        assert!(args.join(" ").contains("--fit off"));
-        assert!(!tensor_split_conflicts_with_fit(&gpu));
-
-        let gpu2 = GpuSettings {
-            fit: true,
-            split_mode: "tensor".into(),
-            ..Default::default()
-        };
-        assert!(tensor_split_conflicts_with_fit(&gpu2));
     }
 
     /// 只有白名单里的键能进命令行；布尔键按 flag 处理；空值与未知键丢掉。

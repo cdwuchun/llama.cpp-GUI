@@ -6,9 +6,9 @@ import { getFitEntry, putFitEntry, type FitCacheEntry } from "../utils/fitCache"
 import type { FitRow, ModelView } from "../types";
 import { formatExtraParams, isEnvKey, parseExtraParams } from "../utils/extraParams";
 import { getModelIcon } from "../utils/modelIcon";
-import { composeSectionName, displayNameOfSection, presetSections, sanitizeSectionName } from "../utils/models";
+import { composeSectionName, displayNameOfSection } from "../utils/models";
 import { initParamState, paramSchema, paramStateToEntries, type ParamState } from "../utils/paramSchema";
-import { parseEnvVars, sectionEntries, sectionText } from "../utils/presetText";
+import { parseEnvVars } from "../utils/presetText";
 import { ParamForm } from "./ParamForm";
 import { Modal } from "./Sheet";
 
@@ -114,10 +114,10 @@ function formSnapshot(v: {
 }
 
 export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () => void }) {
-  const presetText = useApp((s) => s.presetText);
   const busy = useApp((s) => s.busy);
   const devices = useApp((s) => s.devices);
-  const status = useApp((s) => s.status);
+  // 加载/停止模型都走前门（:9090），按钮的可用性看**前门在不在跑**
+  const frontDoor = useApp((s) => s.strataStatus.proxy);
   const saveModelSection = useApp((s) => s.saveModelSection);
   const removeModelSection = useApp((s) => s.removeModelSection);
   const startModel = useApp((s) => s.startModel);
@@ -189,54 +189,64 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
     setAlias(displayNameOfSection(current));
   }, [settings?.aliases, model.id, model.section]);
 
-  // 只在**切换模型**时用磁盘上的段内容初始化表单。
+  // 只在**切换模型**时用磁盘上的配置初始化表单。
   //
-  // 不能把 `current` 放进依赖：它随 `presetText` 变（保存、刷新、别名变更都会换引用），
+  // 不能把别名 `current` 放进依赖：保存、刷新、别名变更都会换引用，
   // 那样用户正在编辑的勾选/额外参数/环境变量会被静默重置回磁盘状态
-  // （表现就是"我打了一半的字自己变回去了"）。这里用 ref 读最新文本，依赖只有段名。
-  const presetTextRef = useRef(presetText);
-  presetTextRef.current = presetText;
+  // （表现就是"我打了一半的字自己变回去了"）。依赖只有段名。
 
   /** 打开时的表单快照（见 formSnapshot），关闭前询问就是拿当前值和它比 */
   const initialFormRef = useRef("");
 
   useEffect(() => {
-    const entries = sectionEntries(presetTextRef.current, model.section);
-    const nextParams = initParamState(entries);
-    const nextDevices = entries["device"]
-      ? entries["device"].split(",").map((s) => s.trim()).filter(Boolean)
-      : [];
-    const nextMainGpu = entries["main-gpu"] ?? "-1";
-    setParamState(nextParams);
-    setGpuDevices(nextDevices);
-    setMainGpu(nextMainGpu);
+    let cancelled = false;
+    // 表单初值直接读**原生 config**（第三刀）：不再把 presets.ini 文本解析一遍 ——
+    // config 目录里的那份 JSON 才是真源，ini 文本只是它的只读投影。
+    void (async () => {
+      const rows = await ipc.configEntries(model.section);
+      if (cancelled) return;
+      const entries: Record<string, string> = {};
+      for (const [key, value] of rows) entries[key] = value;
 
-    // preset 中不属于参数 schema、也不属于 GPU 专区的键：
-    // LLAMA_ARG_* 还原成环境变量文本，其余还原成命令行片段作为「额外参数」
-    const extra: [string, string][] = [];
-    const env: string[] = [];
-    for (const [key, value] of Object.entries(entries)) {
-      // 淘汰键直接丢掉：既不显示，保存时也不会再写回去
-      if (schemaKeys.has(key) || RESERVED_KEYS.has(key) || RETIRED_KEYS.has(key)) continue;
-      if (isEnvKey(key)) env.push(`${key}=${value}`);
-      else extra.push([key, value]);
-    }
-    const nextExtra = formatExtraParams(extra);
-    const nextEnv = env.join(" ");
-    setExtraText(nextExtra);
-    setEnvText(nextEnv);
+      const nextParams = initParamState(entries);
+      const nextDevices = entries["device"]
+        ? entries["device"].split(",").map((s) => s.trim()).filter(Boolean)
+        : [];
+      const nextMainGpu = entries["main-gpu"] ?? "-1";
+      setParamState(nextParams);
+      setGpuDevices(nextDevices);
+      setMainGpu(nextMainGpu);
 
-    // 这一轮填进去的内容就是「打开时」的样子，作为关闭前询问的基线。
-    // 必须在这里同步算出来：写成"首次渲染后记录"记到的是还没填值的空表单，
-    // 弹窗一打开就说"有未保存的修改"；换个 effect 记录又要赌执行顺序。
-    initialFormRef.current = formSnapshot({
-      alias: displayNameOfSection(settings?.aliases?.[model.id] ?? model.section),
-      mainGpu: nextMainGpu,
-      gpuDevices: nextDevices,
-      paramState: nextParams,
-      extraText: nextExtra,
-      envText: nextEnv,
-    });
+      // config 里不属于参数 schema、也不属于 GPU 专区的键：
+      // LLAMA_ARG_* 还原成环境变量文本，其余还原成命令行片段作为「额外参数」
+      const extra: [string, string][] = [];
+      const env: string[] = [];
+      for (const [key, value] of Object.entries(entries)) {
+        // 淘汰键直接丢掉：既不显示，保存时也不会再写回去
+        if (schemaKeys.has(key) || RESERVED_KEYS.has(key) || RETIRED_KEYS.has(key)) continue;
+        if (isEnvKey(key)) env.push(`${key}=${value}`);
+        else extra.push([key, value]);
+      }
+      const nextExtra = formatExtraParams(extra);
+      const nextEnv = env.join(" ");
+      setExtraText(nextExtra);
+      setEnvText(nextEnv);
+
+      // 这一轮填进去的内容就是「打开时」的样子，作为关闭前询问的基线。
+      // 必须在这里同步算出来：写成"首次渲染后记录"记到的是还没填值的空表单，
+      // 弹窗一打开就说"有未保存的修改"；换个 effect 记录又要赌执行顺序。
+      initialFormRef.current = formSnapshot({
+        alias: displayNameOfSection(settings?.aliases?.[model.id] ?? model.section),
+        mainGpu: nextMainGpu,
+        gpuDevices: nextDevices,
+        paramState: nextParams,
+        extraText: nextExtra,
+        envText: nextEnv,
+      });
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [model.section, schemaKeys]);
 
   const envParsed = parseEnvVars(envText);
@@ -284,22 +294,6 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
   }, [fitPath]);
 
   const fitRows: FitRow[] | null = fitEntry?.rows ?? null;
-  /** 参数动过了（提示重算，但不自动跑） */
-  const fitStale = fitEntry ? fitEntry.params !== fitParams : false;
-  /** llama.cpp 版本或设备集合变了（同样只提示） */
-  const fitEnvStale = fitEntry
-    ? fitEntry.version !== fitVersion || fitEntry.devices !== fitDevices
-    : false;
-  const fitHint = !fitEntry
-    ? ""
-    : fitStale
-      ? "参数已改动，结果可能要重算（点「重新估算」）。"
-      : fitEnvStale
-        ? "llama.cpp 版本或设备变了，建议重新估算。"
-        : "上次估算 " +
-          new Date(fitEntry.at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) +
-          "。";
-
   /**
    * llama-fit-params 不认 --mmproj / --model-draft（实测直接 invalid argument），
    * 所以多模态投影文件与草稿模型的占用**算不进上面那张表**，这里如实报出来。
@@ -397,7 +391,8 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
       await stopModel(model.section);
     }
 
-    const sections = new Set(presetSections(useApp.getState().presetText));
+    // 原生 config 清单（第三刀）：段名集合不再从 presets.ini 文本解析
+    const sections = new Set((useApp.getState().configs ?? []).map((c) => c.name));
 
     // 先写 preset，成功了再动别的。以前这里不看返回值：写失败时照样往下走，
     // 会删掉旧段、把 aliases 改到一个并不存在的新段名上、甚至去启动一个
@@ -424,7 +419,7 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
         useApp.getState().setNotice(`已重命名为「${target}」，正在按新名字重新加载`);
         await startModel(target);
       } else {
-        useApp.getState().setNotice(`已重命名为「${target}」，preset 段名同步改掉了`);
+        useApp.getState().setNotice(`已重命名为「${target}」，配置文件同步更新了`);
       }
     }
     // 已经落盘了，把基线挪到当前表单：否则保存完再点「取消」还要被问一次
@@ -441,9 +436,6 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
   };
 
   const loaded = model.status === "loaded" || model.status === "loading";
-
-  /** 净化后的段名片段：输入框里保留用户原样输入，落盘与提示文案都用这个值 */
-  const cleanedAlias = sanitizeSectionName(alias);
 
   /**
    * 保存的主 GPU 下标是否已经对不上当前设备列表。
@@ -483,37 +475,21 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
   const left = (
     <div>
       <div className="form-group">
-        <label className="form-label">模型名（同时作为 preset 段名）</label>
+        <label className="form-label">模型别名</label>
         <input
           type="text"
           className="form-control"
           value={alias}
           placeholder={model.name}
-          title={`作者前缀取自模型目录，会保留；填整段名（含 /）则按整段用；留空还原为 ${model.id}`}
+          title={`作者前缀取自模型目录，会保留；填完整名字（含 /）则按原样用；留空还原为 ${model.id}`}
           onChange={(e) => setAlias(e.target.value)}
         />
-        <small className="form-text">
-          改这里会同时改掉 preset 段名（= router 里的模型名），作者前缀保留。
-        </small>
-        {/* 输入框保留用户原样打的字（自己看得出打了什么），真正落盘的是净化后的段名。
-            依据：llama.cpp common/preset.cpp 的 PEG 语法里段头是
-            `header-line ::= "[" ws (section-name = [^]]*) ws "]" eol` —— 段名遇到第一个
-            `]` 就结束，`a]b` 会被解析成段名 `a` 加一段垃圾，后续键的归属全错；
-            `eol ::= ws comment? (newline / EOF)` 说明换行直接终止段头行，
-            一个输入会凭空造出两行。只过滤 `[ ] \r \n`：`:`、`_`、`-`、`.`、空格
-            在段名里合法（router 还会做 `名字:tag` 规范化），不能一并砍掉。 */}
-        {alias !== cleanedAlias && (
-          <small className="form-text" style={{ color: "var(--warning-color)" }}>
-            已忽略 <code>[</code>、<code>]</code> 与换行：preset 的段头是 <code>[名字]</code> 形式，
-            段名里出现 <code>]</code> 会让这一段的键归属错乱，换行则会破坏 ini 结构。
-            保存时按 <span className="mono">{cleanedAlias || model.id}</span> 写入。
-          </small>
-        )}
+        {/* 左栏的说明文本全部删掉（用户 m01644 第 3 点）：这个弹层是表单，解释性小字一律不留。 */}
         <small className="form-text mono">{model.scanned?.path ?? model.id}</small>
       </div>
 
       <div className="form-group">
-        <label className="form-label">preset 段名</label>
+        <label className="form-label">模型id</label>
         <input type="text" className="form-control mono" value={model.section} readOnly disabled />
       </div>
 
@@ -528,13 +504,6 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
             />
             <span className="form-check-label">多模态（视觉）</span>
           </label>
-          <small className="form-text">
-            {visionOff
-              ? "已关闭：不加载视觉能力（写入 --no-mmproj），可以省一点显存"
-              : detectedMmproj
-                ? `已开启：自动加载同目录的 ${detectedMmproj.split("/").pop()}`
-                : "已开启：投影文件留空时由服务器自动检测，也可以在「多模态」分组里指定"}
-          </small>
         </div>
       )}
 
@@ -551,39 +520,23 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
               补一个占位项，让"配置里存的是几号卡"始终可见 */}
           {staleMainGpu && <option value={mainGpu}>索引 {mainGpu}（当前设备列表里没有）</option>}
         </select>
-        <small className="form-text">
-          选择主 GPU（可选，留默认则由 llama.cpp 决定）。写进 preset 的是**设备下标**：
-          llama.cpp 的 <code>--main-gpu</code> 只认数字索引，改存设备名会被 router 拒绝，
-          所以这里把设备名和下标一起显示，方便核对打的是哪张卡。
-        </small>
         {staleMainGpu && (
-          <small className="form-text" style={{ color: "var(--warning-color)" }}>
-            配置里保存的下标 {mainGpu} 在本机枚举结果里找不到（当前 {devices.length} 张设备）。
-            可能是换了硬件 / 改了驱动，直接启动会让 llama.cpp 拿一个不存在的下标去选设备；
-            请重新选一张卡，或改回「默认」。
+          <small className="form-text text-warn">
+            配置里保存的下标 {mainGpu} 在本机枚举结果里找不到（当前 {devices.length} 张设备），
+            启动会让 llama.cpp 拿不存在的下标去选设备；请重新选一张卡或改回「默认」。
           </small>
         )}
       </div>
 
       <div className="form-group">
         <label className="form-label">设备</label>
-        <div
-          id="deviceChecklist"
-          style={{
-            border: "1px solid var(--border-color)",
-            borderRadius: "0.75rem",
-            padding: "0.75rem",
-            maxHeight: 260,
-            overflow: "auto",
-          }}
-        >
+        <div id="deviceChecklist" className="device-checklist">
           {devices.length === 0 ? (
             <div className="settings-empty">
               尚未枚举到设备
               <button
                 type="button"
-                className="btn btn-secondary"
-                style={{ marginLeft: 8, padding: "0.25rem 0.6rem", fontSize: "0.78rem" }}
+                className="btn btn-secondary btn-xs ml-2"
                 onClick={() => void refreshDevices()}
               >
                 <i className="fas fa-sync-alt" /> 重新枚举
@@ -591,20 +544,9 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
             </div>
           ) : (
             devices.map((d) => (
-              <label
-                key={d.name}
-                style={{
-                  display: "flex",
-                  alignItems: "flex-start",
-                  gap: 8,
-                  padding: "6px 6px",
-                  borderRadius: 8,
-                  cursor: "pointer",
-                }}
-              >
+              <label key={d.name} className="device-row">
                 <input
                   type="checkbox"
-                  style={{ marginTop: 2 }}
                   checked={gpuDevices.includes(d.name)}
                   onChange={() =>
                     setGpuDevices((prev) =>
@@ -612,7 +554,7 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
                     )
                   }
                 />
-                <span style={{ fontSize: "0.9rem" }}>
+                <span className="device-row-text">
                   <span className="mono">{d.name}</span>
                   {d.description && <span className="form-text"> {d.description}</span>}
                 </span>
@@ -620,17 +562,13 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
             ))
           )}
         </div>
-        <small className="form-text">
-          不勾选 = 使用全部显卡，显存由 <code>--fit</code> 自动分配。
-        </small>
       </div>
 
       <div className="form-group">
         <label className="form-label">显存预估</label>
         <button
           type="button"
-          className="btn btn-secondary"
-          style={{ padding: "0.35rem 0.8rem", fontSize: "0.82rem" }}
+          className="btn btn-secondary btn-compact"
           disabled={fitBusy || !model.scanned}
           title={
             model.scanned
@@ -644,7 +582,7 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
         </button>
 
         {fitError && (
-          <small className="form-text" style={{ color: "var(--danger-color)" }}>
+          <small className="form-text text-danger">
             {fitError}
           </small>
         )}
@@ -670,29 +608,14 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
           </div>
         ) : null}
 
-        {fitRows && fitRows.length > 0 && (
-          <small className="form-text">
-            {fitHint ? fitHint + " " : ""}
-            单位 MiB；合计 = 模型 + 上下文 + 计算。Host 是留在系统内存里的部分。
-          </small>
-        )}
-
         {fitRows && fitRows.length > 0 && fitExtras.length > 0 && (
-          <small className="form-text" style={{ color: "var(--warning-color)" }}>
-            未计入：{fitExtras.join("、")} —— llama-fit-params 不接受这两类参数，
-            实际占用还要加上它们。
-          </small>
+          <small className="form-text text-warn">未计入：{fitExtras.join("、")}</small>
         )}
 
         {fitRows && fitRows.length === 0 && (
           <small className="form-text">没有解析到结果，请看「系统日志」。</small>
         )}
 
-        {!fitRows && !fitError && !fitBusy && (
-          <small className="form-text">
-            逐卡预估占用的 MiB（模型 / 上下文 / 计算缓冲）。按全部可见设备计算，不套用上方勾选。
-          </small>
-        )}
       </div>
     </div>
   );
@@ -701,7 +624,7 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
     <div>
       <ParamForm state={paramState} onChange={setParamState} />
 
-      <div className="form-group" style={{ marginTop: "1rem" }}>
+      <div className="form-group mt-4">
         <label className="form-label">额外参数</label>
         <textarea
           className="form-control"
@@ -721,7 +644,7 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
         )}
       </div>
 
-      <div className="form-group" style={{ marginTop: "1rem" }}>
+      <div className="form-group mt-4">
         <label className="form-label">环境变量</label>
         <textarea
           className="form-control mono"
@@ -735,7 +658,7 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
           格式为 KEY=VALUE，多个用空格分隔，值含空格时用引号包裹；只接受 LLAMA_ARG_ 前缀。
         </small>
         {envErrors.length > 0 ? (
-          <small className="form-text" style={{ color: "var(--danger-color)" }}>
+          <small className="form-text text-danger">
             {envErrors[0]}
           </small>
         ) : (
@@ -783,7 +706,7 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
             <button
               type="button"
               className="btn btn-primary btn-uniform"
-              disabled={!status.running || busy}
+              disabled={!frontDoor || busy}
               onClick={() => void stopModel(model.section)}
             >
               <i className="fas fa-stop" /> 停止模型
@@ -793,7 +716,7 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
               type="button"
               className="btn btn-primary btn-uniform"
               disabled={busy}
-              title={model.inPreset ? undefined : "会先保存配置，写入 presets.ini 后再启动"}
+              title={model.inPreset ? undefined : "会先保存配置（新模型会自动生成配置文件），再启动"}
               onClick={async () => {
                 // 用 save 返回的**新段名**启动：改过名时旧段已经被删掉了，
                 // 拿 model.section 去 load 必然失败
@@ -851,7 +774,8 @@ export function ConfigSheet({ model, onClose }: { model: ModelView; onClose: () 
 export function DetailSheet({ model, onClose }: { model: ModelView; onClose: () => void }) {
   const props = useApp((s) => s.modelProps[model.section]);
   const loadModelProps = useApp((s) => s.loadModelProps);
-  const presetText = useApp((s) => s.presetText);
+  // 配置原文（JSON）：ini 视图退役后直接读文件（第三刀）
+  const [configText, setConfigText] = useState("");
 
   useEffect(() => {
     if (model.status === "loaded") {
@@ -859,7 +783,20 @@ export function DetailSheet({ model, onClose }: { model: ModelView; onClose: () 
     }
   }, [model.section, model.status, loadModelProps]);
 
-  const section = useMemo(() => sectionText(presetText, model.section), [presetText, model.section]);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const text = await ipc.configRead(model.section);
+        if (!cancelled) setConfigText(text);
+      } catch {
+        if (!cancelled) setConfigText("");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [model.section]);
   const modalities = props?.modalities;
   const modalityText = modalities
     ? [modalities.vision ? "视觉" : null, modalities.audio ? "音频" : null, modalities.video ? "视频" : null]
@@ -879,7 +816,7 @@ export function DetailSheet({ model, onClose }: { model: ModelView; onClose: () 
         </button>
       }
     >
-      <div className="form-text mono" style={{ marginTop: 0, marginBottom: "1rem" }}>
+      <div className="form-text mono mt-0 mb-4">
         {model.id}
       </div>
 
@@ -916,13 +853,13 @@ export function DetailSheet({ model, onClose }: { model: ModelView; onClose: () 
         </div>
       </div>
 
-      <div className="form-group" style={{ marginTop: "1.25rem" }}>
-        <label className="form-label">presets.ini 中的该段</label>
-        {section ? (
-          <div className="code-block">{section}</div>
+      <div className="form-group mt-5">
+        <label className="form-label">配置文件（JSON）</label>
+        {configText ? (
+          <div className="code-block">{configText}</div>
         ) : (
-          <div className="form-text" style={{ marginTop: 0 }}>
-            该模型还没有 preset 段，可在「配置」里保存后生成。
+          <div className="form-text mt-0">
+            该模型还没有配置文件，可在「配置」里保存后生成。
           </div>
         )}
       </div>

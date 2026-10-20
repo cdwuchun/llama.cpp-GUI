@@ -21,8 +21,8 @@ export function setRouterApiKey(key: string | null | undefined): void {
   apiKey = key?.trim() ? key.trim() : null;
 }
 
-/** 当前 key 对应的鉴权请求头（未设置时为空对象）。 */
-function authHeaders(): Record<string, string> {
+/** 当前 key 对应的鉴权请求头（未设置时为空对象）。聊天客户端也复用它。 */
+export function authHeaders(): Record<string, string> {
   return apiKey ? { authorization: `Bearer ${apiKey}` } : {};
 }
 
@@ -44,10 +44,25 @@ async function readError(res: Response): Promise<string> {
   }
 }
 
+/**
+ * 各类请求的超时。
+ *
+ * 前门是单进程自写的 HTTP 服务，历史上出现过「连得上但不回包」（有人持着调度器锁等 taskkill，
+ * 用户 m05816）。前端原来用裸 fetch——没有超时，一次挂住的请求能把轮询循环和 finally 清理
+ * 一起拖死。读类请求短超时，卸载给 2 分钟，加载按前门自己的 START_TIMEOUT（60 秒）再放宽。
+ */
+const GET_TIMEOUT_MS = 10_000;
+const UNLOAD_TIMEOUT_MS = 120_000;
+const LOAD_TIMEOUT_MS = 300_000;
+
 /** 列出模型（`reload=true` 会让 router 重新读取 preset 文件）。 */
 export async function fetchModels(port: number, reload = false): Promise<RouterModel[]> {
   const url = `${routerBase(port)}/models${reload ? "?reload=1" : ""}`;
-  const res = await fetch(url, { method: "GET", headers: authHeaders() });
+  const res = await fetch(url, {
+    method: "GET",
+    headers: authHeaders(),
+    signal: AbortSignal.timeout(GET_TIMEOUT_MS),
+  });
   if (!res.ok) {
     throw new Error(`GET /models 失败：${await readError(res)}`);
   }
@@ -60,6 +75,7 @@ export async function loadModel(port: number, id: string): Promise<void> {
     method: "POST",
     headers: { "content-type": "application/json", ...authHeaders() },
     body: JSON.stringify({ model: id }),
+    signal: AbortSignal.timeout(LOAD_TIMEOUT_MS),
   });
   if (!res.ok) {
     throw new Error(`加载 ${id} 失败：${await readError(res)}`);
@@ -71,6 +87,7 @@ export async function unloadModel(port: number, id: string): Promise<void> {
     method: "POST",
     headers: { "content-type": "application/json", ...authHeaders() },
     body: JSON.stringify({ model: id }),
+    signal: AbortSignal.timeout(UNLOAD_TIMEOUT_MS),
   });
   if (!res.ok) {
     throw new Error(`卸载 ${id} 失败：${await readError(res)}`);
@@ -81,6 +98,7 @@ export async function unloadModel(port: number, id: string): Promise<void> {
 export async function fetchProps(port: number, id: string): Promise<ModelProps> {
   const res = await fetch(`${routerBase(port)}/props?model=${encodeURIComponent(id)}`, {
     headers: authHeaders(),
+    signal: AbortSignal.timeout(GET_TIMEOUT_MS),
   });
   if (!res.ok) {
     throw new Error(`GET /props 失败：${await readError(res)}`);
@@ -236,12 +254,15 @@ export function portFromArgs(args: string[] | undefined): number | null {
  *
  * 每个模型是**独立**的 llama-server 子实例（各自端口、各自 WebUI），
  * 所以同时跑多个模型时是**可选的**，不能想当然地打开第一个。
+ *
+ * 端口来源：前门合成的列表直接给 `port`；router 那条老路只能从 `status.args` 里解析
+ * （`--port <n>`），两条都认，router 退役后前半段留下。
  */
 export function chatTargets(models: RouterModel[]): { id: string; port: number }[] {
   const out: { id: string; port: number }[] = [];
   for (const m of models) {
     if (m.status?.value !== "loaded") continue;
-    const port = portFromArgs(m.status?.args);
+    const port = m.port ?? portFromArgs(m.status?.args);
     if (port != null) out.push({ id: m.id, port });
   }
   return out;

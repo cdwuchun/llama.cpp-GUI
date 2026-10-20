@@ -1,0 +1,138 @@
+/* Strata UI — tokens. Derived from the Gainsty design system.
+   Light is default; dark via <html data-theme="dark">.
+   Values marked (derived) are not in the Gainsty source and were added for the app.
+
+   本文件是样式基座 S1（UI_STYLE_BASELINE.md §3）：数值全部取自上游
+   E:\AI\Strata\serve\web\tokens.css 实测原值，上游 87 行全量照抄（不裁剪、不改名、不合并）。
+   S3（2026-10-15）补齐字体：上游两条 Outfit @font-face 照抄（只改相对路径）。
+   中文不打包 —— 与上游 strata-manager 一致（apps/desktop/src/official/tokens.css 只带 Outfit）。
+   **故意不列任何中文字体名**：中文字形交给 WebView2 的默认回落，与 S1 之前（body 栈
+   'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif）的回落条件完全相同。
+   别再写 "Microsoft YaHei UI" —— 那是 Windows 的 UI 变体（字距更紧、笔画更细），显式指定后
+   中文观感比默认回落更差（用户 m07070 实测反馈）。要动中文字体，先跟用户确认。
+
+   也**不要写 system-ui**（2026-10-15 实测，用户 m07107 第二次反馈后定位）：Windows 上它解析成
+   Segoe UI，中文回落到 YaHei 的 **UI 变体**，与 S1 之前的默认回落不是同一张字形。取证方式：
+   headless Edge（与 WebView2 同一 Blink 内核）在同一块 canvas 上逐像素比对（E:\tmp\fontpix.html
+   → E:\tmp\dom2.txt）：含 system-ui 的栈相对 S1 之前的栈，中文 16px 差 3572 像素、32px 差 11221
+   像素，且与显式 "Microsoft YaHei"/"Microsoft YaHei UI" 的差异数完全相同；把 system-ui 换成
+   BlinkMacSystemFont 后差异归零（与 S1 之前逐像素一致）。宽度测量测不出这件事——中文全角字形
+   恒为 1em，字体不同但 advance 相同，必须比像素。
+
+   主题机制不改：本项目已是 document.documentElement.dataset.theme（src/store.ts:497-499）
+   + [data-theme="dark"]（legacy/index.css:28），与上游同一套。 */
+
+/* Outfit (SIL Open Font License 1.1, src/styles/fonts/Outfit-OFL.txt)：单变量字体，字重 100-900 */
+@font-face{font-family:"Outfit";src:url("./fonts/outfit-latin-wght.woff2") format("woff2-variations");font-weight:100 900;font-display:swap;unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+@font-face{font-family:"Outfit";src:url("./fonts/outfit-latin-ext-wght.woff2") format("woff2-variations");font-weight:100 900;font-display:swap;unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}
+:root{
+  /* type */
+  --st-font:"Outfit",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  --st-font-mono:ui-monospace,"Cascadia Mono",Consolas,monospace; /* (derived) */
+  --st-fs-xs:12px;  --st-fs-sm:13px; --st-fs-md:14px; --st-fs-base:16px;
+  --st-fs-lg:18px;  --st-fs-xl:24px; --st-fs-stat:32px; --st-fs-display:40px;
+  --st-fw-regular:400; --st-fw-medium:500; --st-fw-bold:700; --st-fw-black:900;
+  --st-lh-tight:1.1; --st-lh-body:1.55;
+
+  /* spacing (4pt) */
+  --st-s-1:4px; --st-s-2:8px; --st-s-3:12px; --st-s-4:16px; --st-s-5:20px;
+  --st-s-6:24px; --st-s-8:32px; --st-s-10:40px; --st-s-12:48px; --st-s-16:64px;
+
+  /* radius */
+  --st-r-sm:8px; --st-r-md:14px; --st-r-lg:20px; --st-r-xl:24px; --st-r-pill:9999px;
+  /* 本项目补的三档（上游没有）：对应 app.css:306 已定的
+     容器 14 / 按钮与表单 10 / 搜索与下拉 12 / 小按钮 8 / 图标块 9 / 弹层 18 / 徽标 999 */
+  --st-r-btn:10px; --st-r-field:12px; --st-r-popover:18px;
+
+  /* motion (derived) */
+  --st-ease:cubic-bezier(.2,.7,.2,1); --st-dur:160ms;
+
+  /* color — light */
+  --st-bg:#f9fafb;
+  --st-surface:#ffffff;
+  --st-surface-2:#f7f7f7;
+  --st-topbar:rgba(255,255,255,.9);  /* (derived) 顶栏毛玻璃底，取 --st-surface + 90% */
+  --st-line:#dee5ee;
+  --st-line-soft:#eeeeee;
+  --st-ink:#221e1f;
+  --st-ink-soft:#303030;
+  --st-ink-muted:#6f6f6f;        /* Gainsty #7a7a7a darkened slightly for 4.5:1 on white */
+  --st-icon:#2F384C;             /* Anron default */
+
+  --st-accent:#10b981;
+  --st-accent-hover:#0c8a60;
+  --st-accent-ink:#ffffff;
+  --st-accent-tint:#ecfdf5;
+  --st-accent-text:#0c8a60;      /* accent used as text on light */
+  --st-focus:#405de6;
+  --st-focus-ring:rgba(64,93,230,.25);  /* (derived) = --st-focus + 25%，focus 外圈 */
+
+  --st-info:#0f97ff;     --st-info-tint:#e8f4ff;    --st-info-text:#0668c2;
+  --st-warn:#e39b0b;     --st-warn-tint:#fff6e0;    --st-warn-text:#8a5a00;   /* (derived) */
+  --st-danger:#e0283f;   --st-danger-tint:#fdecee;  --st-danger-text:#b01a2e; /* (derived) */
+
+  /* (derived) 语义色的 rgb 通道，供 rgb(var(--st-*-rgb) / α) 写半透明底与描边
+     （S2 2026-10-16：把散落的 indigo/紫/绿/红/黄 rgba 收敛到色板，色相不再各写各的） */
+  --st-accent-rgb:16 185 129;  --st-info-rgb:15 151 255;  --st-warn-rgb:227 155 11;  --st-danger-rgb:224 40 63;
+
+  --st-code-bg:#1b1f23;  --st-code-ink:#e6e9ec;  /* code blocks stay dark in both themes (derived) */
+
+  --st-sh-card:0 18px 7px rgba(0,0,0,.01),0 10px 6px rgba(0,0,0,.02),0 4px 4px rgba(0,0,0,.03),0 1px 2px rgba(0,0,0,.04);
+  --st-sh-bar:0 54px 21px rgba(0,0,0,.01),0 30px 18px rgba(0,0,0,.03),0 13px 13px rgba(0,0,0,.05),0 3px 7px rgba(0,0,0,.06);
+  --st-sh-pop:0 10px 40px rgba(15,23,42,.08),0 1px 3px rgba(15,23,42,.06);
+  color-scheme:light;
+}
+
+/* color — dark (all derived) */
+[data-theme="dark"]{
+  --st-bg:#0e1113;
+  --st-surface:#161a1d;
+  --st-surface-2:#1d2226;
+  --st-topbar:rgba(22,26,29,.9);     /* (derived) 取 dark --st-surface #161a1d + 90% */
+  --st-line:#2a3036;
+  --st-line-soft:#22272c;
+  --st-ink:#eef1f3;
+  --st-ink-soft:#c7cdd3;
+  --st-ink-muted:#8e979f;
+  --st-icon:#c7cdd3;
+
+  --st-accent:#34d399;
+  --st-accent-hover:#4ade80;
+  --st-accent-ink:#052e20;
+  --st-accent-tint:rgba(52,211,153,.12);
+  --st-accent-text:#4ade80;
+  --st-focus:#7b93ff;
+  --st-focus-ring:rgba(123,147,255,.25);  /* (derived) = --st-focus + 25% */
+
+  --st-info:#3aa9ff;     --st-info-tint:rgba(58,169,255,.12);  --st-info-text:#7cc4ff;
+  --st-warn:#f5b53d;     --st-warn-tint:rgba(245,181,61,.12);  --st-warn-text:#f8c96a;
+  --st-danger:#ff5a6e;   --st-danger-tint:rgba(255,90,110,.12);--st-danger-text:#ff8a98;
+
+  /* (derived) 见浅色段的同名说明 */
+  --st-accent-rgb:52 211 153;  --st-info-rgb:58 169 255;  --st-warn-rgb:245 181 61;  --st-danger-rgb:255 90 110;
+
+  --st-code-bg:#0a0c0e;  --st-code-ink:#e6e9ec;
+
+  --st-sh-card:0 1px 2px rgba(0,0,0,.4);
+  --st-sh-bar:0 12px 32px rgba(0,0,0,.45),0 2px 6px rgba(0,0,0,.35);
+  --st-sh-pop:0 16px 48px rgba(0,0,0,.55),0 1px 3px rgba(0,0,0,.4);
+  color-scheme:dark;
+}
+
+/* 兼容别名层（UI_STYLE_BASELINE.md §3 第 3 条）：旧变量名只为让存量引用零改动
+   继承新色板；新写的 CSS 与 TSX 一律不准再用旧名，存量随各页重构逐步换成 --st-*（只减不增）。
+   S1 阶段 legacy/index.css 在本文件之后加载，:root 旧定义仍覆盖这些别名 → 视觉零变化；
+   S2（2026-10-16）已把 legacy 的 :root / [data-theme="dark"] 定义块整块删除、散落 hex 收敛到 token，
+   本层自此真正接管。以下 6 条是 legacy 用过但别处没有的名字，一并在这里补齐。 */
+:root{
+  --bg-color:var(--st-bg);             --card-bg:var(--st-surface);      --sidebar-bg:var(--st-surface);
+  --border-color:var(--st-line);       --text-primary:var(--st-ink);     --text-secondary:var(--st-ink-muted);
+  --input-bg:var(--st-surface);        --hover-bg:var(--st-surface-2);   --active-bg:var(--st-line-soft);
+  --primary-soft:var(--st-line-soft);  --primary-color:var(--st-accent); --accent-color:var(--st-accent);
+  --success-color:var(--st-accent);    --danger-color:var(--st-danger);  --warning-color:var(--st-warn);
+  --info-color:var(--st-info);         --shadow-sm:var(--st-sh-card);    --shadow-md:var(--st-sh-pop);
+  --radius:var(--st-r-md);             --transition-speed:var(--st-dur);
+  --primary-hover:var(--st-accent-hover);   --bg-secondary:var(--st-surface-2);
+  --sidebar-footer-bg:var(--st-surface-2);  --topbar-bg:var(--st-topbar);
+  --disabled-bg:var(--st-surface-2);        --modal-content-bg:var(--st-surface);
+}

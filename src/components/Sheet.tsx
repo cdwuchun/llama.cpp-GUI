@@ -70,7 +70,7 @@ export function Modal({
         <div className="modal-header">
           <h3 className="modal-title">
             {icon ? (
-              <img src={icon} alt="" style={{ width: 24, height: 24, objectFit: "contain" }} />
+              <img src={icon} alt="" className="sheet-icon" />
             ) : (
               <i className={`fas ${iconClass ?? "fa-upload"}`} />
             )}

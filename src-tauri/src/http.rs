@@ -4,8 +4,16 @@
 //! 压测（bench.rs）与空闲卸载（idle.rs）共用这一份实现。
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
+
+/// 连接阶段的超时上限。
+///
+/// 调用方给的整体 deadline 可能很长（探测是 3 秒），但「连不上」和「连上了不答」是两码事：
+/// 本机连一个没人监听的端口，被拒都要两秒（实测 127.0.0.1 约 2.0–2.2 秒），而
+/// `TcpStream::connect` 不受读/写超时约束 —— 探一次就白等这么久。给连接单独一个短上限，
+/// 本机正常连接是毫秒级（用户 m06134：卡片卡住，日志里每次读列表都耗时 6.1 秒）。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// 发一个请求并返回响应体。
 ///
@@ -21,7 +29,13 @@ pub fn request(
     deadline: Duration,
 ) -> Result<String, String> {
     let addr = format!("{host}:{port}");
-    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("连接 {addr} 失败：{e}"))?;
+    let sock = addr
+        .to_socket_addrs()
+        .map_err(|e| format!("解析 {addr} 失败：{e}"))?
+        .next()
+        .ok_or_else(|| format!("解析 {addr} 失败：没有可用地址"))?;
+    let mut stream = TcpStream::connect_timeout(&sock, deadline.min(CONNECT_TIMEOUT))
+        .map_err(|e| format!("连接 {addr} 失败：{e}"))?;
     stream.set_read_timeout(Some(deadline)).ok();
     stream.set_write_timeout(Some(deadline)).ok();
     stream.set_nodelay(true).ok();

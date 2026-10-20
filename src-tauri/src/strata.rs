@@ -1,6 +1,6 @@
 //! Strata 运行时通道：config 扫描、启停、状态探测、参数读写。
 //!
-//! 设计约束（见 `STRATA_INTEGRATION_PLAN.md` §7 升级解耦规则）：
+//! 设计约束（见 `docs/archive/STRATA_INTEGRATION_PLAN.md` §7 升级解耦规则）：
 //! - **R1 启动命令不自己拼**：从上游生成的 `run-<model>.bat` 解析，上游改了格式这里跟着变。
 //! - **R2 零硬编码**：所有路径来自 config 与 run 脚本，GUI 只存 Strata 根目录。
 //! - **R3 版本从运行时读**：`/props.build_info`，不缓存、不解析文件名。
@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::http;
-use crate::router::{now_ms, spawn_pump, LogHub, LogLine};
+use crate::logs::{now_ms, spawn_pump, LogHub, LogLine};
 use crate::winfix;
 
 /// 端口就绪等待上限。Strata 的 HTTP 监听在模型加载前就绑好（Python 启动快，
@@ -443,7 +443,7 @@ fn fallback_command(root: &Path, config_path: &Path, port: u16) -> (PathBuf, Vec
 
 /// Strata 自己的日志读取器：整条流固定归到 `"strata"` 源。
 ///
-/// 不能复用 [`crate::router::spawn_reader`] —— 它按行首 `[端口]` 把日志分成
+/// 不能复用 [`crate::logs::spawn_reader`] —— 它按行首 `[端口]` 把日志分成
 /// `model:<端口>` / `system`，Strata 的输出没有那个前缀，全部会被塞进 `"system"`
 /// （也就是 router 自己的那一路），前端就没法把 Strata 的模型日志单独挑出来看。
 fn spawn_strata_reader<R: std::io::Read + Send + 'static>(
@@ -563,7 +563,7 @@ pub fn spawn_strata(
         format!(
             "[gui] 启动 Strata {} 参数: {}",
             exe.display(),
-            crate::router::redact_args(&args).join(" ")
+            crate::logs::redact_args(&args).join(" ")
         ),
     );
 
@@ -627,19 +627,19 @@ pub fn spawn_strata(
                     exit.code()
                 );
                 hub.push("system", format!("[gui] {msg}"));
-                crate::router::force_kill_tree(pid, &mut child);
+                crate::logs::force_kill_tree(pid, &mut child);
                 anyhow::bail!(msg);
             }
             Ok(None) => {}
             Err(err) => {
-                crate::router::force_kill_tree(pid, &mut child);
+                crate::logs::force_kill_tree(pid, &mut child);
                 anyhow::bail!("等待 Strata 启动失败: {err}");
             }
         }
         if Instant::now() >= deadline {
             let msg = format!("Strata 在 {} 秒内没有监听 {probe} 端口，请看日志", READY_TIMEOUT.as_secs());
             hub.push("system", format!("[gui] {msg}"));
-            crate::router::force_kill_tree(pid, &mut child);
+            crate::logs::force_kill_tree(pid, &mut child);
             anyhow::bail!(msg);
         }
         thread::sleep(Duration::from_millis(150));
@@ -712,7 +712,7 @@ pub fn stop_strata(slot: &Arc<Mutex<Option<StrataProcess>>>) -> Option<u32> {
     let mut process = slot.lock().unwrap_or_else(|e| e.into_inner()).take()?;
     let pid = process.child.id();
     let _ = process.child.kill();
-    crate::router::force_kill_tree(pid, &mut process.child);
+    crate::logs::force_kill_tree(pid, &mut process.child);
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -776,18 +776,12 @@ pub fn spawn_monitor(
                 // Strata 是**不由前端 store 驱动**的进程槽（`strata_start` 之后状态只在
                 // 后端变），崩溃监测是唯一能发现「它自己没了」的地方。这里顺手刷一次托盘
                 // 菜单可用性，否则「启动服务」会一直禁用着，用户以为托盘坏了。
-                // 只动菜单、不动 tooltip：tooltip 还要带 router 的端口，这里没那个上下文。
-                let router_running = app
+                // 只动菜单、不动 tooltip：tooltip 还要带前门的端口，这里没那个上下文。
+                let service_running = app
                     .try_state::<crate::state::AppState>()
-                    .map(|state| {
-                        state
-                            .router_slot
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .is_some()
-                    })
+                    .map(|state| crate::strata_proxy::running_port(&state).is_some())
                     .unwrap_or(false);
-                crate::tray::sync_menu_state(&app, router_running, false);
+                crate::tray::sync_menu_state(&app, service_running, false);
                 return;
             }
         }
@@ -798,7 +792,41 @@ pub fn spawn_monitor(
 ///
 /// 全部字段可选（**R4**）：端点缺失或字段缺失时保持 `None`，
 /// 老版本 Strata 缺端点只会让界面少显示几项，不会报错。
+///
+/// 探测到「退化」时复探一次再采信：引擎切换/加载模型的那一两秒里，偶尔有一轮
+/// `/health` 不应答或还回着旧的 `loaded: false`，单轮采信会让卡片
+/// 「运行中 → 已停止 → 运行中」闪一下（用户 m12735）。但也不能为了不闪就把判断推后 ——
+/// 实例真挂了必须马上显示（用户 m13216 第 2 点），所以做法是「立刻复探」而不是「等下一轮」：
+/// 本机关闭端口是即时 RST，复探几乎不花时间；真卡住时才会再等一个超时。
 pub fn probe(port: u16, api_key: Option<&str>) -> StrataStatus {
+    let first = probe_with_timeout(port, api_key, PROBE_TIMEOUT);
+    if is_healthy(&first) {
+        return first;
+    }
+    // 复探用和首探一样的超时：这一轮的来历就是「引擎正好忙、3 秒没应答」，
+    // 只给 0.8 秒等于让它再失败一次（用户 m13709 报的抖动就是这样复现的）。
+    // 真挂的实例连不上是即时 RST，复探不花时间；只有半死状态才会把两个超时都用满。
+    let again = probe_with_timeout(port, api_key, PROBE_TIMEOUT);
+    // 复探结果更晚，无认健康与否都采信它：真挂了立刻显示「已停止」，
+    // 单轮抖动则被这次复探吸收掉。
+    again
+}
+
+/// 探测结果是否「健康」：端口应答且明确说已加载模型。
+///
+/// `loaded == None` 也算不健康 —— 那说明这一轮 `/health` 读到了但字段缺失，
+/// 多半是引擎正处于切换状态，值得复探一次。
+fn is_healthy(st: &StrataStatus) -> bool {
+    st.running && st.loaded == Some(true)
+}
+
+
+/// 同 [`probe`]，但超时由调用方定。
+///
+/// 前门合成 `/models` 时要挨个 config 探一遍「有没有外部实例在跑」，那是列表热路径：
+/// 3 秒的探测超时会让一次列表请求拖上好几秒（用户 m06134：每次读列表耗时 6.1 秒
+/// = 3 份 config × 每份约 2 秒的「连不上」）。本机正常响应是毫秒级，这类场景用短超时。
+pub fn probe_with_timeout(port: u16, api_key: Option<&str>, timeout: Duration) -> StrataStatus {
     let mut st = StrataStatus {
         running: true,
         port,
@@ -806,7 +834,7 @@ pub fn probe(port: u16, api_key: Option<&str>) -> StrataStatus {
     };
     st.running = true;
 
-    if let Ok(body) = http::request("127.0.0.1", port, "GET", "/health", None, api_key, PROBE_TIMEOUT) {
+    if let Ok(body) = http::request("127.0.0.1", port, "GET", "/health", None, api_key, timeout) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
             st.loaded = v.get("loaded").and_then(|x| x.as_bool());
             st.live_max_context = v.get("max_context").and_then(|x| x.as_u64());
@@ -830,14 +858,14 @@ pub fn probe(port: u16, api_key: Option<&str>) -> StrataStatus {
         return st;
     }
 
-    if let Ok(body) = http::request("127.0.0.1", port, "GET", "/props", None, api_key, PROBE_TIMEOUT) {
+    if let Ok(body) = http::request("127.0.0.1", port, "GET", "/props", None, api_key, timeout) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
             st.version = v.get("build_info").and_then(|x| x.as_str()).map(|s| s.to_string());
             st.models_autoload = v.get("models_autoload").and_then(|x| x.as_bool());
         }
     }
 
-    if let Ok(body) = http::request("127.0.0.1", port, "GET", "/status", None, api_key, PROBE_TIMEOUT) {
+    if let Ok(body) = http::request("127.0.0.1", port, "GET", "/status", None, api_key, timeout) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
             st.busy = v.get("busy").and_then(|x| x.as_bool());
             st.prompt_tokens = v.get("prompt_tokens").and_then(|x| x.as_u64());

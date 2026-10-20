@@ -2033,7 +2033,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "llamacpp-gui"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "regex",
@@ -2046,6 +2046,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
  "walkdir",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

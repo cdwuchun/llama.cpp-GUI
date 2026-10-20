@@ -1,6 +1,6 @@
 [package]
 name = "llamacpp-gui"
-version = "0.1.2"
+version = "0.2.0"
 description = "llama.cpp GUI - Tauri 2 外壳，管理 llama-server router mode"
 authors = ["llamacpp-gui"]
 edition = "2021"
@@ -26,6 +26,28 @@ serde_json = "1"
 anyhow = "1"
 regex = "1"
 walkdir = "2"
+
+# 联网搜索的 HTTP 走系统 curl.exe，不引 reqwest（理由见 src/search.rs 顶部注释：
+# 本机 schannel 不可用 —— cargo 直连 https 会报 SEC_E_NO_CREDENTIALS，
+# 而 curl.exe 自带 TLS 后端，实测能正常访问各搜索 API）。
+
+# 只用来清掉系统标题栏左边那个小图标（WM_SETICON + ICON_SMALL，见 lib.rs 的
+# strip_caption_chrome）。windows-sys 本来就在依赖树里（tauri / tao 用它），
+# 这里只是把已经锁定的版本提成直接依赖，不会多下载东西。
+#
+# Win32_System_SystemInformation / Win32_System_Threading 是监控采集层
+# （src/monitor.rs）要的：GetSystemTimes（在 Threading 模块）算 CPU 占用、
+# GlobalMemoryStatusEx（在 SystemInformation 模块）读物理内存。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    # PDH 性能计数器：磁盘吞吐（PhysicalDisk(_Total)）要它
+    "Win32_System_Performance",
+] }
 
 # ---------- 构建体积控制 ----------
 # Windows 上默认的完整调试信息（PDB）会把 target/ 顶到 10 GB 量级。

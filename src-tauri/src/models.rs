@@ -17,53 +17,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
-use regex::{Captures, Regex};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
-
-// ---------------------------------------------------------------------------
-// 被清理段的归档
-//
-// 自动清理失效段时会先把段内容存到这里，而不是直接丢掉：用户过段时间又把同一个模型
-// 下载回模型目录，扫描时就能把当初调好的参数（上下文、采样、GPU 相关键…）原样恢复，
-// 只把 `model` 指向的路径换成新扫到的那个。恢复成功即从归档里移除。
-// ---------------------------------------------------------------------------
-
-static ARCHIVE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
-
-const ARCHIVE_VERSION: u32 = 1;
-
-#[derive(Serialize, Deserialize)]
-struct ArchiveFile {
-    version: u32,
-    /// 段名 → 归档内容
-    sections: BTreeMap<String, ArchiveEntry>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ArchiveEntry {
-    /// 删除时的段名。改过名的模型段名是别名，恢复时按它把名字还原回去。
-    #[serde(default)]
-    section: String,
-    /// 删除时 `model` 指向的文件名（不含路径）。
-    ///
-    /// 用来防止"同目录换了另一个模型"被误恢复：扫描 id 是目录相对路径，同一目录里
-    /// 把 A.gguf 换成 B.gguf 时 id 不变，但 A 的参数（`spec-draft-model`、`chat-template-file`
-    /// 之类指向具体文件的键）套到 B 上是错的。文件名对不上就不恢复。
-    #[serde(default)]
-    model_file: String,
-    removed_at_ms: u64,
-    entries: Vec<(String, String)>,
-}
-
-impl Default for ArchiveFile {
-    fn default() -> Self {
-        Self {
-            version: ARCHIVE_VERSION,
-            sections: BTreeMap::new(),
-        }
-    }
-}
 
 /// preset / 归档文件的读-改-写锁。
 ///
@@ -75,312 +31,6 @@ pub fn preset_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-}
-
-/// 告诉 models 模块归档文件放哪（`None` = 不归档，清理掉的段就真没了）。
-pub fn set_archive_path(path: Option<PathBuf>) {
-    let _ = ARCHIVE_PATH.set(path);
-}
-
-/// 读归档。
-///
-/// **文件存在但读不出来**（JSON 损坏、版本不符）必须报错而不是当成"空归档"：
-/// 后者会让下一次归档写入用空对象覆盖掉全部历史，用户所有被清理过的配置就真没了。
-/// 只有"文件不存在"才算空归档。
-fn read_archive() -> Result<ArchiveFile> {
-    let Some(Some(file)) = ARCHIVE_PATH.get() else {
-        return Ok(ArchiveFile::default());
-    };
-    if !file.exists() {
-        return Ok(ArchiveFile::default());
-    }
-    let text = fs::read_to_string(file)
-        .with_context(|| format!("读取归档失败: {}", file.display()))?;
-    let archive: ArchiveFile = serde_json::from_str(&text)
-        .with_context(|| format!("归档文件损坏: {}（为避免覆盖历史，本次不写入归档）", file.display()))?;
-    if archive.version != ARCHIVE_VERSION {
-        anyhow::bail!(
-            "归档文件版本不符（{} != {}）: {}",
-            archive.version,
-            ARCHIVE_VERSION,
-            file.display()
-        );
-    }
-    Ok(archive)
-}
-
-fn write_archive(archive: &ArchiveFile) -> Result<()> {
-    let Some(Some(file)) = ARCHIVE_PATH.get() else {
-        return Ok(());
-    };
-    if let Some(parent) = file.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("创建归档目录失败: {}", parent.display()))?;
-    }
-    let json = serde_json::to_string_pretty(archive).context("序列化归档失败")?;
-    // 临时名带 pid + 序号，理由同 `write_preset`：固定用 `json.tmp` 时，两个并发写
-    // 会互相截断，先改名的一方还会让另一方的 `rename` 直接失败。
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = file.with_extension(format!("json.{}.{seq}.tmp", std::process::id()));
-    fs::write(&tmp, json).with_context(|| format!("写入归档失败: {}", tmp.display()))?;
-    fs::rename(&tmp, file).with_context(|| format!("替换归档失败: {}", file.display()))
-}
-
-/// 归档若干被清理掉的段。key 用**扫描 id**（不是段名），恢复时只按扫描 id 查。
-///
-/// 返回 `Err` 表示没存住 —— 调用方**必须**据此放弃清理，否则段删了、归档也没写，
-/// 用户看到的是"清理成功"但配置永久消失。
-fn archive_sections(removed: &[(String, String, String, Vec<(String, String)>)]) -> Result<()> {
-    if removed.is_empty() {
-        return Ok(());
-    }
-    let mut archive = read_archive()?;
-    let now = crate::router::now_ms();
-    for (scanned_id, section, model_file, entries) in removed {
-        archive.sections.insert(
-            scanned_id.clone(),
-            ArchiveEntry {
-                section: section.clone(),
-                model_file: model_file.clone(),
-                removed_at_ms: now,
-                entries: entries.clone(),
-            },
-        );
-    }
-    write_archive(&archive)
-}
-
-/// 消费归档条目。
-///
-/// 必须**在 preset 已经成功写盘之后**才调用：反过来（先删归档再写 preset）一旦
-/// 写盘失败就是永久丢失。
-fn consume_archived(scanned_id: &str) -> Result<()> {
-    let mut archive = read_archive()?;
-    if archive.sections.remove(scanned_id).is_none() {
-        return Ok(());
-    }
-    write_archive(&archive)
-}
-
-/// 归档里有没有这个模型（按扫描 id 查；只读，供测试与后续扩展用）。
-#[allow(dead_code)]
-pub fn has_archived(scanned_id: &str) -> bool {
-    read_archive()
-        .map(|archive| archive.sections.contains_key(scanned_id))
-        .unwrap_or(false)
-}
-
-/// 失效段清理的结果。
-pub struct PruneResult {
-    /// 清理后的 preset 文本（没清理时就是原文）。
-    pub text: String,
-    /// 被删掉的段名。
-    pub removed: Vec<String>,
-    /// 所有带 `model` 的段都失效 → 疑似模型盘没挂上，**跳过**了清理。
-    pub skipped_all_missing: bool,
-}
-
-/// 清理「模型文件已经不存在」的 preset 段。
-///
-/// 判断依据只有一条：段里有 `model` 键、而它指向的 gguf 已经不在了。
-/// 这样区分得开两种情况：
-/// - 模型被删掉/移走 → 段自动清掉（用户不用手动去删）；
-/// - 用户手写的段指向别处的真实文件 → 文件还在，段原样保留；
-/// - 完全没有 `model` 键的段一律不碰（不是本应用生成的，可能是用户自己的写法）。
-///
-/// 被清掉的段会**先归档**（见 [`restore_archived_sections`]），模型重新下载回来时能恢复。
-///
-/// 两道"别把配置清空"的保护：
-/// 1. 任何一个**模型根目录当前不存在**（移动盘没插、网络盘掉线、盘符变了）→ 整轮跳过；
-/// 2. 所有段都失效且数量 ≥3 → 也跳过（可能是模型被整体搬走，而不是用户主动删除）。
-///
-/// 单个模型真的被删掉时（根目录还在、只有它没了）照常清理。
-pub fn prune_missing_sections(
-    text: &str,
-    alias_reverse: &HashMap<String, String>,
-    roots: &[PathBuf],
-) -> PruneResult {
-    let sections = list_sections(text);
-    let mut with_model: Vec<(String, PathBuf)> = Vec::new();
-    for section in &sections {
-        let entries = section_entries(text, section);
-        if let Some((_, value)) = entries.iter().find(|(key, _)| key == "model") {
-            let value = value.trim();
-            if !value.is_empty() {
-                with_model.push((section.clone(), PathBuf::from(value)));
-            }
-        }
-    }
-
-    let missing: Vec<(String, PathBuf)> = with_model
-        .iter()
-        .filter(|(_, path)| !path.is_file())
-        .cloned()
-        .collect();
-
-    if missing.is_empty() {
-        return PruneResult {
-            text: text.to_string(),
-            removed: Vec::new(),
-            skipped_all_missing: false,
-        };
-    }
-
-    let root_gone = roots
-        .iter()
-        .any(|root| !root.as_os_str().is_empty() && !root.is_dir());
-    let all_missing = missing.len() == with_model.len() && with_model.len() >= 3;
-    if root_gone || all_missing {
-        return PruneResult {
-            text: text.to_string(),
-            removed: Vec::new(),
-            skipped_all_missing: true,
-        };
-    }
-
-    let mut pruned = text.to_string();
-    let mut removed = Vec::new();
-    let mut archived: Vec<(String, String, String, Vec<(String, String)>)> = Vec::new();
-    for (section, path) in missing {
-        // 先按原文把段内容取出来归档，再删段。
-        // 归档 key 用扫描 id：段名可能是用户改过的别名，反查一下，
-        // 这样模型重新下载回来时只按扫描 id 就能查到。
-        let scanned_id = alias_reverse
-            .get(&section)
-            .cloned()
-            .unwrap_or_else(|| section.clone());
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        archived.push((
-            scanned_id,
-            section.clone(),
-            file_name,
-            section_entries(text, &section),
-        ));
-        pruned = remove_section(&pruned, &section);
-        removed.push(section);
-    }
-
-    // 归档失败就**不要**清理：宁可留着失效段，也不能让配置凭空消失
-    if let Err(err) = archive_sections(&archived) {
-        eprintln!("[preset] 归档失败，已放弃本次清理: {err:#}");
-        return PruneResult {
-            text: text.to_string(),
-            removed: Vec::new(),
-            skipped_all_missing: false,
-        };
-    }
-
-    PruneResult {
-        text: pruned,
-        removed,
-        skipped_all_missing: false,
-    }
-}
-
-/// 为新扫到的模型恢复归档里的段配置。
-///
-/// 只处理「preset 里还没有这个段、而归档里有记录」的模型 —— 模型重新下载回来后
-/// 参数自动回来；从没配过的模型两条都命中不了，行为和以前一致（仍然等用户点
-/// 「同步到 presets.ini」，不自动建段）。
-/// `model` 键用新扫到的路径覆盖，其余键原样写回。
-///
-/// 归档条目**不在这里消费**：调用方把 preset 成功写盘后才调
-/// [`consume_archived_section`]，否则写盘失败就等于把配置永久删了。
-///
-/// 性能上**不是**每个模型各扫一遍：早先这里是循环里 `list_sections(&out)` 重扫全文、
-/// 每次 `peek_archived` 重读并解析整份归档 JSON，200 个模型就是 200 次全文扫描 +
-/// 200 次 JSON 解析，而这段跑在 `preset_lock()` 里，会一直挡着所有 preset 写命令。
-/// 现在段名收成一个集合（插入后增量更新）、归档在循环外一次读成内存表 —— 行为不变，
-/// 只是把重复解析搬到循环外。
-pub fn restore_archived_sections(
-    text: &str,
-    models: &[ScannedModel],
-    aliases: &HashMap<String, String>,
-) -> (String, Vec<String>) {
-    let mut out = text.to_string();
-    let mut restored = Vec::new();
-
-    // 段名匹配一律大小写不敏感：用户手写 `[qwen3-4b]` 而扫描 id 是 `Qwen3-4B` 时，
-    // 按原样比较会认不出这是同一个模型，于是又 append 一段 —— router 里就出现两个段
-    // 指向同一个 gguf（一个带参数、一个是空段），用户手写的参数从此读不到。
-    let mut existing: Vec<String> = list_sections(&out);
-
-    // 归档只读一次：坏掉就整轮不恢复（文件留着等人工处理），绝不当成"空归档"
-    // —— 那会让下面的逻辑把每条都当"没归档"跳过，看起来像配置丢了。
-    let archive = match read_archive() {
-        Ok(archive) => archive.sections,
-        Err(err) => {
-            eprintln!("[preset] 读取归档失败，本次不恢复任何段（归档文件保持原样）: {err:#}");
-            return (out, restored);
-        }
-    };
-
-    for model in models {
-        // 已经有段（按扫描 id 或按别名算）就不用恢复
-        let alias = aliases
-            .get(&model.id)
-            .map(String::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let taken = |existing: &[String], name: &str| {
-            existing.iter().any(|s| s.eq_ignore_ascii_case(name))
-        };
-        if taken(&existing, &model.id) {
-            continue;
-        }
-        if let Some(alias) = alias {
-            if taken(&existing, alias) {
-                continue;
-            }
-        }
-
-        // 只按扫描 id 查归档（归档时已经把别名反查成扫描 id 了）
-        let Some(entry) = archive.get(&model.id) else {
-            continue;
-        };
-
-        // 同目录换了另一个模型文件 → 不恢复，避免把旧参数套到新模型上
-        if !entry.model_file.is_empty() {
-            let current = Path::new(&model.path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if current != entry.model_file {
-                continue;
-            }
-        }
-
-        // 段名：用户当前若还留着别名就用别名，否则用归档时记下的段名
-        let section = alias
-            .map(str::to_string)
-            .or_else(|| (!entry.section.is_empty()).then_some(entry.section.clone()))
-            .unwrap_or_else(|| model.id.clone());
-
-        out = ensure_model_section(&out, model, &section);
-        let rest: Vec<(String, String)> = entry
-            .entries
-            .iter()
-            .filter(|(key, _)| !key.eq_ignore_ascii_case("model")) // 路径用新扫到的
-            .cloned()
-            .collect();
-        out = upsert_entries(&out, &section, &rest);
-        // 刚写进去的段名要立刻并进集合，否则同一个模型名再出现一次就会重复插入
-        existing.push(section.clone());
-        restored.push(section);
-    }
-
-    (out, restored)
-}
-
-/// 消费归档条目：**只能在 preset 已经成功写盘之后调用**。
-pub fn consume_archived_section(scanned_id: &str) {
-    if let Err(err) = consume_archived(scanned_id) {
-        eprintln!("[preset] 清理归档条目失败（{scanned_id}）: {err:#}");
-    }
 }
 
 /// 扫描得到的一个模型。
@@ -407,17 +57,36 @@ pub struct ScannedModel {
     pub group: String,
 }
 
-/// 扫描结果 + 当前 preset 状态。
+/// 配置目录里的一份 config（`llamacpp-<id>.json`）。
+///
+/// 第三刀（`presets.ini` 退役）：前端原来靠解析 ini 文本拿「有哪些模型」「哪个关了
+/// WebUI」，现在直接读这个原生视图，不再经过 `render_ini_view` 的文本投影。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConfigEntry {
+    /// config 文件名主体；请求里 `model` 用的也是它（AGENTS.md 铁律 2）。
+    pub id: String,
+    /// 配置里的 `name`（迁移后与 id 一致）。
+    pub name: String,
+    /// 关掉了自带 WebUI ⇒ 卡片上的「聊天」入口要禁用（铁律 1）。
+    pub no_webui: bool,
+    /// 配置指向的模型文件还在不在（不在就是归档/失效）。
+    pub has_model: bool,
+    /// `--ctx-size` 解析出来的上下文上限；没配或配 0（= 用模型训练上限）时为 None。
+    /// 压测页据此挑档位，不必去问前门（用户 m11542 第 2 点 / m11820）。
+    #[serde(default)]
+    pub max_context: Option<u64>,
+}
+
+/// 扫描结果 + 当前配置目录状态。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelScanResult {
     pub models: Vec<ScannedModel>,
     /// 辅助文件（多模态投影 / 外挂草稿模型）：不作为模型展示，但参数里可以选。
     #[serde(default)]
     pub aux_files: Vec<AuxFile>,
-    pub preset_path: String,
-    pub preset_text: String,
-    /// preset 中存在、但当前扫描不到的段（多为历史残留或用户手写）。
-    pub orphan_sections: Vec<String>,
+    /// 配置目录里的 config 清单（原生视图，前端据此算「已配置」与 WebUI 开关）。
+    #[serde(default)]
+    pub configs: Vec<ConfigEntry>,
     /// 本次顺手清理掉的失效段（这些段的模型文件已经不在了）。
     #[serde(default)]
     pub removed_sections: Vec<String>,
@@ -456,9 +125,18 @@ pub fn is_mmproj_name(name: &str) -> bool {
     name.to_ascii_lowercase().contains("mmproj")
 }
 
+/// 文件名里出现这些片段就是**外挂草稿模型**。
+///
+/// `dspark`：用户实测目录里有 `*-dspark.gguf`（对应 `--spec-type draft-dspark`，
+/// 见 `src/assets/params.json` 里的 spec-type 选项）。只认 `draft` 的话它会被当成
+/// 主模型列出来，点进去只会加载失败 —— 与 mmproj 是同一类问题。
+/// 以后再有新的草稿类型名，往这里加一项即可。
+const DRAFT_MARKERS: &[&str] = &["draft", "dspark"];
+
 /// 文件名是否是**外挂草稿模型**（推测解码用的小模型）。
 pub fn is_draft_name(name: &str) -> bool {
-    name.to_ascii_lowercase().contains("draft")
+    let lower = name.to_ascii_lowercase();
+    DRAFT_MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
 // ---------------------------------------------------------------------------
@@ -538,7 +216,7 @@ pub fn save_scan_cache(roots: &[PathBuf], models: &[ScannedModel]) {
     let payload = ScanCacheFile {
         version: SCAN_CACHE_VERSION,
         roots: roots.iter().map(|r| to_forward_slash(r)).collect(),
-        saved_at_ms: crate::router::now_ms(),
+        saved_at_ms: crate::logs::now_ms(),
         models: models.to_vec(),
     };
     let Ok(json) = serde_json::to_string(&payload) else {
@@ -856,6 +534,9 @@ const GGUF_TYPE_STRING: u32 = 8;
 /// GGUF 值类型：UINT32（`general.file_type` 用这个）。
 const GGUF_TYPE_U32: u32 = 4;
 
+/// GGUF 值类型：UINT64（`general.context_length` 在部分文件里用这个）。
+const GGUF_TYPE_U64: u32 = 10;
+
 /// 从 GGUF 头部读到的元数据。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GgufMeta {
@@ -863,6 +544,9 @@ pub struct GgufMeta {
     pub architecture: Option<String>,
     /// `general.file_type`（llama.cpp `enum llama_ftype` 的取值）
     pub file_type: Option<u32>,
+    /// `general.context_length`：模型训练时的上下文长度。
+    /// 配置里 `--ctx-size 0`（= 用模型自带值）时靠它给出上限（用户 m11934）。
+    pub context_length: Option<u64>,
 }
 
 impl GgufMeta {
@@ -960,6 +644,24 @@ pub fn gguf_meta_cached(path: &Path, size: u64, modified_ms: u64) -> GgufMeta {
     meta
 }
 
+/// 配置里实际可用的上下文上限：优先 `--ctx-size`，为 0 或没写时用模型 GGUF 的
+/// `general.context_length` 兜底。
+///
+/// 用户 m11934：`--ctx-size 0`（llama.cpp 语义是「用模型自带值」）的模型拿不到上限，
+/// 压测页只能退回默认档位（默认勾到 256K），而这个模型其实只有 128K。
+/// 配置里没写不等于没有上限 —— GGUF 里写着。
+pub fn context_limit(config: &crate::model_config::ModelConfig) -> Option<u64> {
+    if let Some(value) = crate::model_config::ctx_size(config) {
+        return Some(value);
+    }
+    let path = Path::new(config.model.as_deref()?);
+    let (size, modified_ms) = file_meta(path);
+    if size == 0 {
+        return None;
+    }
+    gguf_meta_cached(path, size, modified_ms).context_length
+}
+
 type GgufCacheKey = (String, u64, u64);
 
 fn gguf_cache() -> &'static Mutex<HashMap<GgufCacheKey, GgufMeta>> {
@@ -982,7 +684,14 @@ static META_CACHE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static META_CACHE_DIRTY: AtomicBool = AtomicBool::new(false);
 
 /// 缓存文件版本（不匹配就整份当没有，避免旧格式被当成有效缓存）。
-pub const META_CACHE_VERSION: u32 = 1;
+///
+/// v2：多存 `context_length`。旧缓存没有这个字段，命中后不会重读文件，
+/// 模型上限就永远未知 —— 直接升版本让旧缓存整份作废（用户 m11934）。
+///
+/// v3：上下文长度改按 `<架构名>.context_length` 读（GGUF 的标准写法，见 user m12106）。
+/// v2 的缓存是把 `general.context_length` 读空之后写下的 `None`，
+/// 而键名改了它也不会重读文件 —— 同样必须整份作废。
+pub const META_CACHE_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct MetaCacheFile {
@@ -999,6 +708,8 @@ struct MetaCacheEntry {
     architecture: Option<String>,
     #[serde(default)]
     file_type: Option<u32>,
+    #[serde(default)]
+    context_length: Option<u64>,
 }
 
 /// 告诉 models 模块把元数据缓存写到哪（`None` = 不落盘）。
@@ -1062,6 +773,7 @@ fn read_meta_cache_file(file: &Path) -> HashMap<GgufCacheKey, GgufMeta> {
             GgufMeta {
                 architecture: entry.architecture,
                 file_type: entry.file_type,
+                context_length: entry.context_length,
             },
         );
     }
@@ -1093,6 +805,7 @@ pub fn flush_meta_cache() {
                 modified_ms: *modified_ms,
                 architecture: meta.architecture.clone(),
                 file_type: meta.file_type,
+                context_length: meta.context_length,
             })
             .collect(),
     };
@@ -1261,6 +974,22 @@ impl<R: Read> GgufStream<R> {
                 "general.file_type" if value_type == GGUF_TYPE_U32 => {
                     meta.file_type = self.u32();
                 }
+                // 上下文长度：标准写法是 `<arch>.context_length`（例如 `llama.context_length`），
+                // `general.context_length` 只是部分转换器的写法，两种都要认 ——
+                // 只认后者会读不到上限（用户 m12106：Sharp-MiniCPM5-2B 文件里是 llama.context_length）。
+                _ if key.ends_with(".context_length")
+                    && (key.starts_with("general.")
+                        || meta
+                            .architecture
+                            .as_deref()
+                            .is_some_and(|arch| key == format!("{arch}.context_length"))) =>
+                {
+                    match value_type {
+                        GGUF_TYPE_U32 => meta.context_length = Some(u64::from(self.u32()?)),
+                        GGUF_TYPE_U64 => meta.context_length = self.u64(),
+                        _ => self.skip_value(value_type, 0)?,
+                    }
+                }
                 _ => self.skip_value(value_type, 0)?,
             }
             if meta.architecture.is_some() && meta.file_type.is_some() {
@@ -1323,41 +1052,6 @@ fn section_bounds(lines: &[&str], section: &str) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-/// **删除/归档专用**的行区间（`[start, end)`，以行索引计）。
-///
-/// 与 [`section_bounds`] 的唯一区别：尾部不吞「段尾的空行与写在下一个段头上方的注释」，
-/// 收敛到段内**最后一个非空且非注释行**之后。
-///
-/// 为什么必须单独算：`section_bounds` 的 `end` 是下一个段头，于是 `[A]` 与 `[B]` 之间
-/// 的空行、以及写在 `[B]` 上面的注释（用户手写、说明这一段的用途）都落在 A 的区间里。
-/// 删/归档 A 时一起带走，而归档只保存 `键 = 值`（见 [`section_entries`]，它跳过空行与
-/// `#`/`;` 注释）—— 用户的注释就此**永久丢失**，模型下回来恢复时也补不回来。
-///
-/// 区间收敛后，那些空行与注释归下一个段所有：`[B]` 头上方的注释仍在原地。
-/// 段内全是空行/注释（没有任何键）时区间为空（`start == end`），此时只删段头那一行。
-fn section_removal_bounds(lines: &[&str], section: &str) -> Option<(usize, usize)> {
-    let (start, end) = section_bounds(lines, section)?;
-    let last_content = lines[start + 1..end]
-        .iter()
-        .rposition(|l| !is_blank_or_comment(l))
-        .map(|i| start + 1 + i);
-    let end = match last_content {
-        Some(last) => last + 1,
-        // 段里除了段头什么都没有：只删段头，别把后面的空行/注释一起吃掉
-        None => start + 1,
-    };
-    Some((start, end))
-}
-
-/// 空行，或 ini 注释行（`#` / `;` 开头）。
-///
-/// 只有这两种行算「可以留给下一个段」的尾部内容。不认识的行（比如用户写得不成样子的
-/// `xxx`）不算：那可能是段内容的一部分，删段时一并带走更干净。
-fn is_blank_or_comment(line: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';')
-}
-
 /// 读取某个段内的键值对。
 pub fn section_entries(text: &str, section: &str) -> Vec<(String, String)> {
     let lines: Vec<&str> = text.lines().collect();
@@ -1382,204 +1076,6 @@ pub fn section_entries(text: &str, section: &str) -> Vec<(String, String)> {
     out
 }
 
-/// 写入/更新某个段内的键值对，保留该段中未被涉及的键与注释。
-///
-/// 段不存在时追加到文件末尾。
-///
-/// 三条来自 llama.cpp `common/preset.cpp` 的实测语义（改动前踩过的坑都在这）：
-///
-/// 1. **一个键在段内只能留一行**。router 把段存成 `std::map`，visitor 里是
-///    `parsed[section][key] = value`，同名键**后出现的覆盖先出现的**。所以「保留旧行、
-///    只把新值写进第一条」是错的：用户把 `temp` 从 0.5 改成 0.9，磁盘上成了
-///    `temp = 0.9` 紧跟 `temp = 0.5`，router 读到的还是 0.5 —— 界面改了参数、模型行为
-///    不变。这里把段内该键的**所有**旧行都吃掉，只留一条新行，位置用第一次出现的地方
-///    （参数顺序不跳动，用户看到的还是原来的排列）。
-/// 2. **键名统一写成小写**。router 的选项表里键名是长参数名（`temp`、`ctx-size`），
-///    查表大小写敏感，`Temp = 0.9` 会走到 "option 'Temp' not recognized in preset"；
-///    而 `*_ARG_*` 环境变量名（大写）既不是 ini 里该写的形态，也不是长参数名。
-///    所以界面给的键与文件里已有的同名键都按小写比较、按小写写回 ——
-///    同一个参数不会以两种写法存在两条。
-/// 3. **同名段只认第一个**（[`section_bounds`] 取首个匹配）：用户手写了两段同名时，
-///    GUI 只改第一段，而 router 侧是「后者把前者整个清空」（每遇到段头就
-///    `parsed[current_section] = {}`）。两者行为不一致，但 GUI 侧重复建段本身就是错的，
-///    这里选择不动用户没让改的那一段。
-pub fn upsert_entries(text: &str, section: &str, entries: &[(String, String)]) -> String {
-    let mut lines: Vec<String> = if text.is_empty() {
-        vec!["version = 1".to_string(), String::new()]
-    } else {
-        text.lines().map(|l| l.to_string()).collect()
-    };
-
-    // 同一批 entries 里同名键也只写一行：后一个值胜出（与 router 的"后者覆盖"一致），
-    // 位置取该键第一次出现的位置，不搬到段尾。
-    let mut merged: Vec<(String, String)> = Vec::with_capacity(entries.len());
-    for (k, v) in entries {
-        let key = k.trim().to_ascii_lowercase();
-        match merged.iter().position(|(mk, _)| *mk == key) {
-            Some(pos) => merged[pos].1 = v.clone(),
-            None => merged.push((key, v.clone())),
-        }
-    }
-
-    let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
-    match section_bounds(&refs, section) {
-        Some((start, end)) => {
-            // 每个键只换一次：None 表示"这个键还没处理过"，Some(pos) 表示新行已写在
-            // `replaced[pos]`。`appended_key` 决定段内没出现过的键追加到哪里 —— 有替换过
-            // 键时紧跟在最后一个被替换的键之后（保持原参数顺序），一个都没换时才落到段尾。
-            let mut slot: Vec<Option<usize>> = vec![None; merged.len()];
-            let mut appended_key: Option<usize> = None;
-            let mut replaced: Vec<String> = Vec::with_capacity(end - start - 1);
-            for line in &lines[start + 1..end] {
-                let key = entry_re()
-                    .captures(line)
-                    .map(|c| c[1].to_ascii_lowercase());
-                match key {
-                    Some(key) => match merged.iter().position(|(k, _)| *k == key) {
-                        Some(pos) => {
-                            // 这个键的**每一行**旧内容都吃掉，包括后出现的重复键
-                            if slot[pos].is_none() {
-                                let (k, v) = &merged[pos];
-                                if !v.trim().is_empty() {
-                                    // 空值表示删除该键
-                                    slot[pos] = Some(replaced.len());
-                                    replaced.push(format!("{k} = {v}"));
-                                }
-                                // 删键时不占位：slot 仍是 None，但后面同一键的行照样被吃掉
-                            }
-                        }
-                        None => replaced.push(line.clone()),
-                    },
-                    None => replaced.push(line.clone()),
-                }
-            }
-            for (pos, (k, v)) in merged.iter().enumerate() {
-                if slot[pos].is_none() && !v.trim().is_empty() {
-                    let at = match appended_key {
-                        Some(last) => {
-                            appended_key = Some(last + 1);
-                            last + 1
-                        }
-                        None => {
-                            appended_key = Some(replaced.len());
-                            replaced.len()
-                        }
-                    };
-                    replaced.insert(at, format!("{k} = {v}"));
-                }
-            }
-
-            let mut result: Vec<String> = Vec::with_capacity(lines.len() + 4);
-            result.extend_from_slice(&lines[..=start]);
-            // 丢掉段头后紧跟的空行，保持紧凑
-            let mut body: Vec<String> = replaced;
-            while body.first().map(|l| l.trim().is_empty()).unwrap_or(false) {
-                body.remove(0);
-            }
-            while body.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
-                body.pop();
-            }
-            result.extend(body);
-            result.push(String::new());
-            result.extend_from_slice(&lines[end..]);
-            lines = result;
-        }
-        None => {
-            if lines.last().map(|l| !l.trim().is_empty()).unwrap_or(false) {
-                lines.push(String::new());
-            }
-            lines.push(format!("[{section}]"));
-            for (k, v) in &merged {
-                if !v.trim().is_empty() {
-                    lines.push(format!("{k} = {v}"));
-                }
-            }
-            lines.push(String::new());
-        }
-    }
-
-    // 去掉文件末尾多余空行，保证以换行结束
-    while lines.len() > 1 && lines.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
-        lines.pop();
-    }
-    let mut out = lines.join("\n");
-    out.push('\n');
-    out
-}
-
-/// 删除一个段。
-///
-/// 用 [`section_removal_bounds`]（不是 `section_bounds`）：段尾的空行与写在下一个段头上方的
-/// 注释归下一个段所有，删这一段不能顺手带走 —— 归档只存 `键 = 值`，注释丢了就找不回来。
-pub fn remove_section(text: &str, section: &str) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let Some((start, end)) = section_removal_bounds(&lines, section) else {
-        return text.to_string();
-    };
-    let mut kept: Vec<String> = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        if i >= start && i < end {
-            continue;
-        }
-        kept.push(line.to_string());
-    }
-    while kept.len() > 1 && kept.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
-        kept.pop();
-    }
-    let mut out = kept.join("\n");
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out
-}
-
-/// 确保某个模型在 preset 中有对应段（存在则只校正 `model` 路径）。
-/// 确保该模型在 preset 里有一段。
-///
-/// `section` 是段名，默认传 `model.id`；用户改过别名时传别名 —— 否则"同步 preset"
-/// 会按扫描 id 再建一段，改名后的模型就出现两个段。
-pub fn ensure_model_section(text: &str, model: &ScannedModel, section: &str) -> String {
-    let mut entries: Vec<(String, String)> = Vec::new();
-    if let Some(mmproj) = &model.mmproj {
-        // 多模态：目录内的 mmproj 会被 router 自动识别，这里仅在需要时显式声明
-        let _ = mmproj;
-    }
-    entries.push(("model".to_string(), model.path.clone()));
-    upsert_entries(text, section, &entries)
-}
-
-/// 读取 preset 文件（不存在则返回最小内容）。
-pub fn read_preset(path: &Path) -> Result<String> {
-    if !path.exists() {
-        return Ok("version = 1\n".to_string());
-    }
-    fs::read_to_string(path).with_context(|| format!("读取 {} 失败", path.display()))
-}
-
-/// 写入 preset 文件（自动创建父目录）。
-///
-/// **原子替换**：presets.ini 是用户配置的唯一载体，就地截断写一旦崩溃/断电就会留下
-/// 半截文件，而 `read_preset` 只判 `exists()`，会把它当成"从没配过"，用户的调参就没了。
-/// 所以先写临时文件、留一份 `.bak`、再改名。
-pub fn write_preset(path: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("创建目录 {} 失败", parent.display()))?;
-    }
-    // 临时名带 pid + 序号：固定用 `presets.ini.tmp` 时，两个并发写会互相截断，
-    // 先改名的一方还会让另一方的 rename 直接失败。加序号后，即使某条命令漏了
-    // `preset_lock()`，最坏也只是"后写的赢"，不会把半截内容 rename 成正式文件。
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = path.with_extension(format!("ini.{}.{seq}.tmp", std::process::id()));
-    fs::write(&tmp, content).with_context(|| format!("写入 {} 失败", tmp.display()))?;
-    if path.exists() {
-        // 留一版上一状态，人工误操作后还能救回来
-        let _ = fs::copy(path, path.with_extension("ini.bak"));
-    }
-    fs::rename(&tmp, path).with_context(|| format!("替换 {} 失败", path.display()))
-}
-
 /// 已经被 llama.cpp 淘汰的 preset 键：写回时**直接丢掉**（不做等价转换）。
 ///
 /// 留着的代价是**整个 router 起不来**，而不是只有那一段失效：
@@ -1587,177 +1083,6 @@ pub fn write_preset(path: &Path, content: &str) -> Result<()> {
 ///
 /// - `no-mmap`：新版用 `--load-mode` 取代（`none` = 不用 mmap）后移除了这个开关。
 pub const RETIRED_PRESET_KEYS: &[&str] = &["no-mmap"];
-
-/// 把 hub 风格（也是本应用历史遗留）的 `spec-type_X` 键并回 `spec-type`。
-///
-/// hub 的 UI 把 ngram-mod / ngram-map-k4v 做成独立勾选项、flag 写成 `--spec-type_ngram-mod`，
-/// 我们的参数表一度照搬，于是 preset 里出现 `spec-type_ngram-mod = true`。
-/// llama.cpp 读 preset 时这是**未知选项**，会让 `/models?reload=1` 直接返回 500
-///（"option 'spec-type_ngram-mod' not recognized"），界面上报「读取 router 模型列表失败」，
-/// 该段的子实例也起不来。
-///
-/// `--spec-type` 支持**逗号多值**（llama.cpp 的处理函数就是 `string_split(value, ',')`），
-/// 且 ngram-mod 本来就要能和 draft-mtp 之类的草稿类型共存，所以合并时是**追加**而不是覆盖，
-/// 并按顺序去重；伪键值为假时只是丢掉该键。
-///
-/// 顺带**删除已淘汰的参数名**：新版 llama.cpp 移除了 `--no-mmap`（改用 `--load-mode`），
-/// 旧键留在 preset 里，新版会**直接拒绝启动 router**：
-/// `failed to initialize router models: option 'no-mmap' not recognized in preset 'X'`
-/// —— 一个模型段里的一个过期键，会让所有模型都用不了。这里直接丢掉，不做等价转换。
-pub fn sanitize_preset_keys(text: &str) -> String {
-    // None 表示这一行要删掉（占位回填用）
-    let mut out: Vec<Option<String>> = Vec::new();
-    let mut spec_pos: Option<usize> = None;
-    let mut values: Vec<String> = Vec::new();
-    // 当前段里已经出现过的键 → 该键那一行在 `out` 里的位置（换段清空）
-    let mut kv_pos: HashMap<String, usize> = HashMap::new();
-
-    let read_value = |line: &str| -> String {
-        line.split_once('=')
-            .map(|(_, v)| v.trim().to_string())
-            .unwrap_or_default()
-    };
-    let push_value = |values: &mut Vec<String>, raw: &str| {
-        for part in raw.split(',') {
-            let part = part.trim();
-            if !part.is_empty() && !values.iter().any(|v| v == part) {
-                values.push(part.to_string());
-            }
-        }
-    };
-
-    let flush = |out: &mut Vec<Option<String>>, spec_pos: &mut Option<usize>, values: &mut Vec<String>| {
-        match spec_pos.take() {
-            Some(pos) => {
-                if values.is_empty() {
-                    out[pos] = None;
-                } else {
-                    out[pos] = Some(format!("spec-type = {}", values.join(",")));
-                }
-            }
-            // 段里**只有**伪键、没有真的 `spec-type` 行时，`spec_pos` 是 None：合并出来的
-            // 值必须在这里新建一行，否则 `flush` 什么都不做，值就随着 `values.clear()`
-            // 一起消失 —— 用户勾上的 ngram-mod 在界面上是选中、写盘后却没写出去。
-            // 追加在当前行号处：段内的参数顺序保持原样（新键落在段尾）。
-            None => {
-                if !values.is_empty() {
-                    out.push(Some(format!("spec-type = {}", values.join(","))));
-                }
-            }
-        }
-        values.clear();
-    };
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        // 段边界：先把上一段合并结果落定
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            flush(&mut out, &mut spec_pos, &mut values);
-            out.push(Some(line.to_string()));
-            // 键名去重是按段算的：换段就把账清了
-            kv_pos.clear();
-            continue;
-        }
-        if let Some(caps) = entry_re().captures(line) {
-            // 键名统一按小写比较、按小写回写：router 的选项表键名就是长参数名
-            // （`temp` / `ctx-size`），查表**大小写敏感**，`Temp` 会被当成未知选项。
-            // 见 [`upsert_entries`] 的说明。
-            let key = caps[1].to_ascii_lowercase();
-            if key == "spec-type" || key.starts_with("spec-type_") {
-                // `spec-type_X` 是 hub 的伪键，`spec-type` 是真键，两者都要并成一条
-                match key.strip_prefix("spec-type_") {
-                    // 伪键：真值并进 `spec-type` 的值列表，原行一律不保留
-                    Some(rest) => {
-                        if is_truthy(&read_value(line)) {
-                            push_value(&mut values, rest);
-                        }
-                    }
-                    // 真键：值记进列表，位置留个占位行，等落段时回填
-                    None => {
-                        // 同一段里出现重复的 `spec-type` 时只留一条（router 取后者）。
-                        // 上一次的占位行置空删掉 —— 不删就会留下一个空行，而且 `flush`
-                        // 只回填最后那个占位。
-                        if let Some(prev) = kv_pos.insert(key.clone(), out.len()) {
-                            out[prev] = None;
-                        }
-                        spec_pos = Some(out.len());
-                        out.push(Some(String::new()));
-                        push_value(&mut values, &read_value(line));
-                    }
-                }
-                continue;
-            }
-            // 已淘汰的参数：留着会让 router 起不来，直接丢掉整行
-            if RETIRED_PRESET_KEYS.contains(&key.as_str()) {
-                continue;
-            }
-            // `webui` 与 `no-webui` 是同一个开关的两种写法（llama.cpp 会把取值为假的
-            // flag 换成它的否定别名）。参数表用的是 hub 的键名 `no-webui`，这里统一过去：
-            //   webui = false/0  → no-webui = true（显式关闭）
-            //   webui = true/1   → 删掉（等于默认：自带界面开）
-            // 之前一版界面用的是 `webui` 键，用户勾过"关闭"的段会残留 `webui = false`，
-            // 结果子实例没有界面、而配置里又找不到对应开关。
-            if key == "webui" {
-                if !is_truthy(&read_value(line)) {
-                    out.push(Some("no-webui = true".to_string()));
-                }
-                continue;
-            }
-            // 其余键：键名统一成小写（router 查表大小写敏感），同一段内同名键只留最后一条。
-            //
-            // 只改键名那一段的字符，等号右边的值和用户写的空格原样保留 —— 用户的文件不该
-            // 因为我们"顺手规范化"而整体重排。同名键保留**最后一条的值**、并放在最后一条的
-            // 位置上：router 的解析是 `parsed[section][key] = value`（后写覆盖先写），
-            // 这样文本里的先后 = router 的取值先后，不会出现"界面显示新值、实际跑旧值"。
-            let canonical = lower_key(line, &caps);
-            let at = out.len();
-            if let Some(prev) = kv_pos.insert(key.clone(), at) {
-                out[prev] = None;
-            }
-            out.push(Some(canonical));
-            // 必须 `continue`：这一行的规范形态已经写进 `out`，再走一遍循环末尾的
-            // `out.push(line)` 就会把原行**又追加一次**（`to_lowercase` 没改动的行看起来
-            // 完全一样），结果是整个 preset 的每个键都写了两遍 —— 文件体积翻倍，而且
-            // 重复键在 router 里是"后者覆盖"，语义上就靠"两行同值"侥幸不出错。
-            continue;
-        }
-        out.push(Some(line.to_string()));
-    }
-    flush(&mut out, &mut spec_pos, &mut values);
-
-    let mut joined = out
-        .into_iter()
-        .flatten()
-        .collect::<Vec<String>>()
-        .join("\n");
-    if text.ends_with('\n') {
-        joined.push('\n');
-    }
-    joined
-}
-
-/// preset 里表示"开"的值（llama.cpp 的 flag 类选项：真则输出 `--key`，假则整条不输出）。
-fn is_truthy(value: &str) -> bool {
-    !matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "" | "0" | "false" | "no" | "off"
-    )
-}
-
-/// 只把 `键 = 值` 里**键名那一段**改成小写，等号右边的值、缩进与空格全部原样保留。
-///
-/// 不整行 `to_lowercase()`：值可能是路径（Windows 路径大小写不敏感，但用户写的形态
-/// 不该被我们改），也可能是模板名之类的字符串。
-fn lower_key(line: &str, caps: &Captures<'_>) -> String {
-    let Some(m) = caps.get(1) else {
-        return line.to_string();
-    };
-    let mut out = String::with_capacity(line.len());
-    out.push_str(&line[..m.start()]);
-    out.push_str(&m.as_str().to_ascii_lowercase());
-    out.push_str(&line[m.end()..]);
-    out
-}
 
 // ---------- 从 llama.cpp-hub 迁移模型启动参数 ----------
 //
@@ -1935,30 +1260,32 @@ fn hub_entries_for(
     Some(entries_from_hub_args(&args))
 }
 
-/// 把 hub 的参数合并进 preset 文本。返回（新文本, 报告）。
-pub fn import_hub_presets(preset: &str, hub_config: &Path) -> Result<(String, HubImportReport)> {
+/// 把 hub 的参数合并进**配置目录**（第三刀：不再经过 ini 文本中间层）。返回报告。
+///
+/// 导入只增不减：只遍历配置目录里已有的段，hub 里没有对应配置的段照旧记进 `missing`。
+pub fn import_hub_into_dir(dir: &Path, hub_config: &Path) -> Result<HubImportReport> {
     let raw = fs::read_to_string(hub_config)
         .with_context(|| format!("读取 {} 失败", hub_config.display()))?;
     let hub: BTreeMap<String, HubEntry> = serde_json::from_str(&raw)
         .with_context(|| format!("解析 {} 失败", hub_config.display()))?;
 
-    let mut text = preset.to_string();
     let mut report = HubImportReport {
         hub_path: hub_config.display().to_string(),
         ..Default::default()
     };
-    for section in list_sections(preset) {
+    for item in crate::model_config::load_dir(dir) {
+        let section = item.config.name.clone();
         report.total += 1;
         match hub_entries_for(&hub, &section) {
             Some(entries) if !entries.is_empty() => {
                 report.matched += 1;
                 report.entries += entries.len();
-                text = upsert_entries(&text, &section, &entries);
+                crate::model_config::upsert_entries_in_dir(dir, &section, &entries)?;
             }
             _ => report.missing.push(section),
         }
     }
-    Ok((text, report))
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -2016,168 +1343,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 失效段清理：模型文件没了 → 段删掉；文件还在 / 没有 model 键 → 原样保留
-    #[test]
-    fn prune_removes_sections_whose_model_is_gone() {
-        let _guard = lock_global_state();
-        let dir = std::env::temp_dir().join("llamacpp-gui-prune-test");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let alive = touch(&dir.join("alive.gguf"), 16);
-        let gone = dir.join("gone.gguf"); // 故意不创建
 
-        let text = format!(
-            "version = 1\n\n[Alive]\nmodel = {}\n\n[Gone]\nmodel = {}\n\n[Handwritten]\ntemp = 0.7\n",
-            alive.to_string_lossy().replace('\\', "/"),
-            gone.to_string_lossy().replace('\\', "/"),
-        );
 
-        let result = prune_missing_sections(&text, &HashMap::new(), &[]);
-        assert_eq!(result.removed, vec!["Gone".to_string()]);
-        assert!(!result.skipped_all_missing);
-        assert!(result.text.contains("[Alive]"), "文件还在的段不能删");
-        assert!(!result.text.contains("[Gone]"), "文件没了的段应删掉");
-        assert!(result.text.contains("[Handwritten]"), "没有 model 键的段一律不碰");
 
-        let _ = fs::remove_dir_all(&dir);
-    }
 
-    /// 全部段都失效时（多半是模型盘没挂上）跳过清理，避免把配置清空
-    #[test]
-    fn prune_skips_when_every_model_is_missing() {
-        let _guard = lock_global_state();
-        let dir = std::env::temp_dir().join("llamacpp-gui-prune-all-missing");
-        let missing = dir.join("nope.gguf");
-        let path = missing.to_string_lossy().replace('\\', "/");
-        let text = format!(
-            "version = 1\n\n[A]\nmodel = {path}\n\n[B]\nmodel = {path}\n\n[C]\nmodel = {path}\n"
-        );
-
-        let result = prune_missing_sections(&text, &HashMap::new(), &[]);
-        assert!(result.removed.is_empty());
-        assert!(result.skipped_all_missing);
-        assert_eq!(result.text, text, "跳过时必须原文返回");
-    }
-
-    /// 归档 → 恢复：模型删了又下回来，段配置要能接上（且 model 路径用新扫到的）
-    #[test]
-    fn archived_section_restores_after_model_comes_back() {
-        let _guard = lock_global_state();
-        let dir = std::env::temp_dir().join("llamacpp-gui-archive-test");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        set_archive_path(Some(dir.join("removed-preset-sections.json")));
-
-        // 扫描结果里的主文件路径（sample_model 用的是虚构路径，正好表示"文件不在"）
-        let scanned = vec![sample_model("Unsloth/Qwen3-4B")];
-        let path = scanned[0].path.clone();
-
-        // 1) 用户配好了这个模型（段里的 model 指向同一个文件）
-        let user_tuned =
-            format!("version = 1\n\n[Unsloth/Qwen3-4B]\nmodel = {path}\nctx-size = 32768\ntemp = 0.6\n");
-
-        // 2) 模型文件不在了 → 清理时归档
-        let pruned = prune_missing_sections(&user_tuned, &HashMap::new(), &[]);
-        assert_eq!(pruned.removed, vec!["Unsloth/Qwen3-4B".to_string()]);
-        assert!(!pruned.text.contains("ctx-size"), "段已被清掉");
-        assert!(has_archived("Unsloth/Qwen3-4B"), "清理掉的段必须进归档");
-
-        // 3) 模型重新下载回来 → 扫描时恢复（新路径，旧参数）
-        let (restored_text, restored) =
-            restore_archived_sections(&pruned.text, &scanned, &HashMap::new());
-        assert_eq!(restored, vec!["Unsloth/Qwen3-4B".to_string()]);
-        assert!(restored_text.contains("[Unsloth/Qwen3-4B]"));
-        assert!(restored_text.contains("ctx-size = 32768"), "旧参数要接回来");
-        assert!(restored_text.contains("temp = 0.6"));
-        assert!(
-            restored_text.contains(&scanned[0].path),
-            "model 键要用新扫到的路径覆盖：{restored_text}"
-        );
-
-        // 4) 恢复动作本身不消费归档（消费要等 preset 真的写盘成功）
-        assert!(has_archived("Unsloth/Qwen3-4B"));
-        consume_archived_section("Unsloth/Qwen3-4B");
-        assert!(!has_archived("Unsloth/Qwen3-4B"), "写盘后才消费归档");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// 同一目录换了另一个模型文件（扫描 id 相同）时**不能**恢复旧参数：
-    /// 旧配置里可能含 `spec-draft-model` / `chat-template-file` 这种指向具体文件的键。
-    #[test]
-    fn archived_section_is_not_restored_for_a_different_file() {
-        let _guard = lock_global_state();
-        let dir = std::env::temp_dir().join("llamacpp-gui-archive-swap-test");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        set_archive_path(Some(dir.join("removed-preset-sections.json")));
-
-        let old_path = dir.join("Old-Model-Q8_0.gguf");
-        let tuned = format!(
-            "version = 1\n\n[Unsloth/Qwen3-4B]\nmodel = {}\nctx-size = 32768\n",
-            old_path.to_string_lossy().replace('\\', "/")
-        );
-        let pruned = prune_missing_sections(&tuned, &HashMap::new(), &[]);
-        assert_eq!(pruned.removed.len(), 1);
-        assert!(has_archived("Unsloth/Qwen3-4B"));
-
-        // 同一目录里换成了另一个模型文件
-        let mut swapped = sample_model("Unsloth/Qwen3-4B");
-        swapped.path = dir
-            .join("New-Model-Q4_K_M.gguf")
-            .to_string_lossy()
-            .replace('\\', "/");
-        let (text, restored) = restore_archived_sections(&pruned.text, &[swapped], &HashMap::new());
-        assert!(restored.is_empty(), "文件名对不上不该恢复: {text}");
-        assert!(!text.contains("ctx-size"), "不该把旧参数套上来");
-        assert!(has_archived("Unsloth/Qwen3-4B"), "归档要留着等原文件回来");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// 改过名的模型：段名是别名，但归档 key 必须是扫描 id ——
-    /// 这样模型重新下载回来（扫描 id 不变、别名也还在）时，只按扫描 id 就能查回来
-    #[test]
-    fn archived_section_uses_scanned_id_as_key() {
-        let _guard = lock_global_state();
-        let dir = std::env::temp_dir().join("llamacpp-gui-archive-alias-test");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        set_archive_path(Some(dir.join("removed-preset-sections.json")));
-
-        let scanned_id = "Ornith-ai/Cyber-Tiel-Coder-35B-A3B-MTPv2-23G-ICE";
-        let alias = "Ornith-ai/Cyber-Tiel-Coder-35B-A3B";
-        let model_file = dir.join("model.gguf");
-        let path = model_file.to_string_lossy().replace('\\', "/");
-
-        // 用户改过名后，preset 里是别名段
-        let tuned = format!("version = 1\n\n[{alias}]\nmodel = {path}\nctx-size = 65536\n");
-        let mut aliases = HashMap::new();
-        aliases.insert(scanned_id.to_string(), alias.to_string());
-        let alias_reverse: HashMap<String, String> = aliases
-            .iter()
-            .map(|(k, v)| (v.clone(), k.clone()))
-            .collect();
-
-        // 模型被删 → 清理并归档（key 落到扫描 id 上）
-        fs::remove_file(&model_file).ok();
-        let pruned = prune_missing_sections(&tuned, &alias_reverse, &[]);
-        assert_eq!(pruned.removed, vec![alias.to_string()]);
-        assert!(has_archived(scanned_id), "归档 key 必须是扫描 id，而不是别名");
-
-        // 模型重新下载 → 按扫描 id 命中，段名还原成别名
-        touch(&model_file, 32);
-        let scanned = vec![ScannedModel {
-            id: scanned_id.to_string(),
-            ..sample_model(scanned_id)
-        }];
-        let (restored_text, restored) = restore_archived_sections(&pruned.text, &scanned, &aliases);
-        assert_eq!(restored, vec![alias.to_string()], "恢复出来的段名应是用户的别名");
-        assert!(restored_text.contains(&format!("[{alias}]")));
-        assert!(restored_text.contains("ctx-size = 65536"));
-
-        let _ = fs::remove_dir_all(&dir);
-    }
 
     fn touch(path: &Path, bytes: usize) -> PathBuf {
         if let Some(parent) = path.parent() {
@@ -2237,6 +1406,25 @@ mod tests {
             read_gguf_meta(&path).architecture.as_deref(),
             Some("qwen3moe")
         );
+    }
+
+    #[test]
+    fn gguf_context_length_is_read_from_arch_prefix() {
+        // 真实 GGUF 用的是 `<arch>.context_length`（如 llama.context_length），
+        // 只认 general.context_length 会读不到上限（用户 m12106）。
+        let arch = gguf_string("llama");
+        let context = 131072u32.to_le_bytes();
+        let path = write_gguf(
+            "ctx.gguf",
+            &gguf_bytes(
+                &[
+                    ("general.architecture", 8, &arch),
+                    ("llama.context_length", 4, &context),
+                ],
+                3,
+            ),
+        );
+        assert_eq!(read_gguf_meta(&path).context_length, Some(131072));
     }
 
     #[test]
@@ -2468,256 +1656,19 @@ mod tests {
     }
 
     #[test]
-    fn mmproj_and_draft_name_detection() {        assert!(is_mmproj_name("mmproj-model-f16.gguf"));
+    fn mmproj_and_draft_name_detection() {
+        assert!(is_mmproj_name("mmproj-model-f16.gguf"));
         assert!(is_mmproj_name("MiniCPM-V-2_6-mmproj-model-f16.gguf"));
         assert!(is_mmproj_name("MMPROJ-F16.GGUF"));
         assert!(!is_mmproj_name("Qwen3-4B-Q8_0.gguf"));
 
         assert!(is_draft_name("Qwen3-0.6B-draft-Q8_0.gguf"));
         assert!(is_draft_name("Draft-Model.gguf"));
+        // dspark 草稿（--spec-type draft-dspark）：名字里没有 draft 三个字母，单独认
+        assert!(is_draft_name("Qwen3-4B-dspark-Q8_0.gguf"));
+        assert!(is_draft_name("QWEN3-4B-DSPARK.gguf"));
         // MTP 是模型自带的投机头，不是外挂草稿模型
         assert!(!is_draft_name("Ornith-1.5-9B-MTP-Q6_K.gguf"));
-    }
-
-    #[test]
-    fn preset_roundtrip_keeps_user_content() {        let original = "\
-version = 1
-
-; 用户手写注释
-[*]
-ctx-size = 32768
-n-gpu-layers = 99
-
-[MiniCPM5-2B]
-model = E:/AI/models/OpenBMB/MiniCPM5-2B/MiniCPM5-2B-Q8_0.gguf
-temp = 0.7
-# 保留我自己的注释
-my-custom-key = keep-me
-";
-
-        // 只更新 model 与 temp，其他键/注释必须保留
-        let updated = upsert_entries(
-            original,
-            "MiniCPM5-2B",
-            &[
-                ("model".into(), "E:/new/path/model.gguf".into()),
-                ("temp".into(), "0.9".into()),
-            ],
-        );
-
-        assert!(updated.contains("ctx-size = 32768"));
-        assert!(updated.contains("n-gpu-layers = 99"));
-        assert!(updated.contains("; 用户手写注释"));
-        assert!(updated.contains("# 保留我自己的注释"));
-        assert!(updated.contains("my-custom-key = keep-me"));
-        assert!(updated.contains("model = E:/new/path/model.gguf"));
-        assert!(updated.contains("temp = 0.9"));
-        assert!(!updated.contains("temp = 0.7"));
-        assert_eq!(list_sections(&updated), vec!["MiniCPM5-2B"]);
-
-        // 新增段
-        let added = upsert_entries(&updated, "New-Model", &[("model".into(), "E:/x.gguf".into())]);
-        assert!(added.contains("[New-Model]"));
-        assert!(added.contains("model = E:/x.gguf"));
-        assert_eq!(list_sections(&added), vec!["MiniCPM5-2B", "New-Model"]);
-
-        // 读取段内容
-        let entries = section_entries(&added, "New-Model");
-        assert_eq!(entries, vec![("model".to_string(), "E:/x.gguf".to_string())]);
-
-        // 删除段
-        let removed = remove_section(&added, "New-Model");
-        assert!(!removed.contains("[New-Model]"));
-        assert!(removed.contains("[MiniCPM5-2B]"));
-        assert_eq!(list_sections(&removed), vec!["MiniCPM5-2B"]);
-    }
-
-    /// 删段不能吃掉写在**下一个段头上方**的注释（M3）。
-    ///
-    /// `section_bounds` 的区间尾部是下一个段头，于是 `[A]` 与 `[B]` 之间的空行与注释都算在
-    /// A 头上。删 A 时一起带走，而归档只存 `键 = 值`（`section_entries` 跳过 `#`/`;` 行），
-    /// 用户的注释就此永久丢失。这里断言：删掉前一段后，后一段头上的注释仍在原地。
-    #[test]
-    fn remove_section_keeps_comments_above_next_section() {
-        static INI: &str = "\
-version = 1
-
-[Alive]
-model = E:/a.gguf
-
-# [Gone] 的注释：说明这一段的用途
-; 第二行注释
-[Gone]
-model = E:/gone.gguf
-
-; [Handwritten] 的注释
-[Handwritten]
-temp = 0.7
-";
-        let out = remove_section(INI, "Gone");
-        assert!(out.contains("# [Gone] 的注释：说明这一段的用途"), "{out}");
-        assert!(out.contains("; 第二行注释"), "{out}");
-        assert!(!out.contains("model = E:/gone.gguf"), "段内容要删掉：{out}");
-        assert!(!out.contains("[Gone]\n"), "{out}");
-        assert_eq!(list_sections(&out), vec!["Alive", "Handwritten"]);
-
-        // 段内的注释（写在段头与键之间）不算尾部内容，应随段一起删掉
-        let tuned = "\
-[Alive]
-model = E:/a.gguf
-
-[Gone]
-# 段内注释，属于这一段
-model = E:/gone.gguf
-
-[Handwritten]
-temp = 0.7
-";
-        let out = remove_section(tuned, "Gone");
-        assert!(out.contains("[Handwritten]"), "{out}");
-        assert!(!out.contains("# 段内注释"), "{out}");
-    }
-
-    /// 归档路径同样不能吃掉下一个段头上方的注释（M3 的另一半）。
-    #[test]
-    fn prune_keeps_comments_above_next_section() {
-        let _guard = lock_global_state();
-        let dir = std::env::temp_dir().join("llamacpp-gui-prune-comment-test");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let alive = touch(&dir.join("alive.gguf"), 8);
-        let gone = dir.join("gone.gguf"); // 故意不创建
-
-        let text = format!(
-            "version = 1\n\n[Alive]\nmodel = {}\n\n# 这一行注释是写给 [Handwritten] 的\n[Handwritten]\ntemp = 0.7\n\n[Gone]\nmodel = {}\n",
-            alive.to_string_lossy().replace('\\', "/"),
-            gone.to_string_lossy().replace('\\', "/"),
-        );
-        let result = prune_missing_sections(&text, &HashMap::new(), &[]);
-        assert_eq!(result.removed, vec!["Gone".to_string()]);
-        assert!(result.text.contains("[Handwritten]"), "{}", result.text);
-        assert!(
-            result.text.contains("# 这一行注释是写给 [Handwritten] 的"),
-            "被清理段的尾部注释属于下一个段：{}",
-            result.text
-        );
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// 段名匹配大小写不敏感（M10）。
-    ///
-    /// 用户手写 `[qwen3-4b]` 而扫描出来的 id 是 `Qwen3-4B` 时，精确比较会认不出这是同一个
-    /// 模型，同步 preset 就再 append 一段 —— router 里两个段指向同一个 gguf。断言：各种写法
-    /// 都被当作同一段（不新增第二段），而 `list_sections` 仍返回磁盘上的原始大小写。
-    #[test]
-    fn section_name_matching_is_case_insensitive() {
-        let text = "version = 1\n\n[Qwen3-4B]\nmodel = E:/a.gguf\ntemp = 0.7\n";
-        assert_eq!(
-            section_entries(text, "qwen3-4b"),
-            vec![
-                ("model".to_string(), "E:/a.gguf".to_string()),
-                ("temp".to_string(), "0.7".to_string())
-            ]
-        );
-
-        // upsert 用另一种大小写 → 命中同一个段并更新，绝不新增段
-        let out = upsert_entries(text, "QWEN3-4b", &[("temp".into(), "0.9".into())]);
-        assert_eq!(list_sections(&out), vec!["Qwen3-4B"], "{out}");
-        assert!(out.contains("temp = 0.9"), "{out}");
-        assert_eq!(out.matches("[Qwen3-4B]").count(), 1, "{out}");
-
-        // 大小写不同的段名只认第一个（router 侧同名段是"后者清空前者"，见函数注释）
-        let two = "version = 1\n\n[Qwen3-4B]\ntemp = 0.7\n\n[qwen3-4b]\ntemp = 0.2\n";
-        let out = upsert_entries(two, "qwen3-4b", &[("temp".into(), "0.9".into())]);
-        assert_eq!(list_sections(&out).len(), 2, "{out}");
-        assert_eq!(out.matches("temp = 0.9").count(), 1, "{out}");
-        assert!(out.contains("temp = 0.2"), "第二段原样不动：{out}");
-    }
-
-    /// 段内重复键必须合并成一条（M9）。
-    ///
-    /// router 把段存成 `std::map`，同名键**后出现的覆盖先出现的**。早先 `upsert_entries`
-    /// 每个键只消费一次，第二次出现的同名键落进 `else` 原样保留 → 界面把 `temp` 从 0.5 改成
-    /// 0.9 后磁盘上是 `temp = 0.9` 紧跟 `temp = 0.5`，router 读到的还是 0.5：用户改了参数、
-    /// 模型行为不变。断言：写完之后该键在段内**只剩一行**且是新值。
-    ///
-    /// 顺带覆盖键名规范化：router 的选项表键名是长参数名，查表大小写敏感，
-    /// `Temp` 会走到 "option 'Temp' not recognized in preset"。
-    #[test]
-    fn upsert_merges_duplicate_keys_and_lowercases_key() {
-        let text = "version = 1\n\n[A/B]\nmodel = E:/a.gguf\ntemp = 0.5\nctx-size = 4096\ntemp = 0.6\n";
-        let out = upsert_entries(text, "A/B", &[("temp".into(), "0.9".into())]);
-        assert_eq!(out.matches("temp =").count(), 1, "{out}");
-        assert_eq!(out.matches("temp = 0.9").count(), 1, "{out}");
-        assert!(!out.contains("temp = 0.5"), "{out}");
-        assert!(!out.contains("temp = 0.6"), "{out}");
-        // 写盘前的第二道（大小写也统一掉）跑完之后，仍然是"一条、新值"
-        let cleaned = sanitize_preset_keys(&out);
-        assert_eq!(cleaned.matches("temp =").count(), 1, "{cleaned}");
-        assert!(cleaned.contains("temp = 0.9"), "{cleaned}");
-        // 保留下来的那一条落在**第一次出现**的位置上：`upsert_entries` 只重写自己接到的键，
-        // 重排整段会让用户的参数顺序跳来跳去；而"最后一条生效"的 router 语义由键名合并
-        // 本身保证（段内只剩一条，值就是新值）。写盘前还有 `sanitize_preset_keys` 兜底。
-        let body: Vec<&str> = out.lines().skip(3).collect();
-        assert_eq!(
-            body,
-            vec!["model = E:/a.gguf", "temp = 0.9", "ctx-size = 4096"],
-            "{out}"
-        );
-
-        // 文件里已有的键写成大写 → 同一个键认出来、并写回小写规范形式
-        let upper = "version = 1\n\n[A/B]\nmodel = E:/a.gguf\nTemp = 0.5\n";
-        let out = upsert_entries(upper, "A/B", &[("temp".into(), "0.9".into())]);
-        assert_eq!(out.matches("temp =").count(), 1, "{out}");
-        assert!(!out.contains("Temp"), "{out}");
-        assert!(out.contains("temp = 0.9"), "{out}");
-
-        // 同一批 entries 里重复的键也只写一行，最后一个值胜出（与 router 的后者覆盖一致）
-        let out = upsert_entries(
-            "version = 1\n\n[A/B]\nmodel = E:/a.gguf\n",
-            "A/B",
-            &[
-                ("n-gpu-layers".into(), "10".into()),
-                ("n-gpu-layers".into(), "99".into()),
-            ],
-        );
-        assert_eq!(out.matches("n-gpu-layers =").count(), 1, "{out}");
-        assert!(out.contains("n-gpu-layers = 99"));
-        assert!(!out.contains("n-gpu-layers = 10"));
-
-        // 规范化只动键名：等号右边的值（可能是区分大小写的路径）原样保留。
-        // 注意 `upsert_entries` 只重写它接到的键，手写的 `Model = ...` 原样带走，
-        // 真正统一大小写的是写盘前的 `sanitize_preset_keys`（这里两步一起验证）。
-        let path_line = "version = 1\n\n[A/B]\nModel = E:/ai/Models/My-Path.gguf\n";
-        let out = upsert_entries(path_line, "A/B", &[("temp".into(), "0.9".into())]);
-        let out = sanitize_preset_keys(&out);
-        assert!(out.contains("model = E:/ai/Models/My-Path.gguf"), "{out}");
-        assert!(!out.contains("Model ="), "{out}");
-
-        // 删键（空值）时该键的所有行都要消失
-        let dup = "version = 1\n\n[A/B]\ntemp = 0.5\ntemp = 0.6\n";
-        let out = upsert_entries(dup, "A/B", &[("temp".into(), String::new())]);
-        assert!(!out.contains("temp"), "{out}");
-    }
-
-    /// 写回管线里的键名规范化与同名键合并（`sanitize_preset_keys` 是所有写盘路径的最后一道）。
-    ///
-    /// 注意分层：`upsert_entries` 只重写它接到的那些键，其余行**原样带走**（用户手写的
-    /// `Temp = 0.5` 不会被"顺手"重排）；真正统一键名大小写的是每次写盘前都会跑的
-    /// `sanitize_preset_keys`。这里断言第二道之后大小写重复键也只剩一条。
-    #[test]
-    fn sanitize_lowercases_keys_and_keeps_last_duplicate() {
-        let fixed = sanitize_preset_keys("[A/B]\nModel = E:/a.gguf\nTemp = 0.5\nTemp = 0.9\n");
-        assert!(fixed.contains("model = E:/a.gguf"), "{fixed}");
-        assert!(fixed.contains("temp = 0.9"), "{fixed}");
-        assert!(!fixed.contains("Temp = 0.5"), "{fixed}");
-        assert_eq!(fixed.matches("temp").count(), 1, "{fixed}");
-        // 值原样保留（不整行 to_lowercase）
-        let out = sanitize_preset_keys("[A/B]\nMODEL = E:/ai/Models/My-Path.gguf\n");
-        assert!(out.contains("model = E:/ai/Models/My-Path.gguf"), "{out}");
-        // 清理淘汰键时同样忽略大小写（大写写法漏掉一样会让 router 起不来）
-        assert!(!sanitize_preset_keys("[A/B]\nNo-Mmap = true\n").contains("mmap"));
     }
 
     /// 坏掉的元数据缓存**不能**让扫描炸掉，也不能 panic（M11）。
@@ -2752,9 +1703,10 @@ temp = 0.7
         // 不存在的文件同样返回空表（首次启动就是这个路径）
         assert!(read_meta_cache_file(&dir.join("nope.json")).is_empty());
 
-        // 正常内容要能读回来（兜底归兜底，别把好文件也丢了）
+        // 正常内容要能读回来（兜底归兜底，别把好文件也丢了）。版本号必须写当前值，
+        // 否则会被当成旧版缓存丢掉（META_CACHE_VERSION 涨了这里要跟着走）。
         let good = dir.join("good.json");
-        let mut text = String::from("{\"version\":1,\"entries\":[");
+        let mut text = format!("{{\"version\":{META_CACHE_VERSION},\"entries\":[");
         let _ = write!(
             text,
             "{{\"path\":\"E:/a.gguf\",\"size\":1,\"modified_ms\":2,\"architecture\":\"qwen3\",\"file_type\":15}}"
@@ -2773,14 +1725,6 @@ temp = 0.7
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn upsert_on_empty_text_creates_version_header() {
-        let out = upsert_entries("", "m", &[("model".into(), "E:/a.gguf".into())]);
-        assert!(out.starts_with("version = 1"));
-        assert!(out.contains("[m]"));
-        assert!(out.contains("model = E:/a.gguf"));
-        assert!(out.ends_with('\n'));
-    }
 
     /// 实机跑一遍扫描，核对架构/量化，并给出「冷缓存 vs 热缓存」的耗时。
     /// `cargo test --lib real_environment_scan_timing -- --ignored --nocapture`
@@ -2828,30 +1772,6 @@ temp = 0.7
         );
     }
 
-    /// 需要本机真实环境（默认忽略）：扫描真实模型库生成 preset 文件，供端到端验证
-    #[test]
-    #[ignore]
-    fn real_environment_preset_generation() {
-        let root = PathBuf::from("E:/AI/models");
-        if !root.is_dir() {
-            eprintln!("跳过：{} 不存在", root.display());
-            return;
-        }
-        let models = scan_models(&[root]);
-        let mut text = "version = 1\n\n[*]\nctx-size = 4096\n".to_string();
-        for m in &models {
-            text = ensure_model_section(&text, m, &m.id);
-        }
-        let out = std::env::temp_dir().join("llamacpp-gui-e2e-presets.ini");
-        fs::write(&out, &text).unwrap();
-        println!("已写出 preset: {}", out.display());
-        println!("段数: {}（扫描到 {} 个模型）", list_sections(&text).len(), models.len());
-        println!("----- 前 30 行 -----");
-        for line in text.lines().take(30) {
-            println!("{line}");
-        }
-        assert_eq!(list_sections(&text).len(), models.len());
-    }
 
     /// 需要本机真实环境（默认忽略）：`cargo test -- --ignored --nocapture`
     #[test]
@@ -2898,140 +1818,11 @@ temp = 0.7
         assert_eq!(before, ids.len(), "模型 id 必须唯一");
     }
 
-    #[test]
-    fn preset_file_io() {
-        let dir = std::env::temp_dir().join("llamacpp-gui-preset-io-test");
-        let _ = fs::remove_dir_all(&dir);
-        let path = dir.join("presets").join("presets.ini");
 
-        assert_eq!(read_preset(&path).unwrap().trim(), "version = 1");
-        write_preset(&path, "version = 1\n[a]\nmodel = E:/a.gguf\n").unwrap();
-        assert!(read_preset(&path).unwrap().contains("[a]"));
-        let _ = fs::remove_dir_all(&dir);
-    }
 
-    #[test]
-    fn ensure_model_section_sets_model_path() {
-        let model = ScannedModel {
-            id: "OpenBMB/MiniCPM5-2B".into(),
-            name: "MiniCPM5-2B".into(),
-            path: "E:/AI/models/OpenBMB/MiniCPM5-2B/MiniCPM5-2B-Q8_0.gguf".into(),
-            dir: "E:/AI/models/OpenBMB/MiniCPM5-2B".into(),
-            size_bytes: 1,
-            quantization: Some("Q8_0".into()),
-            architecture: Some("minicpm".into()),
-            mmproj: None,
-            shards: 1,
-            modified_ms: 0,
-            group: "models".into(),
-        };
-        let out = ensure_model_section("version = 1\n", &model, &model.id);
-        assert!(out.contains("[OpenBMB/MiniCPM5-2B]"));
-        assert!(out.contains("model = E:/AI/models/OpenBMB/MiniCPM5-2B/MiniCPM5-2B-Q8_0.gguf"));
 
-        // 第二次调用不应产生重复段
-        let again = ensure_model_section(&out, &model, &model.id);
-        assert_eq!(list_sections(&again), vec!["OpenBMB/MiniCPM5-2B"]);
-    }
 
-    #[test]
-    fn ensure_model_section_uses_given_section_name() {
-        // 改过别名的模型：段名用别名，不能再按扫描 id 建段
-        let model = ScannedModel {
-            id: "OpenBMB/MiniCPM5-2B".into(),
-            name: "MiniCPM5-2B".into(),
-            path: "E:/AI/models/OpenBMB/MiniCPM5-2B/MiniCPM5-2B-Q8_0.gguf".into(),
-            dir: "E:/AI/models/OpenBMB/MiniCPM5-2B".into(),
-            size_bytes: 1,
-            quantization: Some("Q8_0".into()),
-            architecture: Some("minicpm".into()),
-            mmproj: None,
-            shards: 1,
-            modified_ms: 0,
-            group: "models".into(),
-        };
-        let out = ensure_model_section("version = 1\n", &model, "小模型");
-        assert_eq!(list_sections(&out), vec!["小模型"]);
-        assert!(out.contains("model = E:/AI/models/OpenBMB/MiniCPM5-2B/MiniCPM5-2B-Q8_0.gguf"));
-        assert!(!out.contains("[OpenBMB/MiniCPM5-2B]"));
-        // 幂等
-        let again = ensure_model_section(&out, &model, "小模型");
-        assert_eq!(list_sections(&again), vec!["小模型"]);
-    }
 
-    #[test]
-    fn sanitize_merges_hub_style_spec_type_keys() {
-        let broken = "version = 1\n\n[A/B]\nmodel = E:/a.gguf\nspec-type = draft-mtp\nspec-type_ngram-mod = true\nspec-type_ngram-map-k4v = 0\nctx-size = 4096\n";
-        let fixed = sanitize_preset_keys(broken);
-        // 追加而不是覆盖：ngram-mod 必须能和草稿类型共存
-        assert!(fixed.contains("spec-type = draft-mtp,ngram-mod"), "{fixed}");
-        // 假值不并入
-        assert!(!fixed.contains("ngram-map-k4v"));
-        assert!(!fixed.contains("spec-type_ngram"));
-        assert!(fixed.contains("ctx-size = 4096"));
-        assert!(fixed.ends_with('\n'));
-
-        // 段内原本没有 spec-type 时新建，且只出现一次
-        let only_pseudo = "[A/B]\nmodel = E:/a.gguf\nspec-type_ngram-mod = true\n";
-        let fixed2 = sanitize_preset_keys(only_pseudo);
-        assert!(fixed2.contains("spec-type = ngram-mod"));
-        assert_eq!(fixed2.matches("spec-type").count(), 1, "{fixed2}");
-
-        // 重复值去重
-        let dup = "[A/B]\nspec-type = ngram-mod\nspec-type_ngram-mod = true\n";
-        assert!(sanitize_preset_keys(dup).contains("spec-type = ngram-mod\n"));
-
-        // 文件里本来就是重复键（历史遗留）：合并成一条
-        let two_lines = "[A/B]\nspec-type = draft-mtp\nspec-type = ngram-mod\n";
-        let fixed3 = sanitize_preset_keys(two_lines);
-        assert!(fixed3.contains("spec-type = draft-mtp,ngram-mod"), "{fixed3}");
-        assert_eq!(fixed3.matches("spec-type").count(), 1, "{fixed3}");
-    }
-
-    /// `webui` 是旧版界面写下的键名，参数表当前用的是 hub 的 `no-webui`：
-    /// 规范化之后界面上的「禁用webui」开关才能反映真实状态。
-    #[test]
-    fn sanitize_normalizes_webui_key() {
-        // 关闭 → 统一成 no-webui = true
-        let off = "[A/B]\nmodel = E:/a.gguf\nwebui = false\nctx-size = 4096\n";
-        let fixed = sanitize_preset_keys(off);
-        assert!(fixed.contains("no-webui = true"), "{fixed}");
-        assert!(!fixed.contains("webui = false"), "{fixed}");
-        assert!(fixed.contains("ctx-size = 4096"));
-        // 0 同样算关闭
-        assert!(sanitize_preset_keys("[A/B]\nwebui = 0\n").contains("no-webui = true"));
-        // 开启 → 删掉（等于默认）
-        let on = sanitize_preset_keys("[A/B]\nwebui = true\n");
-        assert!(!on.contains("webui"), "{on}");
-        // 已经是 no-webui 的原样保留
-        let already = sanitize_preset_keys("[A/B]\nno-webui = true\n");
-        assert!(already.contains("no-webui = true"));
-    }
-
-    /// 淘汰的 preset 键要被删掉。
-    ///
-    /// 实测（b11065）：某段里残留 `no-mmap = true` 时 router **整个起不来** ——
-    /// `failed to initialize router models: option 'no-mmap' not recognized in preset 'Unsloth/Hy-MT2-7B'`，
-    /// 19 个模型一个都用不了。删掉那一行后立刻恢复正常。
-    #[test]
-    fn sanitize_removes_retired_keys() {
-        let text = "[A/B]\nmodel = E:/a.gguf\nno-mmap = true\nload-mode = mmap+mlock\nctx-size = 8192\n";
-        let fixed = sanitize_preset_keys(text);
-        assert!(!fixed.contains("no-mmap"), "旧键要删掉：{fixed}");
-        assert!(fixed.contains("load-mode = mmap+mlock"), "新键要原样保留：{fixed}");
-        assert!(fixed.contains("ctx-size = 8192"), "{fixed}");
-
-        // 取值为假、或段里只有它一个键，同样删掉
-        let off = sanitize_preset_keys("[A/B]\nno-mmap = false\n");
-        assert!(!off.contains("no-mmap"), "{off}");
-
-        // 列表里的每个淘汰键都必须真的被清理
-        for key in RETIRED_PRESET_KEYS {
-            let text = format!("[A/B]\nmodel = E:/a.gguf\n{key} = true\n");
-            let fixed = sanitize_preset_keys(&text);
-            assert!(!fixed.contains(key), "{key} 没被清理：{fixed}");
-        }
-    }
 
     #[test]
     fn hub_args_tokenizer_handles_quotes() {
@@ -3084,7 +1875,9 @@ temp = 0.7
     #[test]
     fn hub_import_writes_section_params_and_keeps_model_line() {
         let dir = std::env::temp_dir().join("llamacpp-gui-hub-import-test");
-        fs::create_dir_all(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let cfg_dir = crate::model_config::config_dir(&dir);
+        fs::create_dir_all(&cfg_dir).unwrap();
         let hub_path = dir.join("launch_config.json");
         fs::write(
             &hub_path,
@@ -3100,53 +1893,36 @@ temp = 0.7
         )
         .unwrap();
 
-        let preset = "version = 1\n\n[Unsloth/Hy-MT2-1.8B]\nmodel = E:/AI/models/Unsloth/Hy-MT2-1.8B/x.gguf\n\n[Other/Missing]\nmodel = E:/y.gguf\n";
-        let (out, report) = import_hub_presets(preset, &hub_path).unwrap();
+        // 两份配置：一份在 hub 里有参数，一份没有（导入要报 missing）
+        for (id, model) in [
+            ("Unsloth/Hy-MT2-1.8B", "E:/AI/models/Unsloth/Hy-MT2-1.8B/x.gguf"),
+            ("Other/Missing", "E:/y.gguf"),
+        ] {
+            let cfg = crate::model_config::ModelConfig::new(id, Some(model.to_string()));
+            crate::model_config::write(&crate::model_config::path_for_id(&cfg_dir, id), &cfg).unwrap();
+        }
+
+        let report = import_hub_into_dir(&cfg_dir, &hub_path).unwrap();
 
         assert_eq!(report.total, 2);
         assert_eq!(report.matched, 1);
         assert_eq!(report.missing, vec!["Other/Missing".to_string()]);
-        assert!(out.contains("model = E:/AI/models/Unsloth/Hy-MT2-1.8B/x.gguf"));
-        assert!(out.contains("ctx-size = 4096"));
-        assert!(out.contains("gpu-layers = 99"));
-        assert!(out.contains("spec-type = ngram-mod"));
-        assert!(out.contains("pooling = cls"));
-        // 被 router 管理的参数不能出现
-        assert!(!out.contains("port = "));
-        assert!(!out.contains("webui"));
+
+        // 参数落进 config 的 args，模型行保持不变
+        let cfg =
+            crate::model_config::load(&crate::model_config::path_for_id(&cfg_dir, "Unsloth/Hy-MT2-1.8B"))
+                .unwrap()
+                .config;
+        let args = cfg.args.join(" ");
+        assert_eq!(cfg.model.as_deref(), Some("E:/AI/models/Unsloth/Hy-MT2-1.8B/x.gguf"));
+        assert!(args.contains("--ctx-size 4096"));
+        assert!(args.contains("--gpu-layers 99"));
+        assert!(args.contains("--spec-type ngram-mod"));
+        assert!(args.contains("--pooling cls"));
+        // 被前门管理的参数不能出现
+        assert!(!args.contains("--port"));
+        assert!(!args.contains("--webui"));
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    #[ignore = "读取本机 hub 配置与真实预设文件，做数据校验（不写盘）"]
-    fn real_environment_hub_import() {
-        let hub = Path::new("E:/AI/llama.cpp-hub/config/launch_config.json");
-        if !hub.is_file() {
-            eprintln!("跳过：本机没有 {hub:?}");
-            return;
-        }
-        let appdata = std::env::var("APPDATA").expect("APPDATA");
-        let preset_path = Path::new(&appdata).join("dev.llamacpp.gui/presets/presets.ini");
-        let preset = fs::read_to_string(&preset_path).expect("读取预设");
-        let (out, report) = import_hub_presets(&preset, hub).unwrap();
-        // 应用里的写入路径还会跑一次规范化，这里照做以看清最终落盘内容
-        let out = sanitize_preset_keys(&out);
-        println!("hub: {}", report.hub_path);
-        println!("段 {} / 命中 {} / 写入 {} 项", report.total, report.matched, report.entries);
-        println!("未命中: {:?}", report.missing);
-        for section in ["Unsloth/Hy-MT2-1.8B", "OpenBMB/MiniCPM5-2B", "MiniCPM-V-4.6"] {
-            let target = list_sections(&out)
-                .into_iter()
-                .find(|s| s.ends_with(section))
-                .or_else(|| Some(section.to_string()));
-            if let Some(name) = target {
-                println!("--- {name} ---");
-                for (k, v) in section_entries(&out, &name) {
-                    println!("  {k} = {v}");
-                }
-            }
-        }
-        assert!(report.matched > 0, "至少要命中一个模型");
-        assert!(out.contains("ctx-size"), "迁移后应带上下文长度等参数");
-    }
 }

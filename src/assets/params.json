@@ -890,6 +890,22 @@
       "defaultEnabled": false
     },
     {
+      "key": "moe-cache-mib",
+      "flag": "--moe-cache-mib",
+      "abbr": "",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "MoE 专家显存缓存（MiB）",
+      "desc": "--moe-cache-mib N：为保留在 CPU 上的 MoE 专家权重在 GPU 上留出的缓存大小（MiB）。默认 0，表示禁用。配合 --cpu-moe / --n-cpu-moe 使用：被换出到 CPU 的专家权重仍会在 GPU 上缓存一份常用部分，减少每个 token 的 CPU-GPU 往返，代价是占用显存。多 GPU 时按 --tensor-split 的比例在这些 GPU 之间分配。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 14.1,
+      "defaultEnabled": false
+    },
+    {
       "key": "n-cpu-ffn",
       "flag": "--n-cpu-ffn",
       "abbr": "-ncffn",
@@ -1673,7 +1689,7 @@
       "default": "",
       "values": [],
       "label": "草稿模型路径",
-      "desc": "--spec-draft-model / --model-draft：用于推测解码的草稿模型文件路径。留空时 MTP 模式会自动使用主模型的 MTP head。⚠ 如果你不明白这些参数的具体含义，请不要使用。这些参数需要你有相当丰富的专业知识以及足够的耐心去测试。",
+      "desc": "--spec-draft-model / --model-draft：用于推测解码的草稿模型文件路径。留空时 MTP 模式会自动使用主模型的 MTP head；其它草稿类型留空则由 GUI 自动检测主模型同目录下的草稿模型文件（文件名含 draft / dspark）。⚠ 如果你不明白这些参数的具体含义，请不要使用。这些参数需要你有相当丰富的专业知识以及足够的耐心去测试。",
       "group": "page.params.group.draft_model",
       "order": 70,
       "sort": 5,

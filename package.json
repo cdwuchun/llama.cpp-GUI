@@ -1,7 +1,7 @@
 {
   "name": "llamacpp-gui",
   "private": true,
-  "version": "0.1.2",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -20,6 +20,8 @@
     "@tauri-apps/plugin-opener": "^2",
     "react": "^19",
     "react-dom": "^19",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
     "zustand": "^5"
   },
   "devDependencies": {

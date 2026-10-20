@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::gpu::DeviceInfo;
 use crate::models::{AuxFile, ScannedModel};
-use crate::router::{LogHub, RouterProcess, RouterStatus};
+use crate::logs::LogHub;
 use crate::settings::SettingsStore;
 use crate::strata::{StrataModelEntry, StrataProcess, StrataStatus};
 use crate::versions::LlamaCppVersion;
@@ -19,11 +19,7 @@ pub struct AppState {
     pub versions: Mutex<Vec<LlamaCppVersion>>,
     /// 最近一次设备枚举结果。
     pub devices: Mutex<Vec<DeviceInfo>>,
-    /// 运行中的 router 进程（`None` = 未运行）。
-    pub router_slot: Arc<Mutex<Option<RouterProcess>>>,
-    /// router 状态快照（供 `router_status` 直接返回）。
-    pub status: Arc<Mutex<RouterStatus>>,
-    /// 运行中的 Strata 进程（`None` = 未运行）。与 router 互斥使用显存。
+    /// 运行中的 Strata 进程（`None` = 未运行）。
     pub strata_slot: Arc<Mutex<Option<StrataProcess>>>,
     /// Strata 状态快照（供 `strata_status` 直接返回）。
     pub strata_status: Arc<Mutex<StrataStatus>>,
@@ -42,6 +38,11 @@ pub struct AppState {
     /// 用户 m01266 第 2 点：DSH 请求触发引擎启动/加载时，卡片要显示「加载中」而不是
     /// 「已停止 → 直接跳到运行中」。前门自己在服务谁，它是唯一知情者，所以在这里登记。
     pub strata_proxy_serving: Arc<Mutex<Vec<String>>>,
+    /// 前门调度器：llama.cpp 通道子实例的状态与进程句柄。
+    ///
+    /// 挂在 `AppState` 上而不是前门自己拿着：前门路由、托盘退出清理、
+    /// 退出时的统一收尾都要能拿到同一份。
+    pub scheduler: Arc<Mutex<crate::scheduler::Scheduler>>,
     /// 应用配置目录。
     pub config_dir: PathBuf,
     /// 模型扫描结果缓存（磁盘遍历较慢，避免每次刷新都重扫）。
@@ -153,23 +154,18 @@ impl Drop for BackgroundScanGuard {
 impl AppState {
     pub fn new(config_dir: PathBuf, settings: SettingsStore) -> Self {
         let initial = settings.get();
-        let initial_port = initial.port;
         let initial_window = initial.window;
         Self {
             settings,
             logs: Arc::new(LogHub::new()),
             versions: Mutex::new(Vec::new()),
             devices: Mutex::new(Vec::new()),
-            router_slot: Arc::new(Mutex::new(None)),
-            status: Arc::new(Mutex::new(RouterStatus {
-                port: initial_port,
-                ..Default::default()
-            })),
             strata_slot: Arc::new(Mutex::new(None)),
             strata_status: Arc::new(Mutex::new(StrataStatus::default())),
             strata_proxy: Arc::new(Mutex::new(None)),
             strata_switch: Mutex::new(()),
             strata_proxy_serving: Arc::new(Mutex::new(Vec::new())),
+            scheduler: Arc::new(Mutex::new(crate::scheduler::Scheduler::new())),
             config_dir,
             scan_cache: Mutex::new(None),
             window_size: Mutex::new(initial_window),
@@ -201,7 +197,7 @@ impl AppState {
     pub fn cached_scan(&self, roots: &[PathBuf]) -> Option<Vec<ScannedModel>> {
         let guard = self.scan_cache.lock().ok()?;
         let cache = guard.as_ref()?;
-        let fresh = crate::router::now_ms().saturating_sub(cache.at_ms) < 5_000;
+        let fresh = crate::logs::now_ms().saturating_sub(cache.at_ms) < 5_000;
         if fresh && cache.roots == roots {
             Some(cache.models.clone())
         } else {
@@ -214,7 +210,7 @@ impl AppState {
             *guard = Some(ScanCache {
                 roots: roots.to_vec(),
                 models: models.to_vec(),
-                at_ms: crate::router::now_ms(),
+                at_ms: crate::logs::now_ms(),
             });
         }
     }
@@ -249,7 +245,7 @@ impl AppState {
     pub fn cached_aux(&self, roots: &[PathBuf]) -> Option<Vec<AuxFile>> {
         let guard = self.aux_cache.lock().ok()?;
         let cache = guard.as_ref()?;
-        let fresh = crate::router::now_ms().saturating_sub(cache.at_ms) < 5_000;
+        let fresh = crate::logs::now_ms().saturating_sub(cache.at_ms) < 5_000;
         if fresh && cache.roots == roots {
             Some(cache.aux.clone())
         } else {
@@ -262,7 +258,7 @@ impl AppState {
             *guard = Some(AuxCache {
                 roots: roots.to_vec(),
                 aux: aux.to_vec(),
-                at_ms: crate::router::now_ms(),
+                at_ms: crate::logs::now_ms(),
             });
         }
     }
@@ -271,7 +267,7 @@ impl AppState {
     pub fn cached_strata_scan(&self, root: &PathBuf) -> Option<Vec<StrataModelEntry>> {
         let guard = self.strata_scan_cache.lock().ok()?;
         let cache = guard.as_ref()?;
-        let fresh = crate::router::now_ms().saturating_sub(cache.at_ms) < 5_000;
+        let fresh = crate::logs::now_ms().saturating_sub(cache.at_ms) < 5_000;
         if fresh && &cache.root == root {
             Some(cache.entries.clone())
         } else {
@@ -284,7 +280,7 @@ impl AppState {
             *guard = Some(StrataScanCache {
                 root: root.clone(),
                 entries: entries.to_vec(),
-                at_ms: crate::router::now_ms(),
+                at_ms: crate::logs::now_ms(),
             });
         }
     }
@@ -304,9 +300,15 @@ impl AppState {
         entries
     }
 
-    /// `presets.ini` 路径（交给 router 的原生 preset 文件）。
+    /// 旧 `presets.ini` 路径（只剩迁移器读它；迁移完就改名成 `.bak-<时间戳>`）。
     pub fn preset_path(&self) -> PathBuf {
         self.config_dir.join("presets").join("presets.ini")
+    }
+
+    /// 模型配置目录：一个模型一份 `llamacpp-<id>.json`（规格见
+    /// `docs/archive/PROXY_SCHEDULER_PLAN.md` §3.1）。
+    pub fn model_config_dir(&self) -> PathBuf {
+        self.config_dir.join("config")
     }
 
     /// 非 ASCII 路径修复用的链接根目录。

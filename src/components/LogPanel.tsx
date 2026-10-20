@@ -1,7 +1,10 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 
 import { portFromArgs } from "../api/router";
+import { ipc } from "../ipc";
 import { useApp } from "../store";
+import { reportFrontendError } from "../utils/frontendLog";
+import type { LogFileInfo, RouterModel } from "../types";
 
 /**
  * 系统日志页 —— 结构照搬 hub 新版（`index-new.html` 的 `#page-logs` + `js/newui/logs.js`）：
@@ -19,12 +22,6 @@ function fmtClock(ms: number): string {
   const d = new Date(ms);
   const pad = (n: number, w = 2) => String(n).padStart(w, "0");
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-}
-
-function fmtSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 /**
@@ -57,16 +54,59 @@ export function LogPanel() {
   const routerModels = useApp((s) => s.routerModels);
   const strataStatus = useApp((s) => s.strataStatus);
 
+  // 这一轮的日志文件落在哪：挂载时问后端一次。文件名在程序启动时就定下了，运行期不会换。
+  // 排查时用户要把文件发出来，所以路径要能看见、目录要能一键打开（用户 m05885）。
+  const [logInfo, setLogInfo] = useState<LogFileInfo | null>(null);
+  useEffect(() => {
+    let alive = true;
+    void ipc
+      .logsInfo()
+      .then((info) => {
+        if (alive) setLogInfo(info);
+      })
+      .catch(() => {
+        /* 拿不到就不显示路径，不影响日志页本身 */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const openLogDir = async () => {
+    try {
+      await ipc.logsOpenDir();
+    } catch (err) {
+      reportFrontendError("warn", `打开日志目录失败：${String(err)}`);
+    }
+  };
+
   const boxRef = useRef<HTMLDivElement>(null);
   const [follow, setFollow] = useState(true);
 
-  /** 端口 → 正在该端口上的模型（用于把 `model:<port>` 显示成模型名） */
+  /** 来源列表是否展开：收起后把宽度让给日志（用户 m09910） */
+  const [srcOpen, setSrcOpen] = useState(true);
+
+  /** 端口 → 正在该端口上的模型（router 时代的来源格式 `model:<端口>` 用） */
   const runningByPort = useMemo(() => {
     const map = new Map<string, string>();
     for (const r of routerModels) {
-      const port = portFromArgs(r.status?.args);
+      const port = r.port ?? portFromArgs(r.status?.args);
       if (port != null) map.set(String(port), r.id);
     }
+    return map;
+  }, [routerModels]);
+
+  /**
+   * 模型名 → 模型（前门时代的来源格式 `model:<模型名>` 用）。
+   *
+   * 前门的日志来源是调度器给的 `model:{模型名}`（`scheduler.rs`），router 时代是
+   * `model:{端口}`。两种都得认：先按端口反查，查不到就当成模型名。之前只按端口处理，
+   * 模型名被当成端口号，来源列表里显示成「端口 OpenBMB/Sharp-MiniCPM5-2B-Q6_K_XL
+   * （未加载）」（用户 m02105 报的）。
+   */
+  const runningById = useMemo(() => {
+    const map = new Map<string, RouterModel>();
+    for (const r of routerModels) map.set(r.id, r);
     return map;
   }, [routerModels]);
 
@@ -80,12 +120,17 @@ export function LogPanel() {
       else if (line.source === "strata") hasStrata = true;
       else if (line.source.startsWith("model:")) ports.add(line.source.slice(6));
     }
-    // 正在运行但还没有日志的模型也列出来（hub 同样会列出未加载的模型）
-    for (const port of runningByPort.keys()) ports.add(port);
+    // 来源只来自两处：日志里真实出现过的、以及**当前已加载**的模型。
+    // 未加载的模型不再凭空列出来（用户 m02258 第 3 点：没有加载的不要显示）。
+    for (const [id, model] of runningById) {
+      // Strata 通道的模型不在这里列（用户 m03333 第 5 点）：它整条流固定标成 source="strata"，
+      // 上面那条「Strata · 模型名」就是它，再按模型名列一条等于同一个东西两个入口。
+      if (model.channel === "strata") continue;
+      if ((model.status?.value ?? "unloaded") === "loaded") ports.add(id);
+    }
 
     const list: SourceItem[] = [
-      { filter: "all", name: "全部日志", fixed: true },
-      { filter: "system", name: "系统（router 自身）", fixed: true },
+      { filter: "system", name: "系统（GUI 与前门）", fixed: true },
     ];
     // Strata 通道单独一路：Rust 侧 spawn_strata_reader 把整条流固定标成 source="strata"，
     // 不再和 router 的 "system" 混在一起。
@@ -98,20 +143,25 @@ export function LogPanel() {
     }
     if (hasFrontend) list.push({ filter: "frontend", name: "前端（错误上报）" });
 
-    const modelItems = [...ports]
-      .sort((a, b) => Number(a) - Number(b))
-      .map((port) => ({
-        filter: `model:${port}`,
-        name: runningByPort.get(port) ?? `端口 ${port}`,
-        loaded: runningByPort.has(port),
-      }));
-    // 已加载的排在前面，和 hub 一致
-    modelItems.sort((a, b) => Number(Boolean(b.loaded)) - Number(Boolean(a.loaded)));
+    const modelItems = [...ports].map((key) => {
+      const byPort = runningByPort.get(key);
+      const model = byPort ? runningById.get(byPort) : runningById.get(key);
+      const raw = model?.id ?? byPort ?? key;
+      return {
+        filter: `model:${key}`,
+        // 名字去掉作者前缀（用户 m02258 第 3 点）：`OpenBMB/Sharp-x` → `Sharp-x`
+        name: raw.split("/").pop() || raw,
+        loaded: (model?.status?.value ?? "unloaded") === "loaded",
+      };
+    });
+    // 已加载的排在前面，和 hub 一致；同组按名字排（前门时代的键是模型名，不是端口号）
+    modelItems.sort((a, b) => Number(b.loaded) - Number(a.loaded) || a.name.localeCompare(b.name));
     return list.concat(modelItems);
-  }, [logs, runningByPort, strataStatus.model_name]);
+  }, [logs, runningByPort, runningById, strataStatus.model_name]);
 
-  // 过滤项失效（例如模型卸载后该来源消失）就回落到"全部日志"
-  const active = items.some((i) => i.filter === filter) ? filter : "all";
+  // 过滤项失效（例如模型卸载后该来源消失）就回落到第一个来源；
+  // 「全部日志」这一项已按用户 m09910 去掉，"all" 只留作兜底。
+  const active = items.some((i) => i.filter === filter) ? filter : items[0]?.filter ?? "all";
   useEffect(() => {
     if (active !== filter) setFilter(active);
   }, [active, filter, setFilter]);
@@ -174,7 +224,6 @@ export function LogPanel() {
     return chunks;
   }, [shown]);
 
-  const bytes = useMemo(() => shown.reduce((sum, l) => sum + l.text.length, 0), [shown]);
   const lastTs = shown.length ? shown[shown.length - 1].ts_ms : null;
 
   useEffect(() => {
@@ -192,11 +241,6 @@ export function LogPanel() {
     setFollow(el.scrollHeight - el.scrollTop - el.clientHeight < 50);
   };
 
-  const activeItem = items.find((i) => i.filter === active);
-  const status = `${activeItem?.name ?? "全部日志"} · 行 ${shown.length}/${logs.length} · 快照 ${fmtSize(
-    bytes,
-  )} · 更新于 ${lastTs ? fmtClock(lastTs) : "—"}`;
-
   return (
     <main className="main-area">
       <div className="top-bar">
@@ -204,7 +248,16 @@ export function LogPanel() {
           <span>系统日志</span> <span className="model-count-badge">{logs.length} 行</span>
         </h1>
         <div className="top-actions">
-          <label className="form-check" style={{ marginBottom: 0 }}>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => setSrcOpen((v) => !v)}
+            title={srcOpen ? "收起来源列表，把宽度让给日志" : "展开来源列表"}
+          >
+          <i className={`fas ${srcOpen ? "fa-chevron-left" : "fa-list"}`} />
+          <span>{srcOpen ? "收起" : "来源"}</span>
+          </button>
+          <label className="form-check mb-0">
             <input
               type="checkbox"
               className="form-check-input"
@@ -213,6 +266,15 @@ export function LogPanel() {
             />
             <span className="form-check-label">自动滚底</span>
           </label>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => void openLogDir()}
+            title={logInfo?.file ?? "打开日志目录"}
+          >
+            <i className="fas fa-folder-open" />
+            <span>日志目录</span>
+          </button>
           <button type="button" className="btn btn-secondary" onClick={() => void clearLogs()}>
             <i className="fas fa-eraser" />
             <span>清空</span>
@@ -222,7 +284,7 @@ export function LogPanel() {
 
       <div className="page-fill">
         <div className="logs-wrap">
-          <div className="log-sources">
+          <div className={`log-sources${srcOpen ? "" : " is-hidden"}`}>
             {items.map((item) => (
               <div
                 key={item.filter}
@@ -257,14 +319,13 @@ export function LogPanel() {
             <div className="log-view" ref={boxRef} onScroll={onScroll}>
               {chunks.length === 0 ? (
                 <pre>
-                  暂无日志。启动 router 后，模型子实例的输出会带 [端口] 前缀合并进来，可在左侧按来源过滤。
+                  暂无日志。模型子实例的输出会按模型名合并进来（日志来源标成 model:名字），可在左侧按来源过滤。
                 </pre>
               ) : (
                 chunks.map((text, i) => <LogChunk key={i} text={text} />)
               )}
             </div>
 
-            <div className="log-status">{status}</div>
           </div>
         </div>
       </div>

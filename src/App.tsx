@@ -1,18 +1,26 @@
 import { Fragment, useEffect, useState } from "react";
 
 import { getVersion } from "@tauri-apps/api/app";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { BenchPanel } from "./components/BenchPanel";
+import { ChatPanel } from "./components/ChatPanel";
 import { LogPanel } from "./components/LogPanel";
 import { ModelListPanel } from "./components/ModelListPanel";
-import { RuntimePanel } from "./components/RuntimePanel";
+import { MonitoringPage } from "./components/MonitoringPage";
+import { ServiceStatusPopover } from "./components/ServiceStatusPopover";
+import { ServiceTelemetryStatusBar } from "./components/ServiceTelemetryStatusBar";
 import { SettingsPanel } from "./components/SettingsPanel";
-import { StrataPanel } from "./components/StrataPanel";
-import { onTrayCommand } from "./ipc";
+import { monitorEngine, onTrayCommand } from "./ipc";
+import type { MonitorEngine } from "./types";
 import { useApp } from "./store";
 import { appLogo } from "./utils/modelIcon";
+import { buildLiveMetric } from "./utils/telemetry";
 
-type Tab = "models" | "bench" | "runtime" | "strata" | "logs" | "settings";
+// S7（2026-10-16）：「运行环境」页并入设置页的第一张卡（运行时版本），
+// tab 由 5 个减为 4 个。tab 状态不落 localStorage（只硬编码初值），
+// 所以没有旧值残留导致白屏的问题。
+type Tab = "models" | "chat" | "monitor" | "bench" | "logs" | "settings";
 
 /**
  * 页面外壳照搬 hub 默认首页（index.html）的结构：
@@ -20,10 +28,10 @@ type Tab = "models" | "bench" | "runtime" | "strata" | "logs" | "settings";
  * 页面切换＝切换哪个 main 可见。这里由 React 按 tab 只渲染一个 main。
  */
 const TABS: { id: Tab; label: string; icon: string }[] = [
-  { id: "models", label: "模型列表", icon: "fas fa-cubes" },
+  { id: "models", label: "模型", icon: "fas fa-cubes" },
+  { id: "chat", label: "聊天", icon: "fas fa-comments" },
+  { id: "monitor", label: "监控", icon: "fas fa-chart-line" },
   { id: "bench", label: "性能测试", icon: "fas fa-gauge-high" },
-  { id: "runtime", label: "运行环境", icon: "fas fa-microchip" },
-  { id: "strata", label: "Strata", icon: "fas fa-layer-group" },
   { id: "logs", label: "系统日志", icon: "fas fa-terminal" },
   { id: "settings", label: "设置", icon: "fas fa-cog" },
 ];
@@ -36,15 +44,10 @@ export default function App() {
   const notice = useApp((s) => s.notice);
   const setError = useApp((s) => s.setError);
   const setNotice = useApp((s) => s.setNotice);
-  const status = useApp((s) => s.status);
   const settings = useApp((s) => s.settings);
   const busy = useApp((s) => s.busy);
-  const startRouter = useApp((s) => s.startRouter);
-  const stopRouter = useApp((s) => s.stopRouter);
-  const openModelChat = useApp((s) => s.openModelChat);
   const strataStatus = useApp((s) => s.strataStatus);
   const strataEntries = useApp((s) => s.strataEntries);
-  const stopStrata = useApp((s) => s.stopStrata);
   const startStrataProxy = useApp((s) => s.startStrataProxy);
   const stopStrataProxy = useApp((s) => s.stopStrataProxy);
 
@@ -52,6 +55,159 @@ export default function App() {
   const [navOpen, setNavOpen] = useState(false);
   // 主题放在 store 里（设置页顶栏也要用它切换）
   const theme = useApp((s) => s.theme);
+
+  // ---------------------------------------------------------------- 底部服务状态栏
+  // 数据来自 P4 采集层（monitor_sample，Rust 侧 1 秒一采的环形缓冲）。
+  const monitor = useApp((s) => s.monitor);
+  const monitorAt = useApp((s) => s.monitorAt);
+  const recentTurns = useApp((s) => s.recentTurns);
+  const lastTurn = useApp((s) => s.lastTurn);
+  const refreshMonitor = useApp((s) => s.refreshMonitor);
+  const routerModels = useApp((s) => s.routerModels);
+  const configs = useApp((s) => s.configs);
+  const chat = useApp((s) => s.chat);
+  const contextBench = useApp((s) => s.contextBench);
+  const scenarioBench = useApp((s) => s.scenarioBench);
+
+  /**
+   * 1 秒一采。窗口不可见时跳过 —— WebView 最小化后定时器仍在跑，
+   * 每秒一次 NVML + CIM 调用没有意义。
+   */
+  useEffect(() => {
+    void refreshMonitor();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refreshMonitor();
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [refreshMonitor]);
+
+  // 所有「正在跑」的模型：用户可以同时开好几个（用户 m05740）。
+  const loadedModels = routerModels
+    .filter((m) => m.status.value === "loaded")
+    .map((m) => m.id)
+    .sort((a, b) => a.localeCompare(b));
+  // 状态栏 / 监控页看的是「正在跑的那个模型」，不是聊天里选的那个：
+  // 聊天可以选一个还没加载的模型，监控要是跟着它就会盯错对象（用户 m05740）。
+  // 同时跑多个时让用户自己切，选中项掉了就退回列表第一个。
+  const [monitorModel, setMonitorModel] = useState("");
+  const activeModel = loadedModels.includes(monitorModel) ? monitorModel : loadedModels[0] ?? "";
+  const routeState = routerModels.find((m) => m.id === activeModel)?.status.value;
+  const modelState: "loaded" | "loading" | "unloaded" | "unknown" =
+    routeState === "loaded" ? "loaded" : routeState === "loading" ? "loading" : activeModel ? "unloaded" : "unknown";
+  // 监控页的引擎指标（/metrics、/slots）：只在监控页且模型已加载时轮询。
+  // **不能对未加载的模型调 /metrics?model=**，否则前门会把模型拉起来。
+  const [engine, setEngine] = useState<MonitorEngine | null>(null);
+  const [engineError, setEngineError] = useState<string | null>(null);
+  /** 引擎指标拿不到但不该报红时的说明（例如实例没开 --metrics）。 */
+  const [engineNote, setEngineNote] = useState<string | null>(null);
+  // 换模型（或模型重启）时先清空，否则新模型第一次采样返回前，监控页还在显示旧模型的
+  // 槽位与近期请求（用户 m06949「更换模型启动后，最近请求没有清空」）。
+  useEffect(() => {
+    setEngine(null);
+    setEngineError(null);
+    setEngineNote(null);
+  }, [activeModel]);
+  useEffect(() => {
+    if (tab !== "monitor" || !activeModel || modelState !== "loaded") {
+      setEngine(null);
+      setEngineError(null);
+      setEngineNote(null);
+      return;
+    }
+    let alive = true;
+    const pull = async () => {
+      try {
+        // Strata 模型直连引擎自己的端口：上游就是这么拿的（用户 m06557）。
+        // 直连拿不到时回退走前门 —— Strata 配了 api_key 的话，密钥只在 Rust 侧，
+        // 前端拿不到（只有 has_api_key 布尔），直连会 401；前门会替我们加上鉴权头。
+        const strataEntry = strataEntries.find((item) => item.model_name === activeModel) ?? null;
+        const proxyPort = strataStatus.proxy_port ?? 9090;
+        let next = await monitorEngine(
+          strataEntry?.port ?? proxyPort,
+          strataEntry ? null : activeModel,
+          settings?.api_key || null,
+          strataEntry?.config_path ?? null,
+        );
+        if (strataEntry && next.error && proxyPort !== strataEntry.port) {
+          next = await monitorEngine(proxyPort, activeModel, settings?.api_key || null, strataEntry.config_path ?? null);
+        }
+        if (!alive) return;
+        setEngine(next);
+        // 501 = 实例没开 --metrics。这是配置状态，不是故障，别拿红色错误吓用户
+        // （用户 m05810 第 1 点）。重启模型后新实例会自动带上 --metrics。
+        const raw = next.error ?? null;
+        const metricsOff = raw !== null && /does not support metrics endpoint|metrics endpoint/i.test(raw);
+        setEngineError(metricsOff ? null : raw);
+        setEngineNote(
+          metricsOff ? "这个实例没开 --metrics，引擎指标不可用；重启模型后新实例会默认带上。" : null,
+        );
+      } catch (err) {
+        if (alive) setEngineError(err instanceof Error ? err.message : String(err));
+      }
+    };
+    void pull();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void pull();
+    }, 2000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [tab, activeModel, modelState, strataStatus.proxy_port, settings?.api_key]);
+
+  const busyNow = chat.streaming || contextBench.running || scenarioBench.running;
+  // 上下文上限取 config 里的值（`--ctx-size 0` 时后端已回退到 GGUF 的 <arch>.context_length）。
+  const configContext = configs.find((c) => c.name === activeModel)?.max_context ?? null;
+  // 「读取中」= 请求已发出、首个 token 还没到（预填充阶段），照上游 live.state 的分法（用户 m06282）。
+  const activeConversation = chat.conversations.find((item) => item.id === chat.activeId) ?? null;
+  const lastAssistantPhase = (() => {
+    const messages = activeConversation?.messages ?? [];
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const message = messages[i];
+      if (message.role === "assistant") return message.execution?.phase ?? null;
+    }
+    return null;
+  })();
+  const reading = chat.streaming && lastAssistantPhase === "waiting";
+  const speedSeries = useApp((state) => state.speedSeries);
+  // 引擎自报的实时输入速度（只有 Strata 的 /metrics 有 live.prefill_tok_s_mean）。
+  const livePrefillTokS = (() => {
+    const metrics = engine?.metrics as Record<string, unknown> | undefined;
+    const live = metrics?.live as Record<string, unknown> | undefined;
+    const value = live?.prefill_tok_s_mean;
+    return typeof value === "number" && Number.isFinite(value) ? value : null;
+  })();
+  const liveMetric = buildLiveMetric({
+    snapshot: monitor,
+    busy: busyNow,
+    reading,
+    queued: 0,
+    lastTurn,
+    maxContext: configContext,
+    livePrefillTokS,
+  });
+  const statusBar = (
+    <ServiceTelemetryStatusBar
+      hasModel={Boolean(activeModel)}
+      proxy={strataStatus.proxy}
+      modelState={modelState}
+      metric={liveMetric}
+      metricAt={monitorAt}
+      trigger={
+        <ServiceStatusPopover
+          hasModel={Boolean(activeModel)}
+          model={activeModel}
+          proxy={strataStatus.proxy}
+          proxyPort={strataStatus.proxy_port ?? 9090}
+          modelState={modelState}
+          metric={liveMetric}
+          metricAt={monitorAt}
+          onRefresh={() => void refreshMonitor()}
+          onNavigate={(page) => setTab(page)}
+        />
+      }
+    />
+  );
 
   /**
    * GUI 自己的版本号：取自 `tauri.conf.json` 的 `version`（打包时的权威值 —— 安装包文件名
@@ -77,8 +233,10 @@ export default function App() {
   useEffect(() => {
     const pending = onTrayCommand((command) => {
       const store = useApp.getState();
-      if (command === "start-router") void store.startRouter();
-      else if (command === "stop-router") void store.stopRouter();
+      // 「服务」= 前门（:9090）：llama.cpp 子实例与 Strata 引擎都从这一个端口进。
+      // router 已从界面退场（后端模块最后一步再删）。
+      if (command === "start-service") void store.startStrataProxy();
+      else if (command === "stop-service") void store.stopStrataProxy();
     });
     return () => {
       void pending.then((off) => off());
@@ -87,8 +245,18 @@ export default function App() {
 
   // 主题落到 <html data-theme>（hub 的深色变量挂在这个属性上）；
   // localStorage 由 store 的 setTheme 负责写，这里只保证首帧一致。
+  //
+  // 顺带把**系统标题栏**的明暗也跟上（用户 m10631 选的方案 B：不去掉标题栏，
+  // 只让它不再刺眼）。Tauri 在 Windows 上走 DWM 的 immersive dark mode，
+  // 只影响标题栏与原生滚动条；界面配色走的是 [data-theme]，跟这里无关 ——
+  // 全项目没有 prefers-color-scheme 媒体查询，所以不会互相打架。
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
+    void getCurrentWindow()
+      .setTheme(theme === "dark" ? "dark" : "light")
+      .catch(() => {
+        /* 浏览器里跑（npm run dev 无 Tauri）时会失败，忽略即可 */
+      });
   }, [theme]);
 
   // 窄屏抽屉：hub 用 body.mobile-nav-open 控制侧栏与遮罩
@@ -141,6 +309,15 @@ export default function App() {
     : /^strata\b/i.test(strataVersionRaw)
       ? strataVersionRaw
       : `Strata ${strataVersionRaw}`;
+  // llama.cpp 引擎版本（用户 m03333 第 4 点）：左下角除了 Strata 版本，也要能一眼看到
+  // llama.cpp 用的是哪份引擎。`selected_version` 是版本目录名（`llama-b11482-bin-win-cuda-13.4-x64`），
+  // 太长，只取 build 号那一段；取不到就原样显示。
+  const llamaVersion = settings?.selected_version ?? null;
+  const llamaBuild = llamaVersion?.match(/llama-(b\d+)/i)?.[1] ?? null;
+  const llamaFootText = llamaVersion ? `llama.cpp ${llamaBuild ?? llamaVersion}` : "llama.cpp 未选版本";
+  const llamaFootTitle = llamaVersion
+    ? `llama.cpp 引擎：${llamaVersion}`
+    : "还没在「设置」里选 llama.cpp 版本目录";
   const strataFootTitle = strataStatus.proxy
     ? `代理 :${strataProxyPort} · DSH 等客户端连这里${
         strataStatus.running ? `（引擎 :${strataStatus.port}）` : "（引擎按首次请求自动启动）"
@@ -156,19 +333,6 @@ export default function App() {
   const go = (next: Tab) => {
     setTab(next);
     setNavOpen(false);
-  };
-
-  /**
-   * 「开始聊天」：打开 llama.cpp 自带聊天界面。
-   *
-   * 打开的是 **router 自己的** WebUI —— llama.cpp 的 WebUI 内置了 router 支持
-   * （LIST=/v1/models、LOAD=/models/load、SSE=/models/sse），所以在这一个界面里
-   * 就能看到全部模型、按需加载、切换着聊，不必按模型各开一个标签页。
-   * 想直接进某个模型（跳过选择），用模型卡片上的 💬。
-   */
-  const openChat = async () => {
-    setNavOpen(false);
-    await openModelChat();
   };
 
   return (
@@ -211,115 +375,63 @@ export default function App() {
                 <i className={t.icon} />
                 <span>{t.label}</span>
               </a>
-              {/* 与 hub 一致：这一项不是页面，而是打开 llama.cpp 自带的聊天界面。
-                  位置紧跟在「性能测试」下面。 */}
-              {t.id === "bench" && (
-                <a
-                  href="#"
-                  className="nav-item"
-                  title="打开 llama.cpp 自带的聊天界面（router 的 WebUI，可切换全部模型）"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    void openChat();
-                  }}
-                >
-                  <i className="fas fa-comments" />
-                  <span>开始聊天</span>
-                </a>
-              )}
             </Fragment>
           ))}
         </nav>
 
         <div className="sidebar-footer">
-          {/* Strata 状态胶囊：与 router 胶囊同款，点击即启停（显存互斥，见 Strata 面板）。
-              非 GUI 启动的实例（用户自己跑了 run-<model>.bat）按钮置灰 —— 我们停不了它。 */}
-          {settings?.strata_root && (
-            <Fragment>
-              <button
-                type="button"
-                className={`router-pill ${strataStatus.proxy || strataStatus.running ? "is-running" : "is-stopped"}`}
-                disabled={busy || (!strataStatus.proxy && strataStatus.running && strataStatus.external)}
-                style={{ marginBottom: "0.2rem" }}
-                title={
-                  strataStatus.proxy
-                    ? `点击停止 Strata 代理（:${strataProxyPort} · DSH 等客户端连这里）`
-                    : strataStatus.running && strataStatus.external
-                      ? `端口 :${strataStatus.port} 上的 Strata 不是本 GUI 启动的，请在它自己的控制台里停止`
-                      : strataStatus.running
-                        ? `点击停止 Strata 引擎（:${strataStatus.port}）`
-                        : "点击启动 Strata 代理（默认 :9090 · 按请求里的 model 自动切换引擎）"
-                }
-                onClick={() =>
-                  void (strataStatus.proxy ? stopStrataProxy() : strataStatus.running ? stopStrata() : startStrataProxy())
-                }
-              >
-                <span
-                  className={`status-dot ${strataStatus.proxy || strataStatus.running ? "online" : "offline"}`}
-                  style={{ marginTop: 0 }}
-                />
-                <span className="router-pill-text">
-                  {strataStatus.proxy
-                    ? `Strata 代理 :${strataProxyPort}`
-                    : strataStatus.running
-                      ? `Strata 引擎 :${strataStatus.port}`
-                      : "Strata 未运行"}
-                </span>
-                <i
-                  className={`fas ${
-                    (strataStatus.proxy || strataStatus.running) && !(strataStatus.external && !strataStatus.proxy)
-                      ? "fa-stop"
-                      : strataStatus.running
-                        ? "fa-lock"
-                        : "fa-play"
-                  }`}
-                />
-              </button>
-              {(strataStatus.proxy || strataStatus.running) && (
-                <span
-                  className="sidebar-foot-note"
-                  // 与上下两颗胶囊等距（CSS 的 margin-top 也是 0.45rem）
-                  style={{ marginBottom: "0.45rem" }}
-                  title={strataFootTitle}
-                >
-                  {strataFootText}
-                </span>
-              )}
-            </Fragment>
-          )}
-          {/* router 状态 + 启停合成一颗胶囊（样式沿用 hub 模型卡的状态胶囊）：
-              左边状态点、中间状态文字、右边是启动/停止图标 */}
+          {/* 前门胶囊（用户 m00798 + 决策 A3）：统一入口只留 :9090，llama.cpp 子实例与
+              Strata 引擎都从这一个端口进，所以启停合并成一颗 —— 原来那颗 router 胶囊
+              随 router 退役一起删掉了（托盘菜单里仍有 router 的启停，直到后端退役）。
+              前门是懒的：启动它不会加载任何模型，首次请求才按 `model` 起实例。
+              非 GUI 启动的引擎（用户自己跑 run-<model>.bat）停不了，见下方小字的 title。 */}
           <button
             type="button"
-            className={`router-pill ${status.running ? "is-running" : "is-stopped"}`}
-            disabled={busy || (!status.running && !settings?.llama_cpp_dir)}
+            className={`router-pill mb-1 ${strataStatus.proxy ? "is-running" : "is-stopped"}`}
+            disabled={busy}
             title={
-              status.running
-                ? `点击停止 router（:${status.port}）`
-                : settings?.llama_cpp_dir
-                  ? "点击启动 router"
-                  : "先到「设置」里指定 llama.cpp 目录"
+              strataStatus.proxy
+                ? `点击停止前门（:${strataProxyPort} · llama.cpp 与 Strata 两通道都走这里）`
+                : `点击启动前门（默认 :${strataProxyPort} · DSH 等客户端连这里，按请求里的 model 自动切换引擎）`
             }
-            onClick={() => void (status.running ? stopRouter() : startRouter())}
+            onClick={() => void (strataStatus.proxy ? stopStrataProxy() : startStrataProxy())}
           >
-            <span className={`status-dot ${status.running ? "online" : "offline"}`} style={{ marginTop: 0 }} />
+            <span
+              className={`status-dot mt-0 ${strataStatus.proxy ? "online" : "offline"}`}
+            />
             <span className="router-pill-text">
-              {status.running ? `router 运行中 · :${status.port}` : "router 未运行"}
+              {strataStatus.proxy ? `前门 :${strataProxyPort}` : "前门未启动"}
             </span>
-            <i className={`fas ${status.running ? "fa-stop" : "fa-play"}`} />
+            <i className={`fas ${strataStatus.proxy ? "fa-stop" : "fa-play"}`} />
           </button>
-          {status.version && (
-            <span className="sidebar-foot-note" title={status.version}>
-              {status.version}
-            </span>
-          )}
+          <span className="sidebar-foot-note" title={strataFootTitle}>
+            {strataFootText}
+          </span>
+          <span className="sidebar-foot-note" title={llamaFootTitle}>
+            {llamaFootText}
+          </span>
         </div>
       </aside>
 
       {tab === "models" && <ModelListPanel />}
+      {tab === "monitor" && (
+        <MonitoringPage
+          live={liveMetric}
+          snapshot={monitor}
+          engine={engine}
+          engineError={engineError}
+          engineNote={engineNote}
+          recentTurns={recentTurns}
+          model={activeModel}
+          models={loadedModels}
+          onSelectModel={setMonitorModel}
+          gpuName={monitor?.static.gpuName ?? null}
+          speedSeries={speedSeries}
+          sampledAt={monitorAt}
+        />
+      )}
+      {tab === "chat" && <ChatPanel />}
       {tab === "bench" && <BenchPanel />}
-      {tab === "runtime" && <RuntimePanel />}
-      {tab === "strata" && <StrataPanel />}
       {tab === "logs" && <LogPanel />}
       {tab === "settings" && <SettingsPanel />}
 
@@ -372,6 +484,7 @@ export default function App() {
           </div>
         </div>
       )}
+      {statusBar}
     </>
   );
 }

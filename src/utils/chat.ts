@@ -1,0 +1,513 @@
+/**
+ * 原生聊天页的纯逻辑：消息/会话类型、请求体构造、SSE 组帧与解码、能力判定。
+ *
+ * 照上游 `packages/core/src/chat.ts` 移植，**去掉 Strata 专有的三样**：
+ * - `strata_mcp`（换成 GUI 自己当 MCP 客户端的 `mcpTools`，见 `src-tauri/src/mcp.rs`）
+ * - `strata_prefix`（固定文档前缀缓存，上游靠引擎侧实现）
+ * - `experimental_speed_projection`（依赖 `/metrics` 的 `engine.cvec`）
+ *
+ * 保留的通用部分：共享默认值（`buildSharedDefaults`）、请求体组装
+ * （`buildChatRequest`）、SSE 解析（`SSEParser`）、增量解码（`decodeChatChunk`）。
+ */
+
+export type ChatRole = "system" | "user" | "assistant" | "tool";
+
+/**
+ * 提供给模型的工具（OpenAI `tools` 数组里的一项）。
+ * llama.cpp 自己既没有联网也没有 MCP 客户端接进本工程；工具由 GUI 执行后把结果喂回去
+ * （联网搜索与网页正文抓取见 `src-tauri/src/search.rs`，MCP 见 `src-tauri/src/mcp.rs`）。
+ */
+export interface ToolSpec {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+}
+
+/** 模型发起的一次工具调用（流式分片累积完成后的形态） */
+export interface ToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+/** 流里 `delta.tool_calls` 的一片（同一次调用会分多条到达，按 `index` 拼） */
+export interface ToolCallFragment {
+  index: number;
+  id?: string;
+  name?: string;
+  arguments?: string;
+}
+
+/** 附件：文本内联成围栏代码块，图片走 `image_url` Data URL */
+export interface ChatAttachment {
+  id: string;
+  name: string;
+  type: "text" | "image";
+  mimeType: string;
+  /** 文本附件是原文；图片是 `data:image/png;base64,...` */
+  content: string;
+}
+
+/** 工具调用（本工程暂不产生，保留渲染结构以备将来） */
+export interface ChatToolEvent {
+  id?: string;
+  name: string;
+  status: string;
+  arguments?: unknown;
+  result?: string | null;
+  /** 卡片头上的一句补充说明（如联网搜索「走的是哪个引擎、跳过了哪些」） */
+  note?: string;
+  at?: number;
+  ok?: boolean;
+  skipped?: boolean;
+  raw?: Record<string, unknown>;
+}
+
+export interface ChatUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  output_tokens?: number;
+  prompt_tokens_details?: { cached_tokens?: number };
+  [key: string]: unknown;
+}
+
+/**
+ * llama.cpp 在流末尾连 `usage` 一起报的 `timings`（纯计算时间，权威口径）。
+ * 压测页一直用这套数，聊天页的「预填充 / 解码 / 草稿命中率」也取自这里（用户 m06312 第 1 点）。
+ */
+export interface ChatSpeed {
+  /** 预填充速度 tok/s（`timings.prompt_per_second`） */
+  prefillTokS?: number;
+  /** 解码速度 tok/s（`timings.predicted_per_second`） */
+  decodeTokS?: number;
+  /** 草稿命中率 0–1（`draft_n_accepted / draft_n`）；没开投机解码就是 null */
+  draftAccept?: number | null;
+  /** 提示词缓存命中的 token 数（`timings.cache_n`），算「缓存命中率」用 */
+  cacheTokens?: number | null;
+}
+
+function num(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** 解析 `chunk.timings`；一个字段都没读到时返回 null，免得把空对象挂到消息上 */
+export function parseChatSpeed(value: unknown): ChatSpeed | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as Record<string, unknown>;
+  const draftN = num(raw.draft_n);
+  const draftHits = num(raw.draft_n_accepted);
+  const speed: ChatSpeed = {
+    prefillTokS: num(raw.prompt_per_second),
+    decodeTokS: num(raw.predicted_per_second),
+    draftAccept: draftN && draftN > 0 && draftHits !== undefined ? draftHits / draftN : null,
+    cacheTokens: num(raw.cache_n) ?? null,
+  };
+  if (
+    speed.prefillTokS === undefined &&
+    speed.decodeTokS === undefined &&
+    speed.draftAccept == null &&
+    speed.cacheTokens == null
+  )
+    return null;
+  return speed;
+}
+
+/** 一次请求的生命周期（照上游 `ChatExecution`，去掉服务请求标识） */
+export interface ChatExecution {
+  phase: "waiting" | "reasoning" | "tools" | "generating" | "completed" | "cancelled" | "failed";
+  startedAt: number;
+  requestStartedAt?: number;
+  finishedAt?: number;
+  firstTokenMs?: number;
+  firstVisibleMs?: number;
+  /** 本地生成的这次操作 id，用于日志对账 */
+  operationId: string;
+  /** 服务回传的响应 id（llama.cpp 是 chatcmpl-…） */
+  responseId?: string;
+}
+
+/** 会话里的一条消息 */
+export interface ChatTurn {
+  id: string;
+  role: ChatRole;
+  content: string;
+  reasoning?: string;
+  createdAt: number;
+  usage?: ChatUsage;
+  /** 流末尾报的预填充 / 解码 / 草稿命中率 */
+  speed?: ChatSpeed;
+  attachments?: ChatAttachment[];
+  tools?: ChatToolEvent[];
+  /** 助手这一轮要求调用的工具（下一轮作为 `tool_calls` 原样发回去） */
+  toolCalls?: ToolCall[];
+  /** `role: "tool"` 时对应哪一次调用 */
+  toolCallId?: string;
+  error?: string;
+  stopped?: boolean;
+  execution?: ChatExecution;
+  elapsedMs?: number;
+  firstTokenMs?: number;
+  reasoningMs?: number;
+}
+
+export interface Conversation {
+  id: string;
+  /** 这份会话绑定的模型名（config 里的 name） */
+  model: string;
+  title: string;
+  messages: ChatTurn[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type ReasoningEffort = "off" | "low" | "medium" | "high";
+
+export interface ChatOptions {
+  model: string;
+  reasoningEffort: ReasoningEffort;
+  temperature: number;
+  topP: number;
+  topK: number;
+  maxTokens: number;
+  seed: number | null;
+  systemPrompt: string;
+  showReasoning: boolean;
+  /** 允许模型调用内置联网搜索（工具由 GUI 执行，llama.cpp 自己不联网） */
+  webSearch: boolean;
+  /** 允许模型调用用户在聊天设置里配的 MCP 工具（同样由 GUI 执行，见 `src-tauri/src/mcp.rs`） */
+  mcpTools: boolean;
+  /** Enter 直接发送（否则 Enter 换行、Ctrl+Enter 发送）；用户 m07816 第 3 点 */
+  enterSends: boolean;
+}
+
+/** 上游 `DEFAULT_COMMON_CHAT_DEFAULTS` 的同一组值（mcp 字段本工程没有） */
+export const DEFAULT_CHAT_OPTIONS: Readonly<ChatOptions> = Object.freeze({
+  model: "",
+  reasoningEffort: "high",
+  temperature: 0.6,
+  topP: 0.95,
+  topK: 20,
+  maxTokens: 0,
+  seed: null,
+  systemPrompt: "",
+  showReasoning: true,
+  webSearch: false,
+  mcpTools: false,
+  enterSends: true,
+});
+
+export function normalizeChatOptions(value: unknown): ChatOptions {
+  const stored =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  const inRange = (input: unknown, min: number, max: number, openMin = false): input is number =>
+    typeof input === "number" &&
+    Number.isFinite(input) &&
+    (openMin ? input > min : input >= min) &&
+    input <= max;
+  return {
+    model: typeof stored.model === "string" ? stored.model : DEFAULT_CHAT_OPTIONS.model,
+    reasoningEffort:
+      typeof stored.reasoningEffort === "string" &&
+      ["off", "low", "medium", "high"].includes(stored.reasoningEffort)
+        ? (stored.reasoningEffort as ReasoningEffort)
+        : DEFAULT_CHAT_OPTIONS.reasoningEffort,
+    temperature: inRange(stored.temperature, 0, 2)
+      ? stored.temperature
+      : DEFAULT_CHAT_OPTIONS.temperature,
+    topP: inRange(stored.topP, 0, 1, true) ? stored.topP : DEFAULT_CHAT_OPTIONS.topP,
+    topK:
+      typeof stored.topK === "number" && Number.isInteger(stored.topK) && stored.topK >= 1 && stored.topK <= 64
+        ? stored.topK
+        : DEFAULT_CHAT_OPTIONS.topK,
+    maxTokens:
+      typeof stored.maxTokens === "number" &&
+      Number.isSafeInteger(stored.maxTokens) &&
+      stored.maxTokens >= 0
+        ? stored.maxTokens
+        : DEFAULT_CHAT_OPTIONS.maxTokens,
+    seed:
+      typeof stored.seed === "number" && Number.isSafeInteger(stored.seed) && stored.seed > 0
+        ? stored.seed
+        : DEFAULT_CHAT_OPTIONS.seed,
+    systemPrompt:
+      typeof stored.systemPrompt === "string" ? stored.systemPrompt : DEFAULT_CHAT_OPTIONS.systemPrompt,
+    showReasoning:
+      typeof stored.showReasoning === "boolean" ? stored.showReasoning : DEFAULT_CHAT_OPTIONS.showReasoning,
+    webSearch: typeof stored.webSearch === "boolean" ? stored.webSearch : DEFAULT_CHAT_OPTIONS.webSearch,
+    mcpTools: typeof stored.mcpTools === "boolean" ? stored.mcpTools : DEFAULT_CHAT_OPTIONS.mcpTools,
+    enterSends: typeof stored.enterSends === "boolean" ? stored.enterSends : DEFAULT_CHAT_OPTIONS.enterSends,
+  };
+}
+
+/** 上游 `buildSharedDefaults`：只放跨模型安全的采样默认值 */
+export function buildSharedDefaults(options: ChatOptions): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (options.reasoningEffort) {
+    out.reasoning_effort = options.reasoningEffort === "off" ? "none" : options.reasoningEffort;
+  }
+  // temperature 为 0 时 top_p/top_k 无意义，别发（上游同）
+  if (options.temperature > 0) {
+    out.top_p = options.topP;
+    out.top_k = options.topK ?? 20;
+  }
+  out.temperature = options.temperature;
+  if (options.maxTokens > 0) out.max_tokens = options.maxTokens;
+  if (options.seed !== null) out.seed = options.seed;
+  return out;
+}
+
+/**
+ * 文本附件 → 围栏代码块。围栏长度按内容里最长反引号串加一，
+ * 否则附件里带 ``` 会把代码块提前截断（上游同）。
+ */
+export function attachmentText(file: ChatAttachment): string {
+  if (file.content.includes("\0")) throw new Error(`${file.name} 包含二进制内容，请使用文本文件`);
+  if (new TextEncoder().encode(file.content).length > 512 * 1024) {
+    throw new Error(`${file.name} 超出 512 KB 文本附件限制`);
+  }
+  const longest = Math.max(0, ...(file.content.match(/`+/g) ?? []).map((run) => run.length));
+  const fence = "`".repeat(Math.max(2, longest + 1));
+  return `File: ${file.name}\n${fence}\n${file.content}\n${fence}`;
+}
+
+const IMAGE_MIME = /^image\/(png|jpeg|webp|gif)$/i;
+
+function apiMessage(message: ChatTurn, supportsImages: boolean): Record<string, unknown> {
+  // 工具结果原样回填：llama.cpp 靠 tool_call_id 把结果对回那次调用
+  if (message.role === "tool") {
+    return { role: "tool", tool_call_id: message.toolCallId ?? "", content: message.content };
+  }
+  const attachments = message.attachments ?? [];
+  const texts: string[] = [];
+  if (message.content) texts.push(message.content);
+  for (const file of attachments) {
+    if (file.type === "text") texts.push(attachmentText(file));
+    else if (file.type !== "image") throw new Error("仅支持文本文件和图片附件");
+  }
+  const content = texts.filter(Boolean).join("\n\n");
+  const calls = message.toolCalls ?? [];
+  const extra =
+    calls.length > 0
+      ? {
+          tool_calls: calls.map((call) => ({
+            id: call.id,
+            type: "function",
+            function: { name: call.name, arguments: call.arguments },
+          })),
+        }
+      : {};
+  const images = attachments.filter((file) => file.type === "image");
+  if (images.length === 0) return { role: message.role, content, ...extra };
+  if (!supportsImages) throw new Error("当前模型未确认支持图片，请换视觉模型");
+  const parts: Record<string, unknown>[] = [{ type: "text", text: content }];
+  for (const image of images) {
+    if (!IMAGE_MIME.test(image.mimeType)) throw new Error(`${image.name} 图片格式不受支持`);
+    parts.push({ type: "image_url", image_url: { url: image.content } });
+  }
+  return { role: message.role, content: parts, ...extra };
+}
+
+/** 组装 `/v1/chat/completions` 的请求体（上游 `buildChatRequest` 的本工程版） */
+export function buildChatRequest(
+  messages: ChatTurn[],
+  options: ChatOptions,
+  supportsImages = false,
+  tools: ToolSpec[] = [],
+): Record<string, unknown> {
+  if (!options.model.trim()) throw new Error("请先选择模型");
+  const api: Record<string, unknown>[] = [];
+  if (options.systemPrompt.trim()) api.push({ role: "system", content: options.systemPrompt.trim() });
+  for (const message of messages) {
+    // 出错/被停掉的那条不参与下一轮上下文（上游同）
+    if (message.error) continue;
+    api.push(apiMessage(message, supportsImages));
+  }
+  return {
+    model: options.model,
+    messages: api,
+    stream: true,
+    stream_options: { include_usage: true },
+    ...(tools.length > 0 ? { tools, tool_choice: "auto" } : {}),
+    ...buildSharedDefaults(options),
+  };
+}
+
+/**
+ * SSE 组帧：任意切块都要能拼回完整事件（CR/LF、多行 data、UTF-8 边界）。
+ * `push` 喂原始字节或字符串，`finish` 收尾把残留行吐出去。
+ */
+export class SSEParser {
+  private buffer = "";
+  private data: string[] = [];
+  private readonly decoder = new TextDecoder();
+
+  constructor(private readonly onData: (data: string) => void) {}
+
+  push(chunk: string | Uint8Array): void {
+    this.buffer += typeof chunk === "string" ? chunk : this.decoder.decode(chunk, { stream: true });
+    this.drain(false);
+  }
+
+  finish(): void {
+    this.buffer += this.decoder.decode();
+    this.drain(true);
+    this.dispatch();
+  }
+
+  private dispatch(): void {
+    if (this.data.length === 0) return;
+    const payload = this.data.join("\n");
+    this.data = [];
+    this.onData(payload);
+  }
+
+  private drain(final: boolean): void {
+    for (;;) {
+      const match = /[\r\n]/.exec(this.buffer);
+      if (!match) break;
+      const index = match.index;
+      // 末尾孤零零一个 \r：可能是 \r\n 的前半，等下一块
+      if (!final && this.buffer[index] === "\r" && index === this.buffer.length - 1) break;
+      const count = this.buffer[index] === "\r" && this.buffer[index + 1] === "\n" ? 2 : 1;
+      const line = this.buffer.slice(0, index);
+      this.buffer = this.buffer.slice(index + count);
+      this.line(line);
+    }
+    if (final && this.buffer) {
+      const line = this.buffer;
+      this.buffer = "";
+      this.line(line);
+    }
+  }
+
+  private line(raw: string): void {
+    // 空行 = 一个事件结束
+    if (raw === "") {
+      this.dispatch();
+      return;
+    }
+    // 冒号开头是注释（llama.cpp 的心跳就是 `:`）
+    if (raw.startsWith(":")) return;
+    const colon = raw.indexOf(":");
+    const field = colon < 0 ? raw : raw.slice(0, colon);
+    let value = colon < 0 ? "" : raw.slice(colon + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "data") this.data.push(value);
+  }
+}
+
+/** 一条 SSE `data:` 载荷解码后的增量 */
+export interface ChatDelta {
+  content?: string;
+  reasoning?: string;
+  usage?: ChatUsage;
+  timings?: ChatSpeed;
+  finishReason?: string;
+  responseId?: string;
+  done?: boolean;
+  /** 流里到达的工具调用分片，按 `index` 累积 */
+  toolCalls?: ToolCallFragment[];
+  error?: string;
+}
+
+/** 解码一条 `data:` 载荷（上游 `decodeChatChunk` 的本工程版） */
+export function decodeChatChunk(data: string): ChatDelta[] {
+  if (data.trim() === "[DONE]") return [{ done: true }];
+  let chunk: Record<string, unknown>;
+  try {
+    chunk = JSON.parse(data) as Record<string, unknown>;
+  } catch {
+    throw new Error("服务返回了无效的 SSE JSON");
+  }
+  const out: ChatDelta[] = [];
+  const error = chunk.error as { message?: unknown } | string | undefined;
+  if (error) {
+    out.push({ error: typeof error === "string" ? error : String((error as { message?: unknown }).message ?? error) });
+    return out;
+  }
+  if (typeof chunk.id === "string") out.push({ responseId: chunk.id });
+  if (chunk.usage && typeof chunk.usage === "object") out.push({ usage: chunk.usage as ChatUsage });
+  const timings = parseChatSpeed(chunk.timings);
+  if (timings) out.push({ timings });
+  const choice = (Array.isArray(chunk.choices) ? chunk.choices[0] : undefined) as
+    | {
+        delta?: { content?: unknown; reasoning_content?: unknown; tool_calls?: unknown };
+        finish_reason?: unknown;
+      }
+    | undefined;
+  if (choice?.finish_reason != null) out.push({ finishReason: String(choice.finish_reason) });
+  const rawCalls = choice?.delta?.tool_calls;
+  if (Array.isArray(rawCalls)) {
+    const fragments: ToolCallFragment[] = [];
+    for (const item of rawCalls) {
+      if (!item || typeof item !== "object") continue;
+      const call = item as {
+        index?: unknown;
+        id?: unknown;
+        function?: { name?: unknown; arguments?: unknown };
+      };
+      fragments.push({
+        index: typeof call.index === "number" ? call.index : 0,
+        ...(typeof call.id === "string" ? { id: call.id } : {}),
+        ...(typeof call.function?.name === "string" ? { name: call.function.name } : {}),
+        ...(typeof call.function?.arguments === "string" ? { arguments: call.function.arguments } : {}),
+      });
+    }
+    if (fragments.length > 0) out.push({ toolCalls: fragments });
+  }
+  const content = choice?.delta?.content;
+  const reasoning = choice?.delta?.reasoning_content;
+  if (typeof content === "string" || typeof reasoning === "string") {
+    out.push({
+      ...(typeof content === "string" ? { content } : {}),
+      ...(typeof reasoning === "string" ? { reasoning } : {}),
+    });
+  }
+  return out;
+}
+
+/** 一次请求的执行状态机（照上游 `newChatExecution` / `advanceChatExecution` / `finishChatExecution`） */
+export function newChatExecution(operationId: string): ChatExecution {
+  return { phase: "waiting", startedAt: Date.now(), operationId };
+}
+
+export function advanceChatExecution(execution: ChatExecution, delta: ChatDelta): ChatExecution {
+  const next: ChatExecution = { ...execution };
+  if (!next.requestStartedAt) next.requestStartedAt = Date.now();
+  if (delta.responseId && !next.responseId) next.responseId = delta.responseId;
+  if (delta.reasoning && next.phase === "waiting") next.phase = "reasoning";
+  if (delta.content) {
+    if (next.firstTokenMs === undefined) next.firstTokenMs = Date.now() - next.startedAt;
+    next.phase = "generating";
+  }
+  return next;
+}
+
+export function finishChatExecution(
+  execution: ChatExecution,
+  cancelled: boolean,
+  failed: boolean,
+): ChatExecution {
+  return {
+    ...execution,
+    phase: failed ? "failed" : cancelled ? "cancelled" : "completed",
+    finishedAt: Date.now(),
+    firstVisibleMs: execution.firstTokenMs,
+  };
+}
+
+/** 会话标题：取首句前 42 个字符（上游同） */
+export function conversationTitle(content: string, fallbackName?: string): string {
+  const trimmed = content.trim();
+  if (trimmed) return trimmed.slice(0, 42);
+  return fallbackName ?? "未命名会话";
+}
+
+export function newId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
