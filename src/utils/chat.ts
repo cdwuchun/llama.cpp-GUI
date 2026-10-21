@@ -127,6 +127,12 @@ export interface ChatExecution {
   operationId: string;
   /** 服务回传的响应 id（llama.cpp 是 chatcmpl-…） */
   responseId?: string;
+  /**
+   * 等待期间的自定义状态文案（用户 m00082 第 3 点）：选中的模型没加载时，发送会先自动拉起，
+   * 这段几十秒里状态条显示「正在加载模型 xxx…」，而不是干等「等待响应」。
+   * 只在 `phase === "waiting"` 时生效 —— 加载完开始生成后由常规标签接管，不必清字段。
+   */
+  hint?: string;
 }
 
 /** 会话里的一条消息 */

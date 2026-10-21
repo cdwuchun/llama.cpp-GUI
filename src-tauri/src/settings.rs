@@ -222,6 +222,13 @@ pub struct Settings {
     /// `shell=True`、120 秒超时、失败只打印不阻断。可用来在 Strata 抢显存前先卸掉 router 的模型。
     #[serde(default)]
     pub strata_before_load: Option<String>,
+    /// 全局选定的 Strata 引擎可执行文件（`engine-bundle\<版本>-…\strata.exe` 的绝对路径）。
+    ///
+    /// `engine-bundle` 下可能多版本并存，设置页「通用 → Strata 引擎」列出来让用户选；
+    /// 选中后由 `strata_apply_engine` 批量写进全部 `strata-*.json` 的 `exe`。
+    /// 这里只是「用户选的是哪个」，各 config 自己的 `exe` 才是运行时的真值。
+    #[serde(default)]
+    pub strata_engine: Option<String>,
     /// `settings.json` 里**本版本不认识的字段**，原样留着。
     ///
     /// 之前没有任何兜底：反序列化时 serde 默认把未知键**丢弃**，于是应用每次改设置都会
@@ -264,6 +271,7 @@ impl Default for Settings {
             strata_idle_unload_s: None,
             strata_min_free_vram_mib: None,
             strata_before_load: None,
+            strata_engine: None,
             strata_host: None,
             strata_port: None,
             strata_api_key: None,
@@ -298,6 +306,8 @@ pub struct SettingsPatch {
     pub strata_idle_unload_s: Option<Option<i64>>,
     pub strata_min_free_vram_mib: Option<Option<i64>>,
     pub strata_before_load: Option<Option<String>>,
+    /// 全局选定的 Strata 引擎 exe（`None` 的那层 = 清空 = 不指定）。
+    pub strata_engine: Option<Option<String>>,
     pub strata_host: Option<String>,
     pub strata_port: Option<u16>,
     pub strata_api_key: Option<String>,
@@ -528,6 +538,9 @@ impl SettingsStore {
             }
             if let Some(v) = patch.strata_before_load {
                 s.strata_before_load = v.filter(|t| !t.trim().is_empty()).map(|t| t.trim().to_string());
+            }
+            if let Some(v) = patch.strata_engine {
+                s.strata_engine = v.filter(|t| !t.trim().is_empty()).map(|t| t.trim().to_string());
             }
             if let Some(v) = patch.strata_host {
                 let v = v.trim().to_string();

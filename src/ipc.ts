@@ -28,11 +28,14 @@ import type {
   Settings,
   SettingsPatch,
   StrataModelEntry,
+  StrataEngine,
   StrataStatus,
 } from "./types";
 
 export const ipc = {
   ping: () => invoke<string>("ping"),
+  /** 首屏渲染完成后调用：后端此时才把主窗口显示出来（避免 WebView2 首帧前露底色）。 */
+  appBootFinished: () => invoke<void>("app_boot_finished"),
   appPaths: () => invoke<AppPaths>("app_paths"),
 
   settingsGet: () => invoke<Settings>("settings_get"),
@@ -72,6 +75,13 @@ export const ipc = {
   /** 加载运行中 Strata 的模型（POST /load）：上游会跑 before_load 并检查显存门槛 */
   strataLoadModel: (root: string, configFile: string) =>
     invoke<string>("strata_load_model", { root, configFile }),
+  /** 列出 `engine-bundle` 下所有可用的引擎版本（可能多份并存） */
+  strataEngines: (root: string) => invoke<StrataEngine[]>("strata_engines", { root }),
+  /** 把某份 config 的 exe 换成选定的引擎可执行文件 */
+  strataSetEngine: (root: string, configFile: string, exe: string) =>
+    invoke<void>("strata_set_engine", { root, configFile, exe }),
+  /** 把选定的引擎批量写进全部 config，返回被改过的文件名 */
+  strataApplyEngine: (exe: string) => invoke<string[]>("strata_apply_engine", { exe }),
 
   logsSnapshot: (limit?: number) => invoke<LogLine[]>("logs_snapshot", { limit: limit ?? null }),
   logsClear: () => invoke<void>("logs_clear"),

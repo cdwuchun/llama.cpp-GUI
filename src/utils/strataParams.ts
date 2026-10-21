@@ -22,7 +22,7 @@ import { isFlagToken } from "./extraParams";
 export type { ParamState };
 
 /** 无值开关：出现即真，不消费下一个 token */
-const FLAG_ONLY = new Set(["vision", "kv-grow", "prompt-cache-tail", "no-ple"]);
+const FLAG_ONLY = new Set(["vision", "kv-grow", "prompt-cache-tail", "no-ple", "batch-mtp"]);
 
 /**
  * 安装事实类参数：由 Strata 的安装器（`START-HERE.bat` / `setup.py`）写下，
@@ -41,9 +41,12 @@ export const STRATA_INSTALL_FACT_FLAGS = [
 const GROUPS = [
   { id: "ctx", label: "上下文与 KV", order: 1, collapsed: false },
   { id: "speed", label: "加速与缓存", order: 2, collapsed: false },
-  { id: "sampling", label: "采样", order: 3, collapsed: false },
-  { id: "vision", label: "多模态", order: 4, collapsed: false },
-  { id: "serve", label: "其它", order: 5, collapsed: true },
+  // 并发与上面两组是同一层级的启动事实：--batch / --batch-mtp / --batch-groups
+  // 是引擎的并发批次开关，--conversation-cache-* 是配套的会话停放预算（用户 m03848）
+  { id: "parallel", label: "并发", order: 3, collapsed: false },
+  { id: "sampling", label: "采样", order: 4, collapsed: false },
+  { id: "vision", label: "多模态", order: 5, collapsed: false },
+  { id: "serve", label: "其它", order: 6, collapsed: true },
 ];
 
 /** 表单认识的参数（取值域摘自 `strata.exe --help`） */
@@ -258,10 +261,44 @@ const PARAM_META: Omit<ParamDef, "abbr" | "delimiter" | "mergeInto" | "mergeValu
       { value: "8", label: "8" },
     ],
     label: "并发槽位",
-    desc: "--batch N（与 --slots N 等价）：最多 N 个请求同时解码，每个槽位有自己的 session 并占用与主 session 相当的显存（通常 2..8）。不写 = 单请求。勾选 --batch-mtp 可让每个槽位每轮多验证一个 MTP 草稿。改完要重启引擎才生效。",
-    group: "speed",
-    order: 8,
-    sort: 8,
+    desc: "--batch N（与 --slots N 等价）：最多 N 个请求同时解码，每个槽位有自己的 session 并占用与主 session 相当的显存（通常 2..8，引擎批次窗口最多 8 行）。不写 = 单请求串行。改完要重启引擎才生效。",
+    group: "parallel",
+    order: 1,
+    sort: 1,
+    defaultEnabled: false,
+  },
+  {
+    key: "batch-mtp",
+    flag: "--batch-mtp",
+    type: "LOGIC",
+    uiType: null,
+    default: "false",
+    values: [],
+    label: "MTP 并发验证",
+    desc: "--batch-mtp：开并发时每个槽位每轮多验证一个 MTP 草稿（多行窗口一次过）。引擎要求同时有 --batch、--mtp（MTP 草稿模型）与 --spec；不能与 --batch-groups 同开；每槽额外占显存。改完要重启引擎才生效。",
+    group: "parallel",
+    order: 2,
+    sort: 2,
+    defaultEnabled: false,
+  },
+  {
+    key: "batch-groups",
+    flag: "--batch-groups",
+    type: "INTEGER",
+    uiType: "dropdown",
+    default: "64",
+    values: [
+      { value: "0", label: "0（关闭）" },
+      { value: "2", label: "2" },
+      { value: "4", label: "4" },
+      { value: "8", label: "8" },
+      { value: "64", label: "64（引擎默认）" },
+    ],
+    label: "并发分组",
+    desc: "--batch-groups G：多卡分层（layer split）运行时把并发槽位分成 G 组流水线过 GPU。只在多卡分层时有意义，单卡不用开；引擎默认 64，0 = 关闭。需要先有 --batch。改完要重启引擎才生效。",
+    group: "parallel",
+    order: 3,
+    sort: 3,
     defaultEnabled: false,
   },
   {
@@ -279,9 +316,9 @@ const PARAM_META: Omit<ParamDef, "abbr" | "delimiter" | "mergeInto" | "mergeValu
     ],
     label: "会话缓存预算（MiB）",
     desc: "--serve：停放（park）会话占用的物理内存预算（MiB）。默认 0 表示关闭会话停放。停放后再次请求可直接恢复，省掉重新 prefill；预算用完时按先后顺序丢弃最旧的会话。改完要重启引擎才生效。",
-    group: "speed",
-    order: 9,
-    sort: 9,
+    group: "parallel",
+    order: 4,
+    sort: 4,
     defaultEnabled: false,
   },
   {
@@ -299,9 +336,9 @@ const PARAM_META: Omit<ParamDef, "abbr" | "delimiter" | "mergeInto" | "mergeValu
     ],
     label: "会话缓存槽数",
     desc: "--serve：最多同时停放的会话数（默认 4）。每个停放会话的实际内存占用仍受「会话缓存预算」约束；槽数给得比预算能装下的多时，超出部分的会话会被丢弃。改完要重启引擎才生效。",
-    group: "speed",
-    order: 10,
-    sort: 10,
+    group: "parallel",
+    order: 5,
+    sort: 5,
     defaultEnabled: false,
   },
   {
@@ -355,7 +392,7 @@ const PARAM_META: Omit<ParamDef, "abbr" | "delimiter" | "mergeInto" | "mergeValu
     default: "",
     values: [],
     label: "多模态模型",
-    desc: "视觉投影模型（config 顶层 vision.mmproj）：让视觉编码器把图像嵌入成模型能读的向量，勾选「多模态（视觉）」后必填。保存时 GUI 会同时把 vision.exe 补成 <安装目录>\\engine\\strata-vision.exe、把 vision.model 同步成启动参数里的 --model。",
+    desc: "视觉投影模型（config 顶层 vision.mmproj）：让视觉编码器把图像嵌入成模型能读的向量，勾选「多模态（视觉）」后必填。保存时 GUI 会把 vision.exe 补成引擎组件目录里的 strata-vision.exe（`engine-bundle\\<版本>-<平台>-<后端>`），把 vision.model 同步成启动参数里的 --model。",
     group: "vision",
     order: 2,
     sort: 2,
@@ -498,6 +535,12 @@ for (const [flag, key] of FLAG_TO_KEY) {
   KEY_FLAGS.set(key, [...(KEY_FLAGS.get(key) ?? []), flag]);
 }
 
+/** 路径的父目录（同时认 `\` 与 `/`）；没有分隔符时返回空串。 */
+function parentDir(path: string): string {
+  const at = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
+  return at > 0 ? path.slice(0, at) : "";
+}
+
 /** 表单认识的 flag 集合（写回时的白名单，含同义写法） */
 export const STRATA_KNOWN_FLAGS = new Set(FLAG_TO_KEY.keys());
 
@@ -594,6 +637,98 @@ export function validateStrataSampling(state: Record<string, ParamState>): strin
     if (!Number.isFinite(n) || !s.check(n)) {
       return `采样参数「${s.label}」的取值 "${raw}" 不合法：上游要求 ${s.range}，否则 Strata 启动时会直接退出`;
     }
+  }
+  return null;
+}
+
+/** 并发组里的参数 key（依赖校验只针对这一组） */
+const PARALLEL_KEYS = [
+  "batch",
+  "batch-mtp",
+  "batch-groups",
+  "conversation-cache-mib",
+  "conversation-cache-slots",
+];
+
+function hasArgFlag(args: unknown[], flag: string): boolean {
+  return args.some((token) => typeof token === "string" && token === flag);
+}
+
+/**
+ * 并发类参数的「能不能开」检查（用户 m03848）。
+ *
+ * 规则全部来自 `strata.exe --help`（0.1.46）与 `control/serve/server.py`：
+ * - `--batch-mtp` 需要 `--batch` + `--mtp` + `--spec`，且不能与 `--batch-groups` 同开
+ * - `--batch-groups` 需要 `--batch`（只在多卡分层时有意义）
+ * - `--batch` 取值 2..8（引擎批次窗口最多 8 行；`--batch-mtp` 靠多行窗口一次过更多）
+ * - `--conversation-cache-slots` 需要会话缓存预算 > 0，否则引擎关闭会话停放、槽数不生效
+ *
+ * 返回错误文案；`null` = 可以开启。关闭操作永远放行（调用方只在 enabled=true 时问）。
+ */
+export function checkStrataParamEnable(
+  key: string,
+  state: Record<string, ParamState>,
+  args: unknown[],
+): string | null {
+  const on = (k: string) => !!state[k]?.enabled;
+  const value = (k: string) => (state[k]?.value ?? "").trim();
+  // `--mtp` 是安装事实类参数（不在表单 schema 里），只能从 args 判断
+  const hasMtp = hasArgFlag(args, "--mtp");
+
+  if (key === "batch") {
+    const raw = value("batch");
+    const n = raw === "" ? NaN : Number(raw);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n < 2 || n > 8) {
+      return `「并发槽位」的取值 "${raw || "空"}" 不合法：引擎要求 2..8（批次窗口最多 8 行）`;
+    }
+    return null;
+  }
+
+  if (key === "batch-mtp") {
+    if (!on("batch")) {
+      return "「MTP 并发验证」不能单独开：引擎要求同时有 --batch，请先勾「并发槽位」";
+    }
+    if (!hasMtp) {
+      return "「MTP 并发验证」需要 --mtp：当前 config 没有 MTP 草稿模型，引擎要求 --batch-mtp 与 --mtp、--spec 同时存在";
+    }
+    if (!on("spec")) {
+      return "「MTP 并发验证」需要 --spec：请先在「加速与缓存」里勾「推测解码」";
+    }
+    if (on("batch-groups")) {
+      return "「MTP 并发验证」与「并发分组」不能同时开：引擎不支持两者共用";
+    }
+    return null;
+  }
+
+  if (key === "batch-groups") {
+    if (!on("batch")) {
+      return "「并发分组」需要先有 --batch：请先勾「并发槽位」，引擎只在并发批次里分组流水线";
+    }
+    if (on("batch-mtp")) {
+      return "「并发分组」与「MTP 并发验证」不能同时开：引擎不支持两者共用";
+    }
+    return null;
+  }
+
+  if (key === "conversation-cache-slots") {
+    if (!on("conversation-cache-mib") || value("conversation-cache-mib") === "0") {
+      return "「会话缓存槽数」需要先把「会话缓存预算」开到大于 0：预算为 0 或未开时引擎关闭会话停放，槽数不会生效";
+    }
+    return null;
+  }
+
+  return null;
+}
+
+/** 写盘前的整组校验：把已启用的并发参数逐个过一遍 `checkStrataParamEnable` */
+export function validateStrataParams(
+  state: Record<string, ParamState>,
+  args: unknown[],
+): string | null {
+  for (const key of PARALLEL_KEYS) {
+    if (!state[key]?.enabled) continue;
+    const error = checkStrataParamEnable(key, state, args);
+    if (error) return error;
   }
   return null;
 }
@@ -745,16 +880,22 @@ export function configToState(cfg: Record<string, unknown>): Record<string, Para
  * `vision.model` 是主模型，不由用户在这里选：GUI 从启动参数里的 `--model` 同步过来
  * （上游 `server.py` 把 exe/mmproj/model 三键都当必需键）。
  *
- * `root` = 设置里的 Strata 安装目录：`vision.exe` 是上游必需键（`server.py` 用它起
- * 视觉编码器），config 里已有就原样保留，缺失时按 `<root>/engine/strata-vision.exe` 补上。
+ * `root` = 设置里的 Strata 安装目录；`engineExe` = 后端解析出的**真实引擎可执行文件**
+ * （`engine-bundle\<版本>-<平台>-<后端>\strata.exe`）。
+ *
+ * 用户 m02686：config 里不留 `component:strata-engine` 这种引用，落盘时直接写真实路径。
+ * 所以拿到 `engineExe` 就同时改写顶层 `exe`，并用它的父目录拼 `vision.exe`
+ * （上游 `server.py` 把 vision.exe/mmproj/model 三键都当必需键）。
  */
 export function stateToConfig(
   cfg: Record<string, unknown>,
   state: Record<string, ParamState>,
   root?: string | null,
+  engineExe?: string | null,
 ): Record<string, unknown> {
   const args = Array.isArray(cfg.args) ? (cfg.args as unknown[]) : [];
   const next: Record<string, unknown> = { ...cfg, args: stateToArgs(args, state) };
+  if (engineExe) next.exe = engineExe;
 
   // 采样默认值：写回 config 顶层 sampling 块。GUI 不认识的键原样保留
   // （上游 0.1.39+ 往里放过实验开关键，例如 experimental_speed_projection）；
@@ -794,7 +935,14 @@ export function stateToConfig(
     const v: Record<string, unknown> = prevVision ?? {};
     if (mmproj) v.mmproj = mmproj;
     if (mainModel) v.model = mainModel;
-    if (!v.exe && root) {
+    // vision.exe 必须指向这一次安装的引擎组件（0.2.x 是 `engine-bundle\<版本>-…`）。
+    // 旧版 config 里可能是已不存在的 `<安装目录>\engine\strata-vision.exe`，
+    // 所以只要拿到引擎路径就覆盖，而不是「没有才补」。
+    const engineDir = engineExe ? parentDir(engineExe) : "";
+    if (engineDir) {
+      const sep = engineDir.includes("\\") ? "\\" : "/";
+      v.exe = `${engineDir}${sep}strata-vision.exe`;
+    } else if (!v.exe && root) {
       const sep = root.includes("\\") ? "\\" : "/";
       v.exe = `${root}${sep}engine${sep}strata-vision.exe`;
     }

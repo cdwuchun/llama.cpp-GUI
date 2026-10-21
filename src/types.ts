@@ -59,6 +59,8 @@ export interface Settings {
   strata_min_free_vram_mib: number | null;
   /** 写入 config 顶层 before_load：加载模型前执行的命令（上游 server.py:2589-2595）。null=不启用 */
   strata_before_load: string | null;
+  /** 全局选定的 Strata 引擎 exe（`engine-bundle\<版本>-…\strata.exe`）：设置页选完会写进全部 config */
+  strata_engine: string | null;
   /** 设置页「服务」分组上次写入的监听地址（真实来源是各 strata-*.json 的 host） */
   strata_host: string | null;
   /** 设置页「服务」分组上次写入的端口（真实来源是各 strata-*.json 的 port） */
@@ -94,6 +96,8 @@ export interface SettingsPatch {
   strata_min_free_vram_mib?: number | null;
   /** 写入 config 顶层 before_load：加载模型前执行的命令（上游 server.py:2589-2595）。空=不启用 */
   strata_before_load?: string | null;
+  /** 全局选定的 Strata 引擎 exe；改它会连带把全部 config 的 exe 写过去（由设置页先调 strata_apply_engine） */
+  strata_engine?: string | null;
   strata_host?: string | null;
   /** 仅记录「服务」分组写入过的端口；null = 本次没填，保留旧记录 */
   strata_port?: number | null;
@@ -194,6 +198,8 @@ export interface StrataModelEntry {
   engine_exists: boolean;
   /** 引擎版本，读引擎同目录 BUILD.json 的 version（运行时 /props.build_info 同源） */
   engine_version: string | null;
+  /** 扫描时把 config 里的 exe 改成了当前安装的引擎（升级换了版本子目录） */
+  engine_stale: boolean;
   /** 模型文件路径，来自 args 的 --native */
   model_path: string | null;
   /** 模型实际字节数：分片模型（-00001-of-00002.gguf）聚合全部分片求和 */
@@ -202,6 +208,21 @@ export interface StrataModelEntry {
   architecture: string | null;
   /** 量化标识：优先 GGUF 头部 file_type 推导，取不到时从文件名 stem 兜底 */
   quantization: string | null;
+}
+
+/**
+ * `engine-bundle` 下的一份引擎组件（可能多版本并存，面板列出来让用户选）。
+ *
+ * 字段来自该版本目录的 `engine-component.json`；清单缺字段时后端回退到
+ * 目录名与 `BUILD.json`，所以整组都可缺省。
+ */
+export interface StrataEngine {
+  version: string | null;
+  platform: string | null;
+  backend: string | null;
+  build: string | null;
+  archs: string[];
+  exe: string;
 }
 
 /** Strata 运行状态：进程事实 + 运行时探测（生效上下文、加载状态、token 占用）。 */

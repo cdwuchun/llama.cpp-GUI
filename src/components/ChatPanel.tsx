@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useApp } from "../store";
 import type { Conversation } from "../utils/chat";
+import { mergeModels } from "../utils/models";
 import { ChatIcon } from "./ChatIcons";
 import { ChatMessageView } from "./ChatMessageView";
 import { ChatSamplingSheet } from "./ChatSamplingSheet";
@@ -59,6 +60,11 @@ function groupConversations(list: Conversation[]): [Bucket, Conversation[]][] {
 export function ChatPanel() {
   const chat = useApp((s) => s.chat);
   const routerModels = useApp((s) => s.routerModels);
+  // 下拉要列出「所有模型」，所以扫描结果、config 清单与 Strata config 也要取（用户 m00082 第 2 点）
+  const scanned = useApp((s) => s.scanned);
+  const configs = useApp((s) => s.configs);
+  const settings = useApp((s) => s.settings);
+  const strataEntries = useApp((s) => s.strataEntries);
   const sendChat = useApp((s) => s.sendChat);
   const stopChat = useApp((s) => s.stopChat);
   const newConversation = useApp((s) => s.newConversation);
@@ -72,7 +78,8 @@ export function ChatPanel() {
   const dismissChatError = useApp((s) => s.dismissChatError);
 
   const [search, setSearch] = useState("");
-  const [historyOpen, setHistoryOpen] = useState(true);
+  /** 聊天历史默认收起（用户 m00547），工具栏的「展开聊天历史」按钮可展开 */
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [samplingOpen, setSamplingOpen] = useState(false);
@@ -123,25 +130,45 @@ export function ChatPanel() {
   const conversation = chat.conversations.find((item) => item.id === chat.activeId) ?? null;
   const streaming = chat.streaming;
 
-  /** 模型下拉一律只列正在运行的模型（用户 m07929 第 3 点）—— 没加载的选了也发不出去；
-   *  采样面板也用这一份，否则「选了没加载的模型」会被发送时的判据忽略（用户 m01516）。 */
-  const runningModels = useMemo(
-    () =>
-      routerModels
-        .filter((m) => m.status.value === "loaded")
-        .map((m) => m.id)
-        .sort((a, b) => a.localeCompare(b)),
-    [routerModels],
-  );
+  /** 模型下拉列出**所有**模型（用户 m00082 第 2 点）：没加载的也要能选，选中后发送时自动拉起。
+   *  顺序沿用 mergeModels 的原始顺序，不把已加载的排到最前（用户 m00370 第 2 点）。 */
+  const allModels = useMemo(() => {
+    const sections = new Set(configs.map((c) => c.name));
+    return mergeModels(
+      scanned,
+      routerModels,
+      settings?.favourites ?? [],
+      sections,
+      settings?.aliases ?? {},
+      strataEntries,
+    );
+  }, [scanned, routerModels, configs, settings?.favourites, settings?.aliases, strataEntries]);
+
+  /** 采样面板与下拉共用的值域：全部模型的请求名 */
+  const modelNames = useMemo(() => allModels.map((m) => m.section), [allModels]);
 
   /**
-   * 自动选模型（用户 m05810 第 5 点）：记住的选择必须仍然「在运行」才用，否则退回运行中
-   * 按 id 排序的第一个。否则上次选过、后来卸载了的模型会一直被当成当前模型，消息发出去才报错。
+   * 当前模型（用户 m00370 第 3 点 + m00437）。
+   *
+   * 记住的选择还在列表里就用它（未加载的由发送时自动拉起，不能悄悄换成别的模型）；
+   * 否则退回「已加载里按 id 排序的第一个」；
+   * 一个都没加载时退回「上次聊天的模型」（最近一份会话绑定的模型，还在列表里）；
+   * 再没有才显示「请选择模型」。
    */
+  const remembered = allModels.find(
+    (m) => m.section === chat.options.model || m.id === chat.options.model,
+  );
+  const defaultLoaded = allModels
+    .filter((m) => m.status === "loaded")
+    .sort((a, b) => a.id.localeCompare(b.id))[0];
+  /** 上次聊天的模型（用户 m00437）：取最近一份会话绑定的模型，且它仍在列表里 */
+  const lastChatModel = useMemo(() => {
+    const latest = [...chat.conversations].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+    if (!latest) return undefined;
+    return allModels.find((m) => m.section === latest.model || m.id === latest.model);
+  }, [chat.conversations, allModels]);
   const activeModel =
-    chat.options.model && runningModels.includes(chat.options.model)
-      ? chat.options.model
-      : runningModels[0] ?? "";
+    remembered?.section ?? defaultLoaded?.section ?? lastChatModel?.section ?? "";
 
   const groups = useMemo(() => {
     const term = search.trim().toLocaleLowerCase("zh-CN");
@@ -296,7 +323,7 @@ export function ChatPanel() {
               <div className="chat-empty">
                 <div className="chat-empty__title">问点什么吧</div>
                 <div className="chat-empty__sub">
-                  {activeModel ? `当前模型 ${activeModel} · 走前门 :9090` : "还没有加载模型，先在模型页启动一个"}
+                  {activeModel ? `当前模型 ${activeModel}` : "请选择模型"}
                 </div>
               </div>
             ) : (
@@ -450,40 +477,47 @@ export function ChatPanel() {
                 <ChatIcon name="settings" />
               </button>
               <span className="spacer" />
-              {/* 输入框右侧直接切模型，菜单只列正在运行的（用户 m07929 第 1、3 点） */}
+              {/* 输入框右侧直接切模型（用户 m00082 第 2 点）：列出所有模型，不排序（用户 m00370 第 2 点）；
+                  已加载的模型名显示为绿色、不做圆点等其它标记（用户 m00370 第 1 点 + m00422）。
+                  没加载的选中后由发送时自动拉起 */}
               <div className="composer-model">
                 <button
                   type="button"
                   className="composer-model__btn"
                   disabled={streaming}
-                  title="选择这次对话用哪个模型"
+                  title="选择这次对话用哪个模型（未加载的会在发送时自动拉起）"
                   aria-haspopup="listbox"
                   aria-expanded={modelOpen}
                   onClick={() => setModelOpen((open) => !open)}
                 >
-                  <span className="composer-model__name">{activeModel || "选择模型"}</span>
+                  <span className="composer-model__name">{activeModel || "请选择模型"}</span>
                   <ChatIcon name="chevron" size={14} className={`st-chev${modelOpen ? " is-open" : ""}`} />
                 </button>
                 {modelOpen && (
                   <>
                     <div className="composer-model__mask" onClick={() => setModelOpen(false)} />
                     <div className="composer-model__menu" role="listbox">
-                      {runningModels.length === 0 && <p className="st-hint">当前没有正在运行的模型</p>}
-                      {runningModels.map((name) => (
-                        <button
-                          key={name}
-                          type="button"
-                          role="option"
-                          aria-selected={name === activeModel}
-                          className={`composer-model__item${name === activeModel ? " is-on" : ""}`}
-                          onClick={() => {
-                            setChatOptions({ ...chat.options, model: name });
-                            setModelOpen(false);
-                          }}
-                        >
-                          <span className="composer-model__label">{name}</span>
-                        </button>
-                      ))}
+                      {allModels.length === 0 && <p className="st-hint">还没扫描到模型</p>}
+                      {allModels.map((model) => {
+                        const loaded = model.status === "loaded";
+                        const selected = model.section === activeModel;
+                        return (
+                          <button
+                            key={model.section}
+                            type="button"
+                            role="option"
+                            aria-selected={selected}
+                            title={model.section}
+                            className={`composer-model__item${selected ? " is-on" : ""}${loaded ? " is-loaded" : ""}`}
+                            onClick={() => {
+                              setChatOptions({ ...chat.options, model: model.section });
+                              setModelOpen(false);
+                            }}
+                          >
+                            <span className="composer-model__label">{model.name}</span>
+                          </button>
+                        );
+                      })}
                     </div>
                   </>
                 )}
@@ -511,7 +545,7 @@ export function ChatPanel() {
       {samplingOpen && (
         <ChatSamplingSheet
           options={chat.options}
-          models={runningModels}
+          models={modelNames}
           onApply={(next) => setChatOptions(next)}
           onClose={() => setSamplingOpen(false)}
         />

@@ -454,6 +454,7 @@ export function ParamForm({
   schema = paramSchema,
   headerTools = true,
   persistKey = "modelParams",
+  onBeforeToggle,
 }: {
   state: Record<string, ParamState>;
   onChange: (next: Record<string, ParamState>) => void;
@@ -463,6 +464,11 @@ export function ParamForm({
   headerTools?: boolean;
   /** 分组折叠状态的 localStorage 键（不同用法各记一份，避免同名分组互相影响） */
   persistKey?: string;
+  /**
+   * 勾选启用前的拦截。返回错误文案则不切换并就地提示（用户 m03848：并发参数
+   * 不满足开启条件要拒绝开启并说明原因）。不传 = 全部放行（llama.cpp 侧参数表）。
+   */
+  onBeforeToggle?: (key: string, state: Record<string, ParamState>) => string | null;
 }) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() =>
     Object.fromEntries(
@@ -488,6 +494,9 @@ export function ParamForm({
   };
 
   const setOne = (key: string, next: ParamState) => onChange({ ...state, [key]: next });
+
+  /** 被拒绝的启用请求（依赖校验没通过）：就地显示原因，开关不切换 */
+  const [toggleError, setToggleError] = useState<string | null>(null);
 
   /**
    * 参数说明弹窗（与 hub 旧版的 `#paramDescModal` 同构）。
@@ -622,6 +631,13 @@ export function ParamForm({
         </div>
       )}
 
+      {toggleError && (
+        <div className="notice error mb-3">
+          <i className="fas fa-triangle-exclamation notice-icon" />
+          <div>{toggleError}</div>
+        </div>
+      )}
+
       <div className="param-groups">
         {schema.groups.map((group) => {
           const items = schema.params.filter((p) => p.group === group.id);
@@ -660,7 +676,19 @@ export function ParamForm({
                             type="checkbox"
                             checked={s.enabled}
                             title="勾选后写入该模型的配置"
-                            onChange={(e) => setOne(p.key, { ...s, enabled: e.target.checked })}
+                            onChange={(e) => {
+                              const enabled = e.target.checked;
+                              // 依赖校验只拦「开启」：关闭永远放行
+                              if (enabled && onBeforeToggle) {
+                                const message = onBeforeToggle(p.key, state);
+                                if (message) {
+                                  setToggleError(message);
+                                  return;
+                                }
+                              }
+                              setToggleError(null);
+                              setOne(p.key, { ...s, enabled });
+                            }}
                           />
                           <label
                             className="form-label"

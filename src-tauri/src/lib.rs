@@ -268,6 +268,33 @@ async fn strata_scan(state: State<'_, AppState>) -> Result<Vec<strata::StrataMod
     Ok(entries)
 }
 
+/// 列出 `engine-bundle` 下所有可用的引擎组件（可能多版本并存），供面板选择。
+#[tauri::command]
+async fn strata_engines(root: String) -> Result<Vec<strata::EngineInfo>, String> {
+    Ok(strata::list_engines(std::path::Path::new(&root)))
+}
+
+/// 把某份 config 的 `exe` 换成选定的那个引擎可执行文件。
+#[tauri::command]
+async fn strata_set_engine(root: String, config_file: String, exe: String) -> Result<(), String> {
+    strata::set_engine(std::path::Path::new(&root), &config_file, &exe)
+}
+
+/// 把选定的引擎批量写进装配目录下的全部 config，返回被改过的文件名（设置页用）。
+#[tauri::command]
+async fn strata_apply_engine(
+    state: State<'_, AppState>,
+    exe: String,
+) -> Result<Vec<String>, String> {
+    let Some(root) = state.settings.get().strata_root.clone() else {
+        return Err("还没设置 Strata 安装目录".into());
+    };
+    let changed = strata::apply_engine(&root, &exe)?;
+    // 扫描缓存作废：卡片上的引擎版本要跟着变
+    state.store_strata_scan(&root, &strata::scan_configs(&root));
+    Ok(changed)
+}
+
 /// 探测运行时状态（生效上下文、版本、加载状态、token 占用）。
 ///
 /// 前端每 5 秒调用一次；**所有阻塞工作**（config 扫描与端口探测）都放进同一段
@@ -1378,6 +1405,25 @@ fn favourite_toggle(state: State<'_, AppState>, model_id: String) -> Vec<String>
     updated.favourites
 }
 
+/// 前端首帧渲染完成后调用：这时才把窗口显示出来（用户 m03477）。
+///
+/// 窗口在 `tauri.conf.json` 里标了 `visible: false`。WebView2 从创建到画出第一帧有几百
+/// 毫秒，这期间窗口只显示底色 —— 用户看到的正是「界面显示不全、一块一块是黑的」。
+/// 等 React 把首屏挂上去再 show，第一眼就是完整界面。
+///
+/// `--minimized`（开机自启）不显示：那种情况窗口要驻留托盘，判断统一由后端做。
+#[tauri::command]
+fn app_boot_finished(window: tauri::WebviewWindow) {
+    if BOOT_MINIMIZED.load(Ordering::SeqCst) {
+        return;
+    }
+    let _ = window.show();
+    if RESTORE_MAXIMIZED.swap(false, Ordering::SeqCst) {
+        let _ = window.maximize();
+    }
+    let _ = window.set_focus();
+}
+
 /// 按 `tauri.conf.json` 里的窗口定义创建主窗口，可指定 webview 的数据目录。
 ///
 /// 为什么要自己建：便携模式下 localStorage / 缓存要跟着 exe 走，
@@ -1625,7 +1671,11 @@ pub fn run() {
                         _ => false,
                     };
                 if restore_maximized {
-                    let _ = window.maximize();
+                    // 窗口此刻还是隐藏的（`visible: false`）。tao 在 Windows 上把
+                    // `maximize()` 实现成 `ShowWindow(SW_MAXIMIZE)`，直接调用会把隐藏窗口
+                    // 顶出来、破坏「首帧后显示」。所以先记下意图，等 `app_boot_finished`
+                    // 显示窗口之后再最大化。
+                    RESTORE_MAXIMIZED.store(true, Ordering::SeqCst);
                 } else {
                     let _ = window.set_size(tauri::PhysicalSize::new(
                         saved_window.width.max(640),
@@ -1693,6 +1743,24 @@ pub fn run() {
                     eprintln!("[tray] 托盘不可用，自启动时不隐藏主窗口（否则用户找不到它）");
                 }
             }
+
+            // 兜底：窗口现在是「隐藏创建、等前端 `app_boot_finished` 再显示」。前端脚本要是
+            // 直接崩在首帧之前，窗口就永远不会出现 —— 4 秒后无条件显示，那时至少能看到
+            // ErrorBoundary 的错误页，而不是「进程在跑、屏幕上什么都没有」。
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(4));
+                    if BOOT_MINIMIZED.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if let Some(window) = handle.get_webview_window("main") {
+                        if !window.is_visible().unwrap_or(false) {
+                            let _ = window.show();
+                        }
+                    }
+                });
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1740,6 +1808,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             ping,
+            app_boot_finished,
             frontend_log,
             app_paths,
             settings_get,
@@ -1750,6 +1819,9 @@ pub fn run() {
             device_list,
             strata_status,
             strata_scan,
+            strata_engines,
+            strata_set_engine,
+            strata_apply_engine,
             strata_probe,
             strata_start,
             strata_stop,
@@ -1803,15 +1875,14 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| match event {
-            // WebView2 初始化过程会把窗口可见性重置回配置值，所以「显示 / 收进托盘」的
-            // 最终决定放在事件循环跑起来之后再做一次。
+            // WebView2 初始化过程会把窗口可见性重置回配置值（配置里现在是 `visible: false`），
+            // 所以这里**不再无条件 show**：显示统一由前端首帧后的 `app_boot_finished` 做
+            // （用户 m03477：提前 show 会露出还没画完的界面，看起来一块一块黑）。
+            // 只处理自启动驻留托盘：那种情况再显式 hide 一次，防止初始化把它翻成可见。
             tauri::RunEvent::Ready => {
                 if let Some(window) = app_handle.get_webview_window("main") {
                     if BOOT_MINIMIZED.load(Ordering::SeqCst) {
                         let _ = window.hide();
-                    } else {
-                        // 显式显示一次：WebView2 初始化过程中窗口可见性可能被重置
-                        let _ = window.show();
                     }
                 }
             }
@@ -1855,6 +1926,10 @@ pub fn run() {
 
 /// 本次启动是否由自启动拉起（`--minimized`）：为真时启动后直接驻留托盘。
 static BOOT_MINIMIZED: AtomicBool = AtomicBool::new(false);
+
+/// 恢复窗口时要不要最大化。窗口是隐藏创建的，`maximize()` 在 Windows 上会把窗口顶出来
+/// （tao 用 `ShowWindow(SW_MAXIMIZE)`），所以意图记在这里、等 `app_boot_finished` 显示后再用。
+static RESTORE_MAXIMIZED: AtomicBool = AtomicBool::new(false);
 
 
 #[cfg(test)]

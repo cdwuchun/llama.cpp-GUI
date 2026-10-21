@@ -21,6 +21,7 @@ import "./styles/app.css";
 
 import App from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { ipc } from "./ipc";
 import { reportFrontendError } from "./utils/frontendLog";
 
 // 全局错误上报：未捕获异常写入后端日志（日志页 frontend 来源）
@@ -46,3 +47,15 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     </ErrorBoundary>
   </React.StrictMode>,
 );
+
+// 窗口是「隐藏创建」的（tauri.conf.json 的 `visible: false`）：WebView2 从创建到画出第一帧
+// 有几百毫秒，那期间显示的是窗口底色，用户看到的就是「界面显示不全、一块一块黑」
+// （用户 m03477）。等 React 把首屏挂上去（两帧之后，确保样式与首渲染都落到屏上）再让
+// 后端 show。`--minimized` 自启动时后端会忽略这个调用，窗口继续留在托盘。
+requestAnimationFrame(() => {
+  requestAnimationFrame(() => {
+    void ipc.appBootFinished().catch((err) => {
+      reportFrontendError("window", `显示主窗口失败：${String(err)}`);
+    });
+  });
+});

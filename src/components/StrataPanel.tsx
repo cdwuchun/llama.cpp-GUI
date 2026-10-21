@@ -21,9 +21,11 @@ import type { StrataModelEntry } from "../types";
 import { ParamForm } from "./ParamForm";
 import type { ParamState } from "../utils/paramSchema";
 import {
+  checkStrataParamEnable,
   configToState,
   stateToConfig,
   strataParamSchema,
+  validateStrataParams,
   validateStrataSampling,
 } from "../utils/strataParams";
 import { fmtSize } from "../utils/models";
@@ -280,6 +282,12 @@ function StrataConfigSheet({ entry, onClose }: { entry: StrataModelEntry; onClos
   const stopStrata = useApp((s) => s.stopStrata);
   const writeStrataConfig = useApp((s) => s.writeStrataConfig);
   const strataRoot = useApp((s) => s.settings?.strata_root ?? null);
+  /** 真实引擎可执行文件（用户 m02686：config 落盘直接写它，不留 `component:` 引用）。
+   *  后端解析成功时 `engine` 才是绝对路径，解析失败会原样保留引用字符串。 */
+  const engineExe =
+    entry.engine_exists && entry.engine && !entry.engine.startsWith("component:")
+      ? entry.engine
+      : null;
 
   const file = fileOf(entry);
   const running = !!status.running && !!status.config_path && basename(status.config_path) === file;
@@ -294,6 +302,7 @@ function StrataConfigSheet({ entry, onClose }: { entry: StrataModelEntry; onClos
    *  解析成功就重置右栏表单，解析失败只提示、不动表单。 */
   const [rawText, setRawText] = useState("");
   const [rawError, setRawError] = useState("");
+
 
   const leftRef = useRef<HTMLDivElement>(null);
   const rightRef = useRef<HTMLDivElement>(null);
@@ -378,10 +387,18 @@ function StrataConfigSheet({ entry, onClose }: { entry: StrataModelEntry; onClos
       setFormError(samplingError);
       return false;
     }
+    // 并发参数的依赖校验也要在写盘前再过一遍：左栏可以直接改 config 原文，
+    // 绕过右栏的勾选拦截（用户 m03848「不满足开启要求要拒绝开启并提示」）
+    const args = Array.isArray(formConfig.args) ? formConfig.args : [];
+    const paramError = validateStrataParams(formState, args);
+    if (paramError) {
+      setFormError(paramError);
+      return false;
+    }
     // args 只改参数表认识的 flag（顺序不变、未收录的原样保留）；
     // 顶层只写 vision.mmproj / vision.model / vision.exe / vision.gpu / vision.max_tokens / open_browser
     // 以及 sampling.{temperature,top_p,top_k,min_p}，其余顶层键不动（R6）
-    const next = stateToConfig(formConfig, formState, strataRoot);
+    const next = stateToConfig(formConfig, formState, strataRoot, engineExe);
     const ok = await writeStrataConfig(file, JSON.stringify(next, null, 1));
     setFormError(ok ? "" : "写回 config 失败，见右上角错误");
     // 写盘成功就把基线挪到当前表单，否则之后点「取消」还要被问一次
@@ -398,7 +415,7 @@ function StrataConfigSheet({ entry, onClose }: { entry: StrataModelEntry; onClos
   const onFormChange = (next: Record<string, ParamState>) => {
     setFormState(next);
     if (!formConfig) return;
-    setRawText(JSON.stringify(stateToConfig(formConfig, next, strataRoot), null, 1));
+    setRawText(JSON.stringify(stateToConfig(formConfig, next, strataRoot, engineExe), null, 1));
     setRawError("");
   };
 
@@ -421,6 +438,7 @@ function StrataConfigSheet({ entry, onClose }: { entry: StrataModelEntry; onClos
     setFormConfig(obj);
     setFormState(configToState(obj));
   };
+
 
   const left = (
     <div className="strata-raw-pane">
@@ -451,6 +469,9 @@ function StrataConfigSheet({ entry, onClose }: { entry: StrataModelEntry; onClos
         onChange={onFormChange}
         schema={strataParamSchema}
         persistKey={`strataParams:${file}`}
+        onBeforeToggle={(key, state) =>
+          checkStrataParamEnable(key, state, Array.isArray(formConfig?.args) ? formConfig.args : [])
+        }
       />
     </div>
   );
@@ -734,16 +755,18 @@ export function StrataPanel({
 
   const toggleOne = useCallback(
     (file: string) => {
-      // 卡片管模型（用户 m03572）：引擎正在跑这份 config → 卸载；否则加载。
-      // 不再要求 `status.loaded` 为真（用户 m04917）：探测没跟上时它是 null，
-      // 于是点「卸载」会被当成「加载」，卡片还显示「加载中」。
-      if (runningFile === file) {
+      // 卡片管模型（用户 m03572）：引擎正在跑这份 config **且模型还加载着** → 卸载；否则加载。
+      // 判据必须带上 `loaded`（用户 m03241）：卸载后引擎进程仍在（`running=true`、
+      // `config_path` 还是这份），只看 runningFile 会把「再点启动」当成又卸载一次，
+      // 于是卡片永远停在「已停止」。探测不明（`loaded === null`）时仍按卸载走，
+      // 那是 m04917 的场景（加载中点了停止，探测没跟上）。
+      if (runningFile === file && status.loaded !== false) {
         void stopStrataModel(file);
         return;
       }
       void startStrataModel(file);
     },
-    [runningFile, startStrataModel, stopStrataModel],
+    [runningFile, status.loaded, startStrataModel, stopStrataModel],
   );
 
 

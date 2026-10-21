@@ -9,9 +9,10 @@
 > - `docs/archive/DECISIONS-2026-10.md` —— 2026-10 的关键决策与落地结果
 > - `docs/archive/` 里还有已落地的设计文档：`docs/archive/PROXY_SCHEDULER_PLAN.md`（前门与配置层规格）、`docs/archive/STRATA_INTEGRATION_PLAN.md`（Strata 通道）、`docs/archive/STRATA_MANAGER_PORT_ASSESSMENT.md`（聊天/监控/压测移植评估）、`docs/archive/WEB_SEARCH_PLAN.md`（五引擎搜索）、`docs/archive/UI_STYLE_BASELINE.md`（样式基座 S1–S8），以及 0.1.x 的历史存档（`docs/archive/REFACTORING_PLAN.md` / `docs/archive/REFACTORING_REVIEW.md` / `docs/archive/CODE_REVIEW.md`）
 >
-> 最后更新：2026-10-20（**0.2.0 版本收口**）。验证基线：`cargo test --lib` **128 passed / 0 failed / 10 ignored**，`npx tsc --noEmit` exit 0，`npm run tauri build` 成功。
-> 已部署 exe：`E:\AI\llama.cpp-gui\llamacpp-gui.exe`，10,418,176 B / 2026-10-20 18:10:00 / SHA256 前 16 `6913F53B8D288180`（0.2.0；上一版备份 `llamacpp-gui.exe.bak-before-0.2.0`）。
-> 版本号：`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` / `Cargo.lock` 统一为 **0.2.0**。
+> 最后更新：2026-10-21（**Strata 参数表新增「并发」组 + 并发参数的依赖校验**）。验证基线：`cargo test --lib` **135 passed / 0 failed / 10 ignored**，`npx tsc --noEmit` exit 0，`npm run tauri build` 成功（`src-tauri\target\build149.log`）。
+> 已部署 exe：`E:\AI\llama.cpp-gui\llamacpp-gui.exe`，10,503,168 B / 2026-10-21 17:31:38 / SHA256 前 16 `D6E9D79369544804`（build149：`--batch`/`--batch-mtp`/`--batch-groups`/`--conversation-cache-mib`/`--conversation-cache-slots` 收进「并发」组、默认全不配置、勾选时按引擎依赖拒绝并提示；上版 build148 备份为 `.bak-before-concurrency`）。
+> 0.2.1 构建（2026-10-21 15:28）：`src-tauri\target\release\llamacpp-gui.exe`，10,502,656 B / SHA256 前 16 `4ABBE77E19D9989F`；安装包 `bundle\nsis\llama.cpp GUI_0.2.1_x64-setup.exe`（3,248,691 B）。这一版含聊天模型下拉改造（列全部模型 / 已加载绿色 / 未加载发送时自动拉起 / 三级默认值）与聊天历史默认收起。
+> 版本号：`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` / `Cargo.lock` 统一为 **0.2.1**。
 
 ---
 
@@ -66,7 +67,7 @@ llama.cpp 的 router mode 已于 2026-10-15 退役（`router.rs` → `logs.rs`�
 | `src-tauri/src/http.rs` | 极简本机 HTTP 客户端（裸 TcpStream，无第三方依赖） | bench 与 idle 共用；非 2xx 时把 JSON 里的 `error.message` 提成错误文本 |
 | `src-tauri/src/idle.rs` | 常驻线程（2 s 一轮，随程序启动挂一次）：把调度器表里「`Ready` + 没有请求在转发 + 空闲超过 `sleep_idle_seconds`」的模型 `Scheduler::stop` 掉 | 每轮实时读设置，保存即生效；见 §2.3 |
 | `src-tauri/src/winfix.rs` | 非 ASCII 路径的 `mklink /J` 链接、端口探测、`CREATE_NO_WINDOW`、`no_throttle`（子进程脱离宿主 Job Object） | 子进程一律走 `hide_console` |
-| `src-tauri/src/strata.rs` | Strata 第二运行时通道：config 扫描 / 校验 / 原子写、引擎启停与崩溃监测、`/load`·`/unload` 转发 | 见 §2.11；实现记录见 `docs/archive/STRATA_INTEGRATION_PLAN.md` |
+| `src-tauri/src/strata.rs` | Strata 第二运行时通道：config 扫描 / 校验 / 原子写、引擎启停与崩溃监测、`/load`·`/unload` 转发、`engine-bundle` 组件解析与多版本选择（`list_engines` / `set_engine`） | 见 §2.11；实现记录见 `docs/archive/STRATA_INTEGRATION_PLAN.md` |
 | `src-tauri/src/strata_proxy.rs` | **前门代理**：一个端口挂全部 config，按请求体里的 `model` 停旧引擎 / 起新引擎并原样转发；`/v1/models` 与「没引擎时的 `/health`」由它合成；`StrataStatus.proxy_serving` 回传给卡片显示「加载中」 | 见 §2.11 末尾「前门的两条硬约束」（Windows accept 继承非阻塞、绝不能向上游发 FIN） |
 | `src-tauri/src/monitor.rs` | 硬件与引擎指标采集：sysinfo + NVML（显存 / PCIe）+ PDH（磁盘）+ 引擎 `/metrics` 文本解析 | 1300 行；逐轮细节见 `docs/archive/ITERATION_LOG.md` §77 及监控各轮 |
 | `src-tauri/src/search.rs` | 联网搜索五引擎（anysearch / tavily / firecrawl / keenable / exa）+ `search.json` + `web_fetch` 正文抓取（含 AnySearch `/v1/extract` 兜底）；HTTP 走系统 `curl.exe`（本机 schannel 不可用，不引 reqwest） | 2073 行；设计见 `docs/archive/WEB_SEARCH_PLAN.md` |
@@ -158,6 +159,8 @@ Strata 的二进制不同名、没有 router mode、管理端点与 llama.cpp �
 - **不能塞进 router 流水线**：`versions.rs::scan_versions` 只认 `llama-server.exe`；`GET /models`、`POST /models/load|unload`、`GET /props`、`/models/sse` 在 Strata 上都不存在。
 - 所以它是**并列的独立通道**：后端 `strata_*` 命令 + `bench_strata`，前端 `StrataPanel.tsx`；llama.cpp 那条通道一行不改 —— 方案与逐轮实现见 `docs/archive/STRATA_INTEGRATION_PLAN.md`。
 - **config 写回必须「校验 → 备份 → 原子写」**，临时文件名要唯一（`strata.rs::temp_config_path`），整段写路径持 `strata_lock()`；只在 rename 那一步加锁没用。
+- **备份只留一份固定名 `<config>.json.bak`**，每次写覆盖（用户 m03392：不要堆积带时间戳的多份）。与 `model_config::write_config`、`settings` 的 `.json.bak` 策略一致；`.bak` 也被 `is_config_file` 排除，不会被当成 config 扫进列表。
+- **`--vram-reserve-mib` 只认命令行，顶层 `vram_reserve_mib` 对引擎无效**：`control\serve\server.py:7075` 是 `reserve = int(args[...]) if "--vram-reserve-mib" in args else 700`，全文不读 config 顶层那个键（0 命中）。顶层 `vram_reserve_mib` 是**安装器 `setup.py` 的记忆字段**（`:7563/:7569/:7578` 写入、`:7523-7524` 重装时继承，注释 `#493`；`strata_control\presets.py:103` 读它填预设 UI）。实测（sc117 iq2-xs，0.1.46）：每槽 ≈1.437 MiB，`700→512` 少 188 MiB 正好多 131 槽（3770 → 3901）；缺 `--kv-resident 30720` 时 KV 全驻显存，槽位会从 3901 掉到 2432。
 - **WebUI 用系统浏览器打开**（`ipc.openLocalUrl`），不内嵌 iframe —— 这样 Strata 自带界面升级时这个 GUI 不必跟着改 CSP。
 - 两条运行时的模型**显存互斥**：启动一边的模型前先卸掉另一边的（`settings.strata_router_mutex` 可关）。
 - **一个端口 = 一份 config = 一个引擎**：多份 config 写同一个端口时（本机两份都是 9090）它们天然互斥，切模型必须先 `/unload` 旧模型（上游顺手保存 learned expert profile、立刻放显存）再杀进程树，见 `store.ts::startStrataModel`（细节见 `docs/archive/STRATA_INTEGRATION_PLAN.md` §22）。
@@ -165,6 +168,7 @@ Strata 的二进制不同名、没有 router mode、管理端点与 llama.cpp �
 - **卡片播放按钮 = 启动引擎 + `/load`**：只起引擎不 `/load` 的话 `/health.loaded=false`，卡片永远显示「已停止」（用户 m00001 的「模型都无法启动」就是这个）。只有侧栏「启动 Strata」胶囊是纯启引擎（强制 `lazy_load: true`）。
 - **卡片徽标的「支持 MTP」以 `args` 里带 `--mtp` 为准**（`strata.rs::StrataModelEntry.mtp` 只暴露 bool，MTP 权重路径不下沉 WebView，与 `has_api_key` 同口径）：`--mtp` 是安装器写下的安装事实（`src/utils/strataParams.ts` 的 `STRATA_INSTALL_FACT_FLAGS`，GUI 只读、写回原样保留），所以它表示"这套安装给这个模型装了自带的 MTP 草稿头"。**不要改用模型名正则** —— 模型列表页那条 `/mtp/i.test(name)` 认的是文件名里带 MTP 的外挂草稿场景，对 Strata 的 config 会漏判和误判。`--spec` 是推测解码窗口，写 `0` 时徽标显示虚线压暗的「MTP 关」（权重在装、投机解码当前关闭）。
 - **`sampling` 是顶层字段，不是 flag**：`temperature` / `top_p` / `top_k` / `min_p` 写在 config 顶层的 `sampling` 对象里（`strataParams.ts` 的哨兵 `--sampling-*` **永不进 `args`**）。语义是「请求自己没带采样字段时的默认值」，改完要重启引擎才生效。上游对坏值**直接拒绝启动**（`temperature` ≥ 0、`top_p` 0 < v ≤ 1、`min_p` 0 ≤ v ≤ 1、`top_k` 1..64 的整数），所以保存前必须过 `validateStrataSampling`；块里 GUI 不认识的键（上游实验开关键）要原样保留。
+- **并发参数集中在参数表的「并发」组，默认全部不配置，且有依赖校验**（用户 m03848）：组内是 `--batch`（别名 `--slots`，2..8，不写 = 单槽串行）、`--batch-mtp`、`--batch-groups`（默认 64，0 = off）、`--conversation-cache-mib`（默认 0 = 关闭会话停放）、`--conversation-cache-slots`（默认 4）。规则来自 `strata.exe --help`（0.1.46）与 `control\serve\server.py`：`--batch-mtp` 需要 `--batch` + `--mtp` + `--spec` 且不能与 `--batch-groups` 同开；`--batch-groups` 需要 `--batch`；`--conversation-cache-slots` 需要预算 > 0 才有意义。`strataParams.ts::checkStrataParamEnable` 负责逐项判定，`validateStrataParams` 在写盘前整组兜底（左栏 config 原文可以直接改，绕过右栏勾选）；`ParamForm` 为此新增可选的 `onBeforeToggle`（不传 = 全放行，llama.cpp 侧参数表不受影响），拒绝时开关不切换、分组上方就地显示原因。
 - 引擎与它 spawn 的子进程都加 `CREATE_BREAKAWAY_FROM_JOB`（`winfix::no_throttle`）：GUI 被后台化时，子进程若继承宿主 Job Object 会被 CPU 节流，推理速度掉到个位数 t/s；父 Job 未开 `BREAKAWAY_OK` 时必须去掉该 flag 重试（`strata.rs::spawn_strata` 里有回退）。
 - **前门代理（B 方案，用户 m00752/m00798）**：`settings.strata_host` / `strata_port`（默认 `127.0.0.1:9090`）是 GUI **进程内**的代理监听（`strata_proxy.rs`），客户端只连它，它按请求体里的 `model` 停旧引擎、起新引擎 —— 切换全程持 `state.strata_switch` 串行化，并等旧端口释放（`strata::wait_port_free`，20 s）。**引擎端口来自各 config 的 `port`，但真正被绑定的是 `run-<模型>.bat` 里的 `--port`**（上游 `server.py:5339/5559` 用 CLI 值，config 的 `port` 它根本不读），两处不一致时 `spawn_strata` 直接 bail 并说明原因。设置页的前门地址/端口**只写 GUI 设置、不写 config**（写进去会把各模型的引擎端口覆盖成 9090）；`api_key` / `idle_unload_s` / `min_free_vram_mib` / `before_load` 仍逐份写 config。
 - **前门是「一个端口挂全部 config」**：`GET /v1/models` 由前门合成（当前引擎那份 `loaded`、其余 `unloaded`，形状照抄上游 `server.py:4313-4323`），没有引擎时 `GET /health` 也由前门合成；点名未知 `model` 一律 404 `model not found: {name}`（与上游同形，上游是 `server.py:4404-4405` 拿请求 `model` 与**当前实例**比对）。`lib.rs::strata_busy` **只算引擎槽位**（不算前门：前门不占显存，算进来会让托盘的「启动服务」一开局就变灰）；`RunEvent::Exit` 与托盘 `quit` 都要关前门。
@@ -173,6 +177,8 @@ Strata 的二进制不同名、没有 router mode、管理端点与 llama.cpp �
   2. **绝不能在引擎生成期间向上游发 FIN（半关）**。上游 `serve/server.py:4127-4150 _watch_client` 每 0.5 s `select` + `recv(1, MSG_PEEK) == b""` 就把「请求套接字读到 EOF」判成**客户端挂断**并 `cancel.set()`，而取消只在提示读取的**分块边界**生效（`server.py:317`，块大小 8192 token）：症状是「小 prompt 侥幸成功、18859 token 的 prompt 在读到第一个块边界（约 5.7 s）时被取消」，引擎日志打 `0 generated ... (cancelled)`。所以前门**不挂**「客户端 → 引擎」的转发线程（请求体已由 `read_body` 整段读完、上游是 HTTP/1.0 + `Connection: close`），只做单向 `io::copy(上游 → 客户端)`。
 - **前门服务状态要回传给前端**：`StrataStatus.proxy_serving`（正在服务的 config 文件名，`state.strata_proxy_serving` 这个 LIFO 栈 + `Serving` 守卫在 `Drop` 时摘掉并广播 `strata://status`）。卡片据此在 **DSH 请求触发加载**时显示「加载中」（`strataStarting` 只覆盖"用户在本页点启动"那条路径，用户 m01266 第 2 点）。排查连接类问题时可设环境变量 `STRATA_PROXY_DEBUG=1` 让前门把逐连接轨迹写进 `%TEMP%\strata-proxy-debug.log`（默认关闭）。
 - **归属信息（`config_path` / `model_name` / `pid` / `started_at_ms` / `port`）只能在「槽位为空」时清**（用户 m01031）：引擎从 spawn 到端口监听之间、以及 `/load` 期间（上游 HTTP 服务单线程，加载 68 GB 权重时 `/health` 会超时）探测都会判「所有端口无响应」，而**探测失败不等于引擎没了**；以前这条分支无条件清 `config_path`，清掉之后 `running` / `model_name` / `loaded` 都能靠后续探测刷新回来，**唯独 `config_path` 补不回来**（它只由「外部实例」那条路写）⇒ 卡片永远「已停止」、面板计数停在 `0/3`，而侧栏写着「引擎运行中」。现在三层都堵上了：`merge_strata_probe` 每次探测都用槽位信息覆盖归属（`lib.rs::apply_owned_status`，有单测）、「无响应」分支在 `slot_owned` 时不动归属、`spawn_monitor` 在进程退出时把归属一起清掉（否则卡片会一直转「加载中」）；前端 `StrataPanel.tsx::runningEntry` 在 `config_path` 缺失时退回按 `/health` 的模型名认，并把「槽位里有引擎、端口还没应答」显示成「加载中」。
+- **引擎在 `<安装目录>\engine-bundle\<版本>-<平台>-<后端>\`，config 直接写 `strata.exe` 的真实路径**（用户 m02686 / m02795）：0.2.x 起引擎从 `serve\` + `.venv` 换成组件包（`strata.exe` + `engine-component.json` + `BUILD.json`），启动器是 `control\python\python.exe` + `control\serve\server.py`（`strata.rs::fallback_command` 优先这套，0.1.x 布局仍兜底）。**`engine-bundle` 下可能多版本并存**（升级不一定删旧的）：**设置页「通用」里的「Strata 引擎」卡片**把它们列成表格让人选（`strata_engines` 列版本 / 后端 / 架构 / 路径，`strata_apply_engine` 把选中的批量写进**全部** `strata-*.json` 的 `exe`，用户 m03103），全局选择记在 `settings.strata_engine`；**模型卡参数弹层不再提供引擎选择**（用户 m03137，那里只留 config 原文与参数）。扫描只在**声明的路径已经不存在**时才自动跟到现有版本（`engine_stale`），路径还在就尊重用户的选择 —— 否则会把那次选择覆盖掉。
+- **Strata 卡片按钮管的是「模型」，不是「引擎进程」**：卸载（`/unload`）只放掉权重，引擎进程与 `config_path` 都还在，所以 `running=true / loaded=false` 是正常态。按钮的切换判据必须带上 `loaded`（`StrataPanel.tsx::toggleOne`：`runningFile === file && status.loaded !== false` → 卸载，否则启动）；只看 `runningFile` 会把「卸载后再点启动」当成又卸载一次，卡片永远停在「已停止」（用户 m03241 实测踩到，build145 修）。探测不明（`loaded === null`）时仍按卸载走，那是 m04917 的场景。
 
 ---
 
@@ -184,6 +190,9 @@ Strata 的二进制不同名、没有 router mode、管理端点与 llama.cpp �
 - **模型列表是三方合并**：扫描结果（`models_scan`）+ config 目录（`config\llamacpp-*.json` 的 `name` / `args`）+ 运行态（调度器表 / 前门 `/v1/models`），再叠加收藏与 Strata 通道的条目。规则在 `utils/models.ts::mergeModels`；对回模型用两条线索：同名 id → config 里的 `model` 路径。`settings.aliases` 是 router 时代的残留（只减不增）。
 - **启动即出列表**：先用落盘缓存 `models-scan-cache.json` 渲染，再后台重扫，只有结果真变了才发 `models://scanned`（stale-while-revalidate）。该事件同时带 `aux_files`，否则后台扫描跑完辅助文件就没了。
 - **组件文件只导出组件**（工具函数抽到 `utils/`），否则 Fast Refresh 失效。
+- **监控页的「并行任务」卡只在真开了多槽位时出现**：判据是 `normalizeSlots(engine.slots).length > 1`（即引擎的 `--slots` / `--batch`），单槽时那张卡只有一行「空闲」，纯占地方（用户 m03711）。组件 `components/SlotMonitor.tsx` 与样式都保留，只是渲染条件收窄。
+- **聊天页输入框右侧的模型下拉**（`ChatPanel.tsx`）：列出**全部**模型，顺序同 `mergeModels`（已加载的不排最前）；已加载的模型名用绿色文字（`components.css` 的 `.composer-model__item.is-loaded`，取 `--st-accent-text`，不额外加圆点/标记）。当前模型取值顺序为「记住的选择 → 已加载里 id 排序第一个 → 上次聊天的模型（最近一份会话的 `conversation.model`）→ 空（显示「请选择模型」）」；`sendChat` 用同一套顺序（用户 m01516），选中的模型未加载时发送前先自动拉起，执行状态卡片显示「拉起中…」。**聊天历史默认收起**（用户 m00547：`historyOpen` 初值 `false`，工具栏的「展开聊天历史」按钮展开）。
+- **主窗口是「隐藏创建、首帧后显示」**：`tauri.conf.json` 的 main 窗口 `visible: false`，`src/main.tsx` 在两帧后调 `ipc.appBootFinished()`（后端 `app_boot_finished`）才 `show()`。原因：WebView2 从创建到画出第一帧有几百毫秒，直接显示用户看到的是「界面显示不全、一块一块黑」（用户 m03477/m03541）。配套两条：①`--minimized` 自启动时后端忽略该调用，窗口留在托盘；②上次是最大化时不能在建窗阶段调 `window.maximize()`（tao 在 Windows 用 `ShowWindow(SW_MAXIMIZE)`，会把隐藏窗口顶出来），意图记进 `RESTORE_MAXIMIZED`、等显示后再应用。后端还有 4 秒兜底：前端崩在首帧之前也会把窗口显示出来。`RunEvent::Ready` 里那条旧的「无条件 `show()`」已经删掉 —— 它会抢在前端就绪之前把窗口推出来（只在 `--minimized` 时显式 `hide()`）。
 
 ### 3.2 通知与弹窗形态
 - 通知走 `store.notice`，`App.tsx` 渲染成参照实现的 toast 结构：`.toast-icon` + `.toast-content`(`.toast-title` + `.toast-message`) + `.toast-close`；图标 `fa-check-circle` / `fa-exclamation-circle`。多行文本时标题取第一行、正文取其余（例如「模型加载 / 模型 X 加载成功」）。
@@ -240,7 +249,7 @@ Strata 的二进制不同名、没有 router mode、管理端点与 llama.cpp �
 npm install                        # 受限沙箱里需要 --ignore-scripts
 npm run cargo:proxy                # 另开终端保持运行：本机 crates 代理 http://127.0.0.1:8787
 npx tsc --noEmit                   # 前端类型检查（在仓库根执行）
-cd src-tauri; cargo test --lib      # 后端单元测试（当前 128 passed / 10 ignored）
+cd src-tauri; cargo test --lib      # 后端单元测试（当前 135 passed / 10 ignored）
 npm test                           # 等价于上面两条（test:web + test:rs）
 npm run tauri build                # 打包（产出 exe + NSIS 安装包）
 node scripts/make-icons.mjs        # 重新生成全部图标资产
@@ -339,7 +348,7 @@ Strata 侧：`strata_root`、`strata_selected_config`、`auto_start_strata`、`s
 
 2. **纯前端渲染的页面 `web_fetch` 抓不到正文**：自写提取不跑 JS、AnySearch `/v1/extract` 也不渲染，SPA 站点（实测 `lobehub.com/docs/usage/start`）只能拿到几百字符占位，模型只能吃搜索引擎给的摘要。
 3. **聊天历史受 localStorage 配额限制**：`CHAT_CONVERSATION_LIMIT = 30`、`CHAT_MESSAGE_LIMIT = 200`、`TOOL_RESULT_KEEP = 2_000`（`src/store.ts:309-312`）。`web_fetch` 单页最多 1.2 万字符，落盘时按 `TOOL_RESULT_KEEP` 截断 —— 不截断会把约 5 MB 配额写满，设置与主题随后静默存不进去。
-4. **`models_max = 1` 时每次换模型都要停旧起新**：默认容量下切模型有 3–6 秒冷启动（日志实测连接耗时 3637 / 6406 ms），不是卡住；要并行驻留就调大 `models_max`（上限 4）。前端「只列运行中的模型」就是为这条配套的（`store.ts` 发送时用同一份判据，避免把未加载的模型名发给前门触发换模型）。
+4. **`models_max = 1` 时每次换模型都要停旧起新**：默认容量下切模型有 3–6 秒冷启动（日志实测连接耗时 3637 / 6406 ms），不是卡住；要并行驻留就调大 `models_max`（上限 4）。聊天页的模型下拉**列出全部模型**（不再「只列运行中的」）；选中未加载的模型后发送会自动拉起（`store.ts::sendChat` 里 `chatAutoLoad`），首次请求因此要等这段冷启动。
 
 ## 8. 新会话怎么获得上下文
 

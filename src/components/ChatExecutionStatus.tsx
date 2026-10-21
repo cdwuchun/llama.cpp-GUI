@@ -33,10 +33,15 @@ export function ChatExecutionStatus({
   };
   const seconds = (value?: number) =>
     value === undefined ? "—" : `${(Math.max(0, value) / 1000).toLocaleString("zh-CN", { maximumFractionDigits: 1 })} s`;
+  // 等待期可以有自定义文案（自动拉起模型时的「正在加载模型 xxx…」，见 ChatExecution.hint）
+  const label =
+    execution.phase === "waiting" && execution.hint
+      ? execution.hint
+      : (labels[execution.phase] ?? execution.phase);
 
   return (
     <div className="chat-execution" aria-label="本次请求状态">
-      <span aria-live="polite">{labels[execution.phase] ?? execution.phase}</span>
+      <span aria-live="polite">{label}</span>
       <span>{seconds((execution.finishedAt ?? now) - execution.startedAt)}</span>
       {execution.firstTokenMs !== undefined && (
         <span>首正文 {seconds(execution.firstVisibleMs ?? execution.firstTokenMs)}</span>

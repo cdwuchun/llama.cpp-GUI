@@ -2772,12 +2772,9 @@ rect.scenario-column.is-failed {
     font-weight: 600;
 }
 
-.composer-model__dot {
-    flex: none;
-    width: 6px;
-    height: 6px;
-    border-radius: var(--st-r-pill);
-    background: var(--st-accent);
+/* 已加载的模型名显示为绿色（用户 m00422），其余按正文色 */
+.composer-model__item.is-loaded {
+    color: var(--st-accent-text);
 }
 
 .composer-model__label {

@@ -669,7 +669,12 @@ export function MonitoringPage({
             {engineError && <p className="st-hint">{engineError}</p>}
           </section>
 
-          <SlotMonitor slots={slots} parallel={slots.length} queued={queued ?? 0} />
+          {/* 并行任务（槽位）卡片只在真的开了多槽位时出现（用户 m03711：没有并行就不显示）。
+              槽位数来自 /slots 的条目数，也就是引擎的 `--slots` / `--batch`。单槽时这张卡
+              只有一行「空闲」，纯占地方。 */}
+          {slots.length > 1 && (
+            <SlotMonitor slots={slots} parallel={slots.length} queued={queued ?? 0} />
+          )}
 
           <div className="metrics">
             {cards.map((card) => (

@@ -47,6 +47,7 @@ import {
   type ToolCall,
 } from "./utils/chat";
 import { buildToolSpecs, isMcpTool, mergeToolCallFragments, parseToolArguments } from "./utils/tools";
+import { mergeModels } from "./utils/models";
 import {
   DEFAULT_SCENARIO_BENCH_OPTIONS,
   estimateScenarioRequests,
@@ -2414,19 +2415,37 @@ export const useApp = create<AppStore>((set, get) => ({
     const draft = state.draft.trim();
     if (!draft && state.attachments.length === 0) return;
 
-    // 模型：采样选项里选的那个，但它必须**仍在运行**，否则退回已加载的第一个。
-    // 判据要与输入框的显示（ChatPanel 的 activeModel）完全一致 —— 只认持久化值会出现
-    // 「输入框显示 Sharp、请求打的是上次记住的另一个模型」：前门按请求体点名换模型，
-    // 用户看到的就是模型自己乱换（用户 m01516）。
-    const loaded = get()
-      .routerModels.filter((m) => m.status.value === "loaded")
-      .map((m) => m.id)
-      .sort((a, b) => a.localeCompare(b));
+    // 模型（用户 m00082 第 2、3 点 + m00370 第 3 点 + m00437）：下拉里可以选**任何**模型，不只是
+    // 已加载的。记住的选择只要还在列表里就用它（未加载的会在下面自动拉起）；否则退回「已加载里按 id
+    // 排序的第一个」；一个都没加载时退回「上次聊天的模型」（最近一份会话绑定的模型）；再没有才报
+    // 「请选择模型」——不能悄悄拿列表第一个未加载的模型顶上。
+    // 判据要与输入框的显示（ChatPanel 的 activeModel）完全一致（用户 m01516）。
+    const snapshot = get();
+    const merged = mergeModels(
+      snapshot.scanned,
+      snapshot.routerModels,
+      snapshot.settings?.favourites ?? [],
+      new Set(snapshot.configs.map((c) => c.name)),
+      snapshot.settings?.aliases ?? {},
+      snapshot.strataEntries,
+    );
     const remembered = state.options.model.trim();
-    const model = remembered && loaded.includes(remembered) ? remembered : loaded[0] || "";
+    /** 上次聊天的模型（用户 m00437）：最近一份会话绑定的模型，仍在列表里就可用 */
+    const lastChat = [...state.conversations]
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .map((c) => merged.find((m) => m.section === c.model || m.id === c.model))
+      .find(Boolean);
+    const target =
+      merged.find((m) => m.section === remembered || m.id === remembered) ??
+      merged
+        .filter((m) => m.status === "loaded")
+        .sort((a, b) => a.id.localeCompare(b.id))[0] ??
+      lastChat;
+    /** 请求体里的 `model` 用段名（config 的 `name`），前门按它路由 */
+    const model = target?.section ?? "";
 
     if (!model) {
-      set({ chat: { ...state, error: "还没有可用的模型，请先在模型页加载一个" } });
+      set({ chat: { ...state, error: "请先在下面的模型下拉里选一个模型" } });
       return;
     }
 
@@ -2563,6 +2582,38 @@ export const useApp = create<AppStore>((set, get) => ({
     };
 
     try {
+      // 选中的模型没加载就先拉起（用户 m00082 第 3 点）：Strata 走引擎接口，
+      // llama.cpp 通道走前门 `/models/load`（前门会等子实例 `/health` 就绪才返回，实测几十秒）。
+      // 状态条这段时间显示「正在加载模型 xxx…」，否则用户只看到「等待响应」，
+      // 几十秒没动静像是卡住了（文案由 ChatMessageView 的状态条读 `hint`，用户 m00220）。
+      if (target && target.status !== "loaded") {
+        if (target.channel === "strata" && !target.strataFile) {
+          patchAssistant((message) => ({
+            ...message,
+            error: `找不到 Strata 模型 ${target.name} 的配置文件（刷新一次模型列表再试）`,
+          }));
+          return;
+        }
+        patchAssistant((message) => ({
+          ...message,
+          execution: {
+            ...(message.execution ?? assistant.execution!),
+            hint: `正在加载模型 ${target.name}…`,
+          },
+        }));
+        if (target.channel === "strata" && target.strataFile) {
+          await get().startStrataModel(target.strataFile);
+        } else {
+          await get().startModel(model);
+        }
+        // startModel / startStrataModel 都以 `error` 报失败（前门没起、引擎起不来等）。
+        // 两者在入口都会先把 error 清空，所以这里读到的必然是本次的失败原因。
+        const failure = get().error;
+        if (failure) {
+          patchAssistant((message) => ({ ...message, error: failure }));
+          return;
+        }
+      }
       // MCP 工具要现拉：首次打开开关、或刚保存过服务器配置时，store 里还是空的
       let mcpTools = get().mcpTools;
       if (state.options.mcpTools && mcpTools.length === 0) {
