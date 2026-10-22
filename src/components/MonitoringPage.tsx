@@ -591,13 +591,20 @@ export function MonitoringPage({
   // 会话缓存卡的占比分母（本地累计的提示词 token）
   const promptTokensSeen = recentTurns.reduce((sum, turn) => sum + (turn.promptTokens ?? 0), 0);
 
-  // 上下文占用照上游：prompt_read/prompt_total（读取中）或 generated/max_tokens（生成中），
-  // 空闲时用引擎的 prompt_tokens / max_context。优先引擎自报，缺了再用本地兜底。
-  const rawUsed =
-    number2(rawLive?.prompt_read) ?? number2(rawLive?.prompt_tokens) ?? live?.promptTokens ?? null;
-  const rawMax = number2(rawLive?.max_tokens) ?? live?.maxContext ?? null;
-  const usedContext = rawUsed ?? 0;
-  const maxContext = rawMax;
+  // 上下文占用的分母是**模型的上下文窗口**，不是 `/status` 的 `max_tokens`。
+  // 实测（Strata 0.1.47，请求里 max_tokens=512）：`/status` 报 `max_tokens: 512`、`/health` 报
+  // `max_context: 204800`，拿 512 当分母会把占比顶成 100%（用户 m05790）。
+  // 运行中从 `/slots[].n_ctx` 取（llama.cpp 与 Strata 都报），没槽位时退回 config 的 max_context。
+  const slotContext = number2(slots[0]?.context ?? null);
+  const maxContext = slotContext ?? live?.maxContext ?? null;
+  // 分子：读取中取已读的提示词（prompt_read，随预填充推进），否则取完整提示词 + 已生成。
+  const readingTokens = number2(rawLive?.prompt_read);
+  const promptTotal = number2(rawLive?.prompt_total);
+  const usedContext = (() => {
+    if (state === "reading" && readingTokens !== null) return readingTokens;
+    if (promptTotal !== null) return promptTotal + (generatedTokens ?? 0);
+    return number2(rawLive?.prompt_tokens) ?? live?.promptTokens ?? 0;
+  })();
   const contextPct = maxContext && maxContext > 0 ? Math.min(100, (usedContext / maxContext) * 100) : 0;
   const mibBytes = 1024 * 1024;
   const gpuUsedBytes = snapshot?.now.gpu?.memUsedMib;

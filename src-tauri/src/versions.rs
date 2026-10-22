@@ -28,6 +28,14 @@ pub struct LlamaCppVersion {
     pub shared_lib_dirs: Vec<PathBuf>,
     /// 路径是否纯 ASCII —— router 在非 ASCII 路径下无法 spawn 子实例（实测）。
     pub ascii_safe: bool,
+    /// 共享 CUDA 运行时的版本（`13.4` 这种）：DLL 主版本 + 版本目录名里的 `cuda-<X.Y>` 标签。
+    ///
+    /// 设置页「共享运行时版本」一列用它（用户 m05137：对齐 Strata 引擎表的字段）。
+    #[serde(default)]
+    pub runtime_version: Option<String>,
+    /// 后端标签（`cuda` / `cpu` / `vulkan` / `hip`），从版本目录名推断。
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 fn exe(base: &str) -> String {
@@ -300,6 +308,44 @@ pub fn scan_versions(
     versions
 }
 
+/// 共享 CUDA 运行时的版本标签（设置页「共享运行时版本」一列）。
+///
+/// DLL 名只带主版本（`cudart64_13.dll` → `13`），版本目录名里通常还有次版本
+/// （`llama-b11671-bin-win-cuda-13.4-x64` → `cuda-13.4`）；两者主版本一致时用后者。
+pub fn runtime_version(version_dir: &Path, shared: &[PathBuf]) -> Option<String> {
+    let major = shared.iter().find_map(|dir| {
+        let entries = fs::read_dir(dir).ok()?;
+        entries.flatten().find_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            let rest = name.strip_prefix("cudart64_")?;
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            (!digits.is_empty()).then_some(digits)
+        })
+    });
+    let tag = version_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(cuda_tag)
+        .map(|t| t.trim_start_matches("cuda-").to_string());
+    match (major, tag) {
+        (Some(major), Some(tag)) => Some(if tag.starts_with(&major) { tag } else { major }),
+        (Some(major), None) => Some(major),
+        (None, Some(tag)) => Some(tag),
+        (None, None) => None,
+    }
+}
+
+/// 从版本目录名推断后端标签（设置页「后端」列，与 Strata 引擎表对齐）。
+pub fn backend_label(dir_name: &str) -> Option<String> {
+    let lower = dir_name.to_ascii_lowercase();
+    for needle in ["cuda", "vulkan", "sycl", "hip", "metal", "cpu"] {
+        if lower.contains(needle) {
+            return Some(needle.to_string());
+        }
+    }
+    None
+}
+
 fn build_version(
     dir: &Path,
     llama_root: &Path,
@@ -315,6 +361,8 @@ fn build_version(
     let fit_params = dir.join(exe("llama-fit-params"));
 
     let shared_lib_dirs = find_shared_cuda_dirs(dir, explicit_libs, Some(llama_root));
+    let runtime_version = runtime_version(dir, &shared_lib_dirs);
+    let backend = backend_label(&name);
     let has_router_mode = cached_probe(&name, cache);
 
     LlamaCppVersion {
@@ -325,6 +373,8 @@ fn build_version(
         has_router_mode,
         shared_lib_dirs,
         ascii_safe: is_ascii_path(dir),
+        runtime_version,
+        backend,
     }
 }
 
@@ -338,6 +388,39 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         File::create(path).unwrap();
+    }
+
+    #[test]
+    fn runtime_version_combines_dll_major_and_cuda_tag() {
+        // 用户 m05137：设置页「共享运行时版本」一列 = DLL 主版本 + 版本目录名里的 cuda-<X.Y> 标签。
+        let dir = std::env::temp_dir().join(format!("llamacpp-gui-rt-{}", std::process::id()));
+        let version_dir = dir.join("llama-b11671-bin-win-cuda-13.4-x64");
+        let lib = dir.join("cudart-cuda13.4");
+        fs::create_dir_all(&version_dir).unwrap();
+        touch(&lib.join("cudart64_13.dll"));
+
+        assert_eq!(
+            runtime_version(&version_dir, &[lib.clone()]).as_deref(),
+            Some("13.4"),
+            "DLL 主版本与目录标签一致时用带次版本的标签"
+        );
+        assert_eq!(
+            runtime_version(&version_dir, &[]).as_deref(),
+            Some("13.4"),
+            "没有共享目录时退回版本名里的标签"
+        );
+        // 目录名没标签、只有 DLL 时就报主版本
+        let plain = dir.join("llama-b1-bin-win-cpu-x64");
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(runtime_version(&plain, &[lib]).as_deref(), Some("13"));
+
+        assert_eq!(
+            backend_label("llama-b11671-bin-win-cuda-13.4-x64").as_deref(),
+            Some("cuda")
+        );
+        assert_eq!(backend_label("llama-b1234-bin-win-cpu-x64").as_deref(), Some("cpu"));
+        assert_eq!(backend_label("llama-b1234-bin-win-vulkan-x64").as_deref(), Some("vulkan"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -3,6 +3,16 @@ import { errText, ipc } from "../ipc";
 import type { StrataEngine } from "../types";
 import { useApp } from "../store"; /** 设置页的分组标签（S7 改版 2026-10-16：左侧导航换成顶部标签，样式与模型列表的引擎标签一致） */
 type Tab = "service" | "paths";
+/** 「自动使用最新版本」：config 里写组件引用，实际版本由 Strata 控制器的组件目录决定（用户 m04934）。 */
+const AUTO_ENGINE = "component:strata-engine";
+const AUTO_ENGINE_ROW: StrataEngine = {
+  version: null,
+  platform: null,
+  backend: null,
+  build: null,
+  archs: [],
+  exe: AUTO_ENGINE,
+};
 const TABS: {
   id: Tab;
   label: string;
@@ -26,6 +36,8 @@ export function SettingsPanel() {
   const deviceError = useApp((s) => s.deviceError);
   /** `engine-bundle` 下可选的 Strata 引擎版本（用户 m03027：「通用」里选引擎） */
   const [strataEngines, setStrataEngines] = useState<StrataEngine[]>([]);
+  /** 「自动使用最新版本」那一行显示的版本/后端/架构：取列表最新那台（列表已按版本倒序，见 `strata::list_engines`）。 */
+  const latestEngine = strataEngines.length > 0 ? strataEngines[0] : null;
   const [tab, setTab] = useState<Tab>("service");
   const [llamaDir, setLlamaDir] = useState("");
   const [modelsMax, setModelsMax] = useState("4"); /** 空闲释放模型的秒数（-1 = 关闭） */
@@ -52,7 +64,7 @@ export function SettingsPanel() {
   if (!settings) {
     return (<main className="main-area">        <div className="content-scrollable">          <div className="panel">            <div className="notice">加载设置中…</div>          </div>        </div>      </main>);
   }
-  /** 列 `engine-bundle` 下的引擎版本，供「通用 → Strata 引擎」选择 */
+  /** 列 `engine-bundle` 下的引擎版本，供「通用 → Strata 引擎版本」选择 */
   async function loadStrataEngines(root: string | null) {
     if (!root) {
       setStrataEngines([]);
@@ -194,16 +206,16 @@ export function SettingsPanel() {
                 <section className="st-card st-card--wide">
                   <div className="st-card__head">
                     <i className="fas fa-microchip"/>
-                    <h2 className="st-card__title">Strata 引擎</h2>
+                    <h2 className="st-card__title">Strata 引擎版本</h2>
                     <span className="st-badge">{strataEngines.length} 个版本</span>
                     <span className="st-spacer"/>
-                    <button type="button" className="st-btn st-btn--secondary st-btn--sm" disabled={busy || !settings.strata_root} title="重新扫描 Strata 安装目录下的 engine-bundle" onClick={() => void loadStrataEngines(settings.strata_root ?? null)}>
+                    <button type="button" className="st-btn st-btn--secondary st-btn--sm" disabled={busy || !settings.strata_root} title="重新扫描 Strata 安装目录下的引擎文件" onClick={() => void loadStrataEngines(settings.strata_root ?? null)}>
                       <i className="fas fa-radar"/>
-                      扫描引擎
+                      扫描版本
                     </button>
                   </div>
                   <div className="st-card__body">
-                    {strataEngines.length === 0 ? (<div className="st-hint">未发现引擎：先在下面指定 Strata 安装目录，引擎在 engine-bundle 下。</div>) : (<div className="st-scroll">
+                    {strataEngines.length === 0 ? (<div className="st-hint">未发现引擎：先在下面指定 Strata 安装目录，引擎文件（strata.exe）要在安装目录或其下两层内。</div>) : (<div className="st-scroll">
                         <table className="st-table">
                           <thead>
                             <tr>
@@ -215,21 +227,36 @@ export function SettingsPanel() {
                             </tr>
                           </thead>
                           <tbody>
-                            {strataEngines.map((item) => (<tr key={item.exe}>
+                            {[AUTO_ENGINE_ROW, ...strataEngines].map((item) => {
+                              const auto = item.exe === AUTO_ENGINE;
+                              const picked = auto ? (settings.strata_engine ?? "") === AUTO_ENGINE : (strataEngines.length === 1 && !settings.strata_engine) || (settings.strata_engine ?? "") === item.exe;
+                              return (<tr key={item.exe}>
                                 <td>
-                                  <input type="radio" name="st-strata-engine" checked={(settings.strata_engine ?? "") === item.exe} onChange={() => void pickStrataEngine(item.exe)}/>
+                                  <input type="radio" name="st-strata-engine" checked={picked} onChange={() => void pickStrataEngine(item.exe)}/>
                                 </td>
-                                <td className="mono">{item.version ?? "未知"}</td>
-                                <td>{item.backend ?? "—"}</td>
-                                <td>{item.archs.length ? item.archs.join(" / ") : "—"}</td>
-                                <td className="mono break-all" title={item.exe}>{item.exe}</td>
-                              </tr>))}
+                                <td className="mono">{item.version ?? latestEngine?.version ?? "未知"}</td>
+                                <td>{item.backend ?? latestEngine?.backend ?? "—"}</td>
+                                <td>{item.archs.length ? item.archs.join(" / ") : latestEngine?.archs.length ? latestEngine.archs.join(" / ") : "—"}</td>
+                                <td className="mono break-all" title={item.exe}>{auto ? "自动使用最新版本" : item.exe}</td>
+                              </tr>);
+                            })}
                           </tbody>
                         </table>
                       </div>)}
-                    <div className="st-hint">选中后立即把全部 strata-*.json 的 exe 改成该版本（重启引擎生效）。</div>
                   </div>
-                </section>                <section className="st-card st-card--wide">                  <div className="st-card__head">                    <i className="fas fa-cubes"/>                    <h2 className="st-card__title">llama.cpp 引擎版本</h2>                    <span className="st-badge">{versions.length} 个版本</span>                    <span className="st-spacer"/>                    <button type="button" className="st-btn st-btn--secondary st-btn--sm" disabled={busy || !settings.llama_cpp_dir} title="重新扫描 llama.cpp 安装目录下的版本" onClick={() => void refreshVersions(true)}>                      <i className="fas fa-radar"/>                      扫描版本                    </button>                  </div>                  <div className="st-card__body">                    {deviceError && (<div className="notice warn">                        <i className="fas fa-triangle-exclamation"/>                        {deviceError}                      </div>)}                    {versions.length === 0 ? (<div className="st-hint">未发现版本，请先在「通用」里指定 llama.cpp 安装目录。</div>) : (<div className="st-scroll">                        <table className="st-table">                          <thead>                            <tr>                              <th>选择</th>                              <th>版本</th>                              <th>路径</th>                              <th>共享 CUDA 运行时</th>                              <th>fit-params</th>                            </tr>                          </thead>                          <tbody>                            {versions.map((v) => (<tr key={v.name}>                                <td>                                  <input type="radio" name="st-version" checked={selectedVersion === v.name} onChange={() => void saveSettings({ selected_version: v.name })}/>                                </td>                                <td className="mono">{v.name}</td>                                <td>                                  {v.ascii_safe ? (<span className="st-badge st-badge--ok">纯 ASCII</span>) : (<span className="st-badge st-badge--warn" title="安装目录含非 ASCII 字符，启动时会自动改用 ASCII 链接目录">                                      含非 ASCII                                    </span>)}                                </td>                                <td>                                  {v.shared_lib_dirs.length === 0 ? (<span className="st-badge st-badge--warn" title="未匹配到直接包含 cudart64_/cublas64_ 的目录，GPU 将不可用">                                      未匹配                                    </span>) : (<details className="st-collapse">                                      <summary>                                        <span className="st-badge st-badge--ok">已就绪</span>                                        {v.shared_lib_dirs.length} 个目录                                        <i className="fas fa-chevron-down st-chev"/>                                      </summary>                                      <div className="st-collapse__body">                                        <ul>                                          {v.shared_lib_dirs.map((d) => (<li className="mono break-all" key={d} title={d}>                                              {d}                                            </li>))}                                        </ul>                                      </div>                                    </details>)}                                </td>                                <td>{v.fit_params_bin ? <i className="fas fa-check"/> : "—"}</td>                              </tr>))}                          </tbody>                        </table>                      </div>)}                  </div>                </section>                <section className="st-card">                  <div className="st-card__head">                    <i className="fas fa-folder-tree"/>                    <h2 className="st-card__title">llama.cpp 安装目录</h2>                  </div>                  <div className="st-card__body">                    <div className="st-row">                      <input className="st-input" value={llamaDir} placeholder="E:\AI\llama.cpp-hub\llamacpp" onChange={(e) => setLlamaDir(e.target.value)}/>                      <button type="button" className="st-btn st-btn--secondary" onClick={() => void pickDirectory().then((p) => { if (p)
+                </section>                <section className="st-card st-card--wide">                  <div className="st-card__head">                    <i className="fas fa-cubes"/>                    <h2 className="st-card__title">llama.cpp 引擎版本</h2>                    <span className="st-badge">{versions.length} 个版本</span>                    <span className="st-spacer"/>                    <button type="button" className="st-btn st-btn--secondary st-btn--sm" disabled={busy || !settings.llama_cpp_dir} title="重新扫描 llama.cpp 安装目录下的版本" onClick={() => void refreshVersions(true)}>                      <i className="fas fa-radar"/>                      扫描版本                    </button>                  </div>                  <div className="st-card__body">                    {deviceError && (<div className="notice warn">                        <i className="fas fa-triangle-exclamation"/>                        {deviceError}                      </div>)}                    {versions.length === 0 ? (<div className="st-hint">未发现版本，请先在「通用」里指定 llama.cpp 安装目录。</div>) : (<div className="st-scroll">                        <table className="st-table">                          <thead>                            <tr>                              <th>选择</th>                              <th>版本</th>                              <th>后端</th>                              <th>共享运行时版本</th>                              <th>路径</th>                            </tr>                          </thead>                          <tbody>                            {versions.map((v) => (<tr key={v.name}>
+                                <td>
+                                  <input type="radio" name="st-version" checked={selectedVersion === v.name} onChange={() => void saveSettings({ selected_version: v.name })}/>
+                                </td>
+                                <td className="mono" title={v.name}>
+                                  {v.name.match(/llama-(b\d+)/i)?.[1] ?? v.name}
+                                  {!v.ascii_safe && (<span className="st-badge st-badge--warn" title="安装目录含非 ASCII 字符，启动时会自动改用 ASCII 链接目录">含非 ASCII</span>)}
+                                  {v.fit_params_bin && (<span className="st-badge st-badge--ok" title="该版本带 llama-fit-params（原生 --fit 的 GPU 分配）">fit</span>)}
+                                </td>
+                                <td>{v.backend ?? "—"}</td>
+                                <td>{v.runtime_version ?? (<span className="st-badge st-badge--warn" title="未匹配到直接包含 cudart64_/cublas64_ 的目录，GPU 将不可用">未匹配</span>)}</td>
+                                <td className="mono break-all" title={v.dir}>{v.dir}</td>
+                              </tr>))}                          </tbody>                        </table>                      </div>)}                  </div>                </section>                <section className="st-card">                  <div className="st-card__head">                    <i className="fas fa-folder-tree"/>                    <h2 className="st-card__title">llama.cpp 安装目录</h2>                  </div>                  <div className="st-card__body">                    <div className="st-row">                      <input className="st-input" value={llamaDir} placeholder="E:\AI\llama.cpp-hub\llamacpp" onChange={(e) => setLlamaDir(e.target.value)}/>                      <button type="button" className="st-btn st-btn--secondary" onClick={() => void pickDirectory().then((p) => { if (p)
     setLlamaDir(p); })}>                        <i className="fas fa-folder-open"/>                        浏览                      </button>                      <button type="button" className="st-btn st-btn--primary" disabled={busy} onClick={() => void saveLlamaDir()}>                        <i className="fas fa-floppy-disk"/>                        保存                      </button>                    </div>                  </div>                </section>                <section className="st-card">                  <div className="st-card__head">                    <i className="fas fa-folder-tree"/>                    <h2 className="st-card__title">Strata 安装目录</h2>                  </div>                  <div className="st-card__body">                    <div className="st-row">                      <input className="st-input" value={strataDir} placeholder="E:\AI\Strata" onChange={(e) => setStrataDir(e.target.value)}/>                      <button type="button" className="st-btn st-btn--secondary" onClick={() => void pickDirectory().then((p) => { if (p)
     setStrataDir(p); })}>                        <i className="fas fa-folder-open"/>                        浏览                      </button>                      <button type="button" className="st-btn st-btn--primary" disabled={busy} onClick={() => void setStrataRoot(strataDir.trim())}>                        <i className="fas fa-floppy-disk"/>                        保存                      </button>                    </div>                  </div>                </section>                <section className="st-card st-card--wide">                  <div className="st-card__head">                    <i className="fas fa-list"/>                    <h2 className="st-card__title">模型根目录</h2>                    <span className="st-spacer"/>                    <button type="button" className="st-btn st-btn--secondary st-btn--sm" disabled={busy} onClick={() => setRoots([...roots, ""])}>                      <i className="fas fa-plus"/>                      添加目录                    </button>                  </div>                  <div className="st-card__body">                    {roots.length === 0 ? (<div className="st-hint">还没有添加模型目录。</div>) : ( /* key 不能用被编辑的值：每敲一个字就会重建 div，输入框会丢焦点 */roots.map((r, i) => (<div className="st-row" key={i}>                          <input className="st-input" value={r} placeholder="E:\AI\models" onChange={(e) => setRoots(roots.map((x, j) => (j === i ? e.target.value : x)))}/>                          <button type="button" className="st-btn st-btn--icon" title="移除" disabled={busy} onClick={() => setRoots(roots.filter((_, j) => j !== i))}>                            <i className="fas fa-times"/>                          </button>                        </div>)))}                    <div className="st-row st-row--end">                      <button type="button" className="st-btn st-btn--primary" disabled={busy} onClick={() => void saveModelRoots()}>                        <i className="fas fa-floppy-disk"/>                        保存                      </button>                    </div>                  </div>                </section>              </div>            </>)}        </div>      </div>    </main>);
 }

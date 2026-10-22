@@ -104,6 +104,9 @@ pub struct AuxCache {
 #[derive(Debug, Clone)]
 pub struct StrataScanCache {
     pub root: PathBuf,
+    /// 这次扫描时「设置页选定的引擎版本」（`None` = 没选）。换引擎必须让缓存失效：
+    /// 卡片上显示的是引擎版本与真实路径，用旧缓存会显示切换前的版本。
+    pub engine: Option<PathBuf>,
     pub entries: Vec<StrataModelEntry>,
     pub at_ms: u64,
 }
@@ -264,11 +267,27 @@ impl AppState {
     }
 
     /// 命中 Strata config 扫描缓存时返回结果（要求根目录未变且未过期）。
+    /// 设置页选定的引擎版本（`settings.strata_engine`）解析成真实可执行文件。
+    ///
+    /// 用户 m04069：**引擎由设置页决定**。它存在时对每份 config 都生效，
+    /// 扫描、启动、参数回显一律以它为准（`parse_config` 还会把不一致的 config 改回来）。
+    pub fn preferred_strata_engine(&self) -> Option<PathBuf> {
+        crate::strata::preferred_engine(self.settings.get().strata_engine.as_deref())
+    }
+
+    /// 设置里记的那个值原样（可能还是 `component:strata-engine`）。
+    ///
+    /// 缓存键必须用它而不是 `preferred_strata_engine()`：后者只认存在的文件，
+    /// 「选了自动使用最新版本」与「没选」都会变成 `None`，切换后缓存分不出来（用户 m04934）。
+    pub fn strata_engine_key(&self) -> Option<PathBuf> {
+        self.settings.get().strata_engine.map(PathBuf::from)
+    }
+
     pub fn cached_strata_scan(&self, root: &PathBuf) -> Option<Vec<StrataModelEntry>> {
         let guard = self.strata_scan_cache.lock().ok()?;
         let cache = guard.as_ref()?;
         let fresh = crate::logs::now_ms().saturating_sub(cache.at_ms) < 5_000;
-        if fresh && &cache.root == root {
+        if fresh && &cache.root == root && cache.engine == self.strata_engine_key() {
             Some(cache.entries.clone())
         } else {
             None
@@ -279,6 +298,7 @@ impl AppState {
         if let Ok(mut guard) = self.strata_scan_cache.lock() {
             *guard = Some(StrataScanCache {
                 root: root.clone(),
+                engine: self.strata_engine_key(),
                 entries: entries.to_vec(),
                 at_ms: crate::logs::now_ms(),
             });
@@ -295,7 +315,8 @@ impl AppState {
         if let Some(cached) = self.cached_strata_scan(root) {
             return cached;
         }
-        let entries = crate::strata::scan_configs(root);
+        let entries =
+            crate::strata::scan_configs(root, self.preferred_strata_engine().as_deref());
         self.store_strata_scan(root, &entries);
         entries
     }

@@ -157,7 +157,10 @@ export default function App() {
 
   const busyNow = chat.streaming || contextBench.running || scenarioBench.running;
   // 上下文上限取 config 里的值（`--ctx-size 0` 时后端已回退到 GGUF 的 <arch>.context_length）。
-  const configContext = configs.find((c) => c.name === activeModel)?.max_context ?? null;
+  // Strata 模型不在 `configs` 里（那是 llama.cpp 侧），用运行中实例的 `/health.max_context` 兜底，
+  // 否则状态栏弹层的「最近请求上下文」在 Strata 下显示「—」（用户 m05790）。
+  const configContext =
+    configs.find((c) => c.name === activeModel)?.max_context ?? strataStatus.live_max_context ?? null;
   // 「读取中」= 请求已发出、首个 token 还没到（预填充阶段），照上游 live.state 的分法（用户 m06282）。
   const activeConversation = chat.conversations.find((item) => item.id === chat.activeId) ?? null;
   const lastAssistantPhase = (() => {

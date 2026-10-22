@@ -115,6 +115,10 @@ export interface LlamaCppVersion {
   shared_lib_dirs: string[];
   /** 路径是否纯 ASCII（router 在非 ASCII 路径下无法创建模型子实例） */
   ascii_safe: boolean;
+  /** 共享 CUDA 运行时的版本（如 `13.4`），设置页「共享运行时版本」列 */
+  runtime_version: string | null;
+  /** 后端标签（cuda / cpu / vulkan …），设置页「后端」列 */
+  backend: string | null;
 }
 
 export interface DeviceInfo {

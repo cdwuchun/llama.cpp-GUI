@@ -17,7 +17,7 @@
 改造已全部完成，这些源码不再是「照着做」的模板，而是**行为对不上时的证据来源**：
 
 - **llama.cpp 实跑 b11671**：`E:\AI\llamacpp\llama-b11671-bin-win-cuda-13.4-x64`。参数语义以 `llama-server --help` 为准；服务端源码在线看 `https://raw.githubusercontent.com/ggml-org/llama.cpp/b11671/tools/server/`（MCP 口径来自 `server-mcp.cpp`，`/metrics` 文本与 `/slots` 字段来自 `server.cpp` / `server-context.cpp`）。**router 主体 `server-models.cpp` 随 router mode 一起退役，不必再看**；`tmp\router-server-models.txt` 是更旧的 b11482 副本，只作历史参考。
-- **Strata 引擎与服务**：`E:\AI\Strata\serve\`（`server.py` / `frontend.py` / `web\`）。引擎行为（`/status` 字段、参数校验、显存账）对不上时读它；`web\tokens.css`、`web\components.css` 是 `src/styles/tokens.css` 的上游真源。
+- **Strata 引擎与服务**：引擎可执行文件在 `E:\AI\Strata\engine\<版本>-<平台>-<后端>\`（旧安装器用 `engine-bundle` 这个名字），控制端在 `E:\AI\Strata\control\` —— `serve\server.py` / `serve\frontend.py` / `serve\web\` 是运行侧，`strata_control\`（`engine_component.py` / `presets.py`）是安装与版本管理侧。引擎行为（`/status` 字段、参数校验、显存账）对不上时读它；`serve\web\tokens.css`、`serve\web\components.css` 是 `src/styles/tokens.css` 的上游真源。
 - **上游 strata-manager**（Tauri 2 + React）：`E:\Code\strata-manager-main`。P1–P8 的移植已全部落地，只在追「上游当初怎么做的」时查；浮窗 `floating_monitor.rs`、监控托盘 `monitor_tray.rs` 属于已取消的 P6，不用管。
 - 本机 vendored 副本 `E:\AI\Strata\third_party\llama.cpp\tools\server\` 是 Strata 自带、版本 `0.4.1-dev`、**不是 git 检出**，与实跑 b11671 未必同 commit。
 
@@ -37,7 +37,7 @@
 ```powershell
 npm run cargo:proxy               # 另开终端保持运行（127.0.0.1:8787），cargo 必需
 npx tsc --noEmit                  # 前端类型检查（仓库根）
-cd src-tauri; cargo test --lib     # 后端单测（当前 128 passed / 10 ignored；ignore 里是三个联网端到端用例）
+cd src-tauri; cargo test --lib     # 后端单测（当前 142 passed / 11 ignored；ignore 里是三个联网端到端用例）
 npm test                           # 前端类型检查 + 后端单测（test:web + test:rs）
 npm run test:smoke                 # 参数表单渲染冒烟测试（需 esbuild，受限沙箱要提权）
 npm run tauri build               # 打包；沙箱内需要提权

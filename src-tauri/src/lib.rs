@@ -202,7 +202,11 @@ fn find_strata_entry(
         .strata_root
         .clone()
         .ok_or_else(|| "尚未设置 Strata 目录".to_string())?;
-    let entries = strata::scan_configs(&root);
+    // 设置页选定的引擎版本是权威（用户 m04069）：扫到的每份 config 都按它显示，
+    // 不一致时顺手把 config 的 exe 改回来。
+    let preferred =
+        strata::preferred_engine(state.settings.get().strata_engine.as_deref());
+    let entries = strata::scan_configs(&root, preferred.as_deref());
     // 这次真扫的结果顺手灌回缓存：`strata_config_write` 写完 config 立刻要用它的
     // 返回值回显，而 `strata_probe` 每 5 秒读的是缓存 —— 不刷新的话，用户改完参数
     // 后界面上会先弹回一个 TTL 周期内的旧端口/旧模型名。
@@ -263,15 +267,71 @@ async fn strata_scan(state: State<'_, AppState>) -> Result<Vec<strata::StrataMod
     if !root.is_dir() {
         return Err(format!("Strata 目录不存在: {}", root.display()));
     }
-    let entries = strata::scan_configs(&root);
+    let preferred = strata::preferred_engine(state.settings.get().strata_engine.as_deref());
+    // 没写端口的 config 先补一个（用户 m05322：与 llama.cpp 侧同一套分配规则，9091 起）
+    let fixed = strata::ensure_ports(&root);
+    if fixed > 0 {
+        state
+            .logs
+            .push("system", format!("[gui] {fixed} 份 Strata config 缺端口，已自动分配"));
+    }
+    let entries = strata::scan_configs(&root, preferred.as_deref());
     state.store_strata_scan(&root, &entries);
     Ok(entries)
 }
 
-/// 列出 `engine-bundle` 下所有可用的引擎组件（可能多版本并存），供面板选择。
+/// 列出安装目录下所有可用的引擎组件（可能多版本并存），供面板选择。
 #[tauri::command]
-async fn strata_engines(root: String) -> Result<Vec<strata::EngineInfo>, String> {
-    Ok(strata::list_engines(std::path::Path::new(&root)))
+async fn strata_engines(
+    state: State<'_, AppState>,
+    root: String,
+) -> Result<Vec<strata::EngineInfo>, String> {
+    let root_path = std::path::PathBuf::from(&root);
+    let list = strata::list_engines(&root_path);
+    // 设置里记的引擎有两个失效场景，都要自动对齐，但**动的范围不同**：
+    // - 引擎目录被升级替换（用户 m04254：`engine-bundle` → `engine`，0.1.46 → 0.1.47）：
+    //   `settings.strata_engine` 指向的文件没了 → 落到列表最新的那台，并把各 config 的 `exe`
+    //   也一起对齐（config 里可能还写着那个已经消失的旧路径）。
+    // - 列表里只有一个版本（用户 m04430）：它必须是选中项，否则设置页一个都不勾，
+    //   看着像「没找到引擎」。这种情况**只更新 settings，不改 config** —— config 里写的可能是
+    //   `component:strata-engine` 组件引用（用户 2026-10-22 的会话），自动改写会把它降级成绝对路径。
+    let saved = state.settings.get().strata_engine.clone();
+    let saved_alive = saved
+        .as_deref()
+        .map(|path| std::path::Path::new(path).is_file())
+        .unwrap_or(false);
+    // 引用形态（`component:strata-engine`，设置页「自动使用最新版本」）**不做任何对齐**：
+    // 它本身就代表「跟着控制器组件目录走最新」，`is_file()` 必然为 false，不能当成「路径失效」，
+    // 否则每次打开设置页都会把引用降级成绝对路径（用户 m04934）。
+    let saved_reference = saved
+        .as_deref()
+        .map(|path| path.starts_with("component:"))
+        .unwrap_or(false);
+    let wanted = if saved_reference {
+        None
+    } else if list.len() == 1 || (saved.is_some() && !saved_alive) {
+        list.first()
+    } else {
+        None
+    };
+    if let Some(wanted) = wanted {
+        let exe = wanted.exe.to_string_lossy().to_string();
+        if saved.as_deref() != Some(exe.as_str()) {
+            state.settings.patch(SettingsPatch {
+                strata_engine: Some(Some(exe.clone())),
+                ..Default::default()
+            });
+            let saved_gone = !saved_reference && saved.is_some() && !saved_alive;
+            if saved_gone {
+                let _ = strata::apply_engine(&root_path, &exe);
+                state.store_strata_scan(
+                    &root_path,
+                    &strata::scan_configs(&root_path, Some(&wanted.exe)),
+                );
+            }
+        }
+    }
+    Ok(list)
 }
 
 /// 把某份 config 的 `exe` 换成选定的那个引擎可执行文件。
@@ -281,6 +341,9 @@ async fn strata_set_engine(root: String, config_file: String, exe: String) -> Re
 }
 
 /// 把选定的引擎批量写进装配目录下的全部 config，返回被改过的文件名（设置页用）。
+///
+/// **引擎由设置页决定**（用户 m04069）：这里同时把选择记进 `settings.strata_engine`，
+/// 免得前端「先 apply 再 save」的窗口里，扫描缓存按旧选择记了一份（卡片会短暂显示旧版本）。
 #[tauri::command]
 async fn strata_apply_engine(
     state: State<'_, AppState>,
@@ -290,8 +353,13 @@ async fn strata_apply_engine(
         return Err("还没设置 Strata 安装目录".into());
     };
     let changed = strata::apply_engine(&root, &exe)?;
-    // 扫描缓存作废：卡片上的引擎版本要跟着变
-    state.store_strata_scan(&root, &strata::scan_configs(&root));
+    state.settings.patch(crate::settings::SettingsPatch {
+        strata_engine: Some(Some(exe.clone())),
+        ..Default::default()
+    });
+    // 扫描缓存作废：卡片上的引擎版本要跟着变（按新选定的版本重扫）
+    let preferred = strata::preferred_engine(Some(&exe));
+    state.store_strata_scan(&root, &strata::scan_configs(&root, preferred.as_deref()));
     Ok(changed)
 }
 

@@ -197,7 +197,8 @@ pub async fn bench_strata(
     max_tokens: u32,
     concurrency: u32,
 ) -> Result<Vec<BenchRecord>, String> {
-    let entry = crate::strata::scan_configs(std::path::Path::new(&root))
+    // 压测只需要端口与密钥，引擎版本不参与；传 None 保持 config 原样（不改写 exe）
+    let entry = crate::strata::scan_configs(std::path::Path::new(&root), None)
         .into_iter()
         .find(|e| {
             e.config_path

@@ -173,8 +173,9 @@ function ConfigCard({
       <span title={entry.model_path ?? undefined}>
         <i className="fas fa-hdd" /> {fmtSize(entry.model_size_bytes)}
       </span>
-      {entry.port != null && (
-        <span>
+      {/* 0 = 还没分配端口（自动分配从 9091 起，启动或刷新时补上），此时不显示这一项 */}
+      {(entry.port ?? 0) > 0 && (
+        <span title={`端口 ${entry.port}（run 脚本与 config 一致）`}>
           <i className="fas fa-network-wired" /> {entry.port}
         </span>
       )}
