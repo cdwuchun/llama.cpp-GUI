@@ -5,7 +5,7 @@
 ## 先读什么
 
 - 接手 / 改代码前：`HANDOVER.md` —— §2 是 llama.cpp 行为约束（每条都有实测依据）、§1.1 代码地图、§7 未决项；逐轮实现日志与历史决策在 `docs/archive/`。
-- 能力清单与构建步骤：`README.md`（含进度表 P1–P8、目录结构、dsh 沙箱构建注意）。
+- 用法与能力：`README.md`（七页功能、外部 llama.cpp / Strata 目录结构、构建步骤）；构建与环境坑在 `HANDOVER.md` §5。
 - 第二条运行时通道（Strata，**已落地**）：方案与逐轮实现记录在 `docs/archive/STRATA_INTEGRATION_PLAN.md`，**约束**在 `HANDOVER.md` §2.11（config 校验+备份+原子写、WebUI 走系统浏览器、显存互斥、`no_throttle` 的脱离 Job 与失败回退）。
 - 前门（统一入口 9090）与 llama.cpp 侧配置层：`docs/archive/PROXY_SCHEDULER_PLAN.md` —— **已落地**，决策结果在 §10，配置层规格在 §3.1（**一个模型一份 JSON**、`presets.ini` 退役），分阶段与安全网见 §8，必须先实测的清单见 §9。
 - 聊天能力（原生聊天页 / 联网搜索 / MCP / 监控 / 压测）：`docs/archive/STRATA_MANAGER_PORT_ASSESSMENT.md`（P1–P8 的评估与决策）、`docs/archive/WEB_SEARCH_PLAN.md`（五引擎搜索，§11 决策）。
@@ -37,7 +37,7 @@
 ```powershell
 npm run cargo:proxy               # 另开终端保持运行（127.0.0.1:8787），cargo 必需
 npx tsc --noEmit                  # 前端类型检查（仓库根）
-cd src-tauri; cargo test --lib     # 后端单测（当前 142 passed / 11 ignored；ignore 里是三个联网端到端用例）
+cd src-tauri; cargo test --lib     # 后端单测（当前 172 passed / 17 ignored；ignore 里是联网与本机引擎相关用例）
 npm test                           # 前端类型检查 + 后端单测（test:web + test:rs）
 npm run test:smoke                 # 参数表单渲染冒烟测试（需 esbuild，受限沙箱要提权）
 npm run tauri build               # 打包；沙箱内需要提权
