@@ -1,6 +1,6 @@
 # llama.cpp GUI
 
-> **本项目 fork 自 [llama.cpp-hub](https://github.com/IIIIIllllIIIIIlllll/llama.cpp-hub)**（作者 Mark）。
+> **本项目 参考了 [llama.cpp-hub](https://github.com/IIIIIllllIIIIIlllll/llama.cpp-hub)**（作者 Mark），后来又根据strata的web界面进行了修改。
 > 上游是给 llama.cpp 套 Web 壳的图形化工具（PWA，Java 后端 + Web 前端），本项目把它做成 Windows 桌面应用
 > （Tauri 2 + Rust + React），并保留对其 `config/launch_config.json` 的迁移支持。
 > 上游以 **MIT** 许可发布，本项目的版权与许可声明见 [`LICENSE`](./LICENSE)。
@@ -110,10 +110,22 @@ P7 已实现的能力（Strata 第二运行时通道）：
 
 - **并列接入，而不是塞进 router 流水线**：Strata（<https://github.com/Niko1221/Strata>）的二进制、
   管理端点、config 格式都与 llama.cpp router 不同，所以它作为**独立通道**与其并存，router 那条线不改。
-  后端注册了 13 个命令（`strata_status` / `strata_scan` / `strata_probe` / `strata_start` /
-  `strata_stop` / `strata_set_root` / `strata_pick` / `strata_config_read` / `strata_config_write` /
-  `strata_unload_model` / `strata_load_model` / `strata_proxy_start` / `strata_proxy_stop`），
+  **Strata 的安装根是设置项 `settings.strata_root`**（留空 = 官方 `%LOCALAPPDATA%\Strata`）：手动解压的布局是
+  `<根>\control\<版本>` + `<根>\engine\<版本>-<平台>-<后端>`，config 与 `run-*.bat` 直接放根目录；官方布局
+  `<根>\terminal\<版本>` 放控制端、`install` 放 `strata-*.json` 与 `run-*.bat`、`components\engine\<版本>-…` 放组件，
+  两种都认。数据目录（模型 / 包 / 预设 / 专家档案）不再由 GUI 读写，`%APPDATA%\Strata\settings.json` 的
+  `data_dir` 归安装器管。
+  后端注册的 21 个命令（`strata_status` / `strata_scan` / `strata_probe` / `strata_start` /
+  `strata_stop` / `strata_pick` / `strata_config_read` / `strata_config_write` /
+  `strata_unload_model` / `strata_load_model` / `strata_engines` / `strata_set_engine` /
+  `strata_apply_engine` / `strata_controllers` / `strata_apply_controller` /
+  `strata_proxy_start` / `strata_proxy_stop` / `strata_upgrade_check` / `strata_upgrade_start` /
+  `strata_upgrade_status` / `strata_upgrade_stop`，外加 `strata_tune_start|status|stop`），
   外加压测命令 `bench_strata`。
+- **「参数调优」按钮**（模型卡右上角）：调 `strata tune auto`，用 Strata 自己的测量流程给这台机器找最快参数
+  （`quick` ≈ 15 分钟，`thorough` 约 2 小时），弹层里实时显示阶段与回合进度、可随时取消。调优期间禁止启动
+  其他引擎（会抢显存），结果写进 Strata 的调优预设（不改 config，下次启动由 `apply_saved_tuning` 叠加）。
+  **「WebUI」按钮常显**：引擎没在跑时先启动再打开浏览器。
 - **前门代理：客户端只连一个端口**（`src-tauri/src/strata_proxy.rs`；默认 `127.0.0.1:9090`，
   设置页里叫「代理监听地址 / 代理端口」）。DSH 等 OpenAI 兼容客户端只连它，它按请求体里的 `model`
   挑 config，必要时**停旧引擎、起新引擎**（切换全程串行化；首次请求要等建引擎 + 加载模型，约 20–60 s）。
@@ -132,7 +144,8 @@ P7 已实现的能力（Strata 第二运行时通道）：
   并且勾选时按引擎的依赖关系校验：`--batch-mtp` 要求 `--batch` + `--mtp` + `--spec` 且不能与
   `--batch-groups` 同开、`--batch-groups` 要求 `--batch`、`--conversation-cache-slots` 要求预算 > 0；
   不满足就拒绝勾选并就地说明原因，写盘前还会再校验一次（防止从 config 原文绕过）。
-  引擎版本**不在模型卡里选**：设置页「通用 → Strata 引擎版本」列出找到的全部引擎（版本 / 后端 / 架构 / 路径），列表最前还有一项「自动使用最新版本」。选中具体版本即把**全部** config 的 `exe` 切到该版本（写绝对路径）；选中「自动使用最新版本」则写回 `component:strata-engine` 引用（实际版本由 Strata 控制器的组件目录决定，升级后自动跟随），GUI 对这种引用**只解析、不改写**。换版本时 `vision.exe` 一起指到新版本目录下的 `strata-vision.exe`（新目录里没有就保留原值），两处都只改这两个字符串，其余内容与键顺序不动。查找规则与 Strata 控制器一致：先看 `STRATA_COMPONENTS_DIR` 或 `%LOCALAPPDATA%\Strata\components\engine`（本机是指向安装目录里引擎文件夹的目录联结），再看安装目录自身及其下两层里含引擎文件的目录，结果按真实路径去重；目录里**只有一个版本时它自动就是选中项**，设置里记的路径万一失效（升级把目录换掉）会自动对齐到最新那台。
+  引擎版本**在设置页「通用 → Strata 引擎版本」里选**（表格形如「llama.cpp 引擎版本」：版本 / 平台 / 后端 / 路径，单选即改写全部 config 的 `exe` 与 `vision.exe`）。卡片上有「自动跟随最新版本」开关（默认开）：开着时启动/刷新会对齐到最高版本，关掉就只认手选的那个，手选的版本失效时仍会自动纠正。控制器版本另有一张同样形态的表（`<根>\control\<版本>`，认 `serve\server.py`），选中即改写 `run-*.bat` 的解释器与工作目录、config 的 `cwd` / `--expert-profile`。两张卡各有一个「升级」按钮：后端只驱动控制端官方的 `strata.py update --components-dir <根>`（feed 签名校验、按显卡挑包、试启动通过才切换、失败保留旧版都不是 GUI 的事），点之前先 `--check`，两侧都最新就只提示「已是最新」不下载。config 里的 `component:strata-engine` 引用仍只解析、不改写。
+   **Strata 安装位置由用户指定**：「通用 → Strata 目录」写 `settings.strata_root`（留空 = 官方 `%LOCALAPPDATA%\Strata`），所有模块都用 `strata::root()` 而不是写死路径；手动解压的布局是 `<根>\control\<版本>` + `<根>\engine\<版本>-<平台>-<后端>`，config 与 `run-*.bat` 直接在根目录，官方布局 `<根>\install` 与 `terminal\<版本>` 也认。数据目录（模型 / packs / profiles / mtp）不再由 GUI 读写 —— `%APPDATA%\Strata\settings.json` 的 `data_dir` 是安装器的事。
   卡片名后的徽标是四项：**视觉 / MTP / 引擎缺失 / KV 池**。「支持 MTP」的判据是这份 config 的
   `args` 里带 `--mtp`（安装器写下的安装事实，路径 GUI 只读），不是按模型名猜；`--spec=0` 时
   徽标显示成虚线压暗的 **「MTP 关」**（权重已装、当前未启用投机解码），悬停给出验证窗口 `--spec=N`。
@@ -175,15 +188,21 @@ P7 已实现的能力（Strata 第二运行时通道）：
 界面细节（按实机反馈调整过；**侧栏已改为 模型 / 聊天 / 监控 / 性能测试 / 系统日志 / 设置 六页**，
 下列个别描述早于这次改版）：
 
-- **侧栏**：`模型列表 / 性能测试 / 运行环境 / Strata / 系统日志 / 设置` 六个页面，外加一个
+- **侧栏**：`模型列表 / 模型下载 / 性能测试 / 运行环境 / Strata / 系统日志 / 设置` 七个页面，外加一个
   「开始聊天」按钮（不是页面，直接打开 llama.cpp 自带聊天界面）；底部把 router 状态与
   启停合成**一颗胶囊**（左边状态点、中间「router 运行中 · :8080」、右边启动/停止图标，
   配色沿用 hub 模型卡的状态胶囊），点一下即启停。
+- **模型下载页**（2026-10-28，照搬上游 strata-manager 的下载页）：左侧官方目录 / 社区两档列表，
+  右侧详情 —— 量化表（下载大小、参考 RAM、本机适配）、上下文与图像、资源评估、吸底提交条；
+  下载交给控制端 `setup.py` 自己跑（`--yes --no-start`），进度按它的 `x / y GB (n%)` 行实时显示，
+  装完回「模型列表」刷新即可。社区档用 HF 镜像 `/api/models` 发现条目（24 小时缓存），
+  其中 ORCA 走自己的链路：下两个分片（85.2 GB）→ 控制端 `tools/iq_pack.py --compat-bf16` 打包 →
+  写一份 `strata-orca-iq3_xxs.json`。「使用已有模型」可以扫本地 GGUF 目录直接生成配置。
 - **模型列表顶栏只留五件事**：搜索、刷新、排序（名称 ↑↓ / 大小 ↑↓ / **运行中优先**）、
   筛选（全部 / 运行中 / 收藏 / 未同步 preset）、视图切换；`同步到 presets.ini` 与
   `编辑 preset 文件` 收进一个 **preset 下拉**。
 - **聊天页的模型下拉**（输入框右侧）：列出**全部**模型（不把已加载的排到最前），已加载的模型名显示为绿色；默认模型依次取「上次的选择 → 已加载里 id 排序第一个 → 上次聊天的模型」，都没有时显示「请选择模型」。选中的模型**未加载时发送会自动拉起**（执行状态卡片提示「拉起中…」），下次请求照常走前门。**聊天历史默认收起**，需要时点工具栏的展开按钮。
-- **设置页**：顶栏是深浅色主题按钮；llama.cpp 目录保存后自动重扫版本与设备；模型根目录
+- **设置页**：顶栏是深浅色主题按钮；llama.cpp 目录保存后自动重扫版本与设备；「llama.cpp 模型目录」
   「保存」即自动重新扫描（不再需要单独的「保存并扫描模型」）；GPU / 多卡分组已移除 ——
   默认不限制设备就是多卡最优解，需要 per-model 覆盖时在模型配置面板里改。
 - **配置弹窗**：参数分组的折叠状态与左右两栏的滚动位置都会记住（按模型分开记，
@@ -252,7 +271,11 @@ npm install                  # 若在受限沙箱中需加 --ignore-scripts
 npm run tauri dev            # 开发（需要 src-tauri 能编译）
 npm run build                # 仅构建前端到 dist/
 npm run tauri build          # 打包 NSIS 安装包
+npm run stamp:version        # 手动把版本号改成打包时刻的 YYYY.MMDD.HHMM（不自动跑）
 ```
+
+版本号（`package.json` / `src-tauri/tauri.conf.json` / `src-tauri/Cargo.toml`）**只在明确要求时才改**，
+`npm run tauri build` 不会动它；`npm run stamp:version` 是一键改成日期版本的工具，`--dry` 只预览。
 
 打包首次需要 NSIS 工具链（Tauri 会自动下载到 `%LOCALAPPDATA%\tauri\NSIS`）。
 本机直连 GitHub 不通时，给构建命令带上代理即可：
@@ -340,7 +363,8 @@ npm test          # 期望 119 passed / 8 ignored
         ├── model_config.rs       # 一个模型一份 JSON：读写/最小化写入/失效归档与恢复
         ├── scheduler.rs          # 多模型驻留：容量闸、端口分配、启动参数组装、空闲卸载
         ├── strata_proxy.rs       # 前门：一个端口挂全部 config，按请求体 model 停旧起新并转发
-        ├── strata.rs             # Strata 第二通道：引擎启停、/status 探测、显存互斥
+        ├── strata.rs             # Strata 第二通道：引擎启停、/status 探测、显存互斥、根目录/引擎/控制器版本
+        ├── strata_upgrade.rs     # 升级控制器与引擎：只驱动控制端官方 strata.py update，翻译进度
         ├── monitor.rs            # 硬件与引擎指标采集（sysinfo / NVML / PDH / Prometheus 文本）
         ├── search.rs             # 联网搜索五引擎 + 网页正文抓取（web_fetch，AnySearch 兜底）
         ├── mcp.rs                # MCP 客户端（stdio/NDJSON）：服务器管理、工具列表与调用
@@ -358,7 +382,7 @@ npm test          # 期望 119 passed / 8 ignored
 
 ```
 settings.json                 # 用户设置
-config/llamacpp-<id>.json     # 一个模型一份配置（name/model/args/port/api_key…）
+config/llamacpp-<id>.json     # 一个模型一份配置（name/model/port/api_key + 参数键如 "ctx-size": 4096）
 config/.orphan/               # 模型文件消失后归档的 config（模型回来时恢复参数）
 logs/gui-<启动时间>.log       # 运行日志（超 8 MB 分卷，只留最近 12 个）
 runtime/                      # 非 ASCII 路径的链接目录
@@ -381,7 +405,7 @@ models-scan-cache.json        # 模型扫描缓存
 
 1. **设置 → llama.cpp 目录**：填版本目录的根（如 `E:\AI\llamacpp`，下面是一层 `llama-bNNNNN-…`），点「保存并扫描」
    → 版本表显示每个版本、共享 CUDA 匹配情况、路径是否纯 ASCII；设备表列出可用 GPU。
-2. **设置 → 模型根目录**：填模型所在目录，点「保存并扫描模型」→ 递归扫描（含多模态与分片分组），GGUF 元数据进缓存。
+2. **设置 → llama.cpp 模型目录**：填模型所在目录，点「保存并扫描模型」→ 递归扫描（含多模态与分片分组），GGUF 元数据进缓存。
 3. **模型页 → 配置**：每张卡点「配置」写一份 `config\llamacpp-<id>.json`（一个模型一份；`name` 就是请求用的模型名）。
 4. **模型页 → 启动**：起该模型的子实例，端口由调度器从号段分配；容量闸按 `models_max`（默认 4）执行，满了先卸最久未用的。
 5. **前门**（侧栏左下的胶囊）是统一入口：默认 9090 一个端口挂全部 config，请求体里的 `model` 决定用哪个。

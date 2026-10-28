@@ -1,13 +1,14 @@
 {
   "name": "llamacpp-gui",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "stamp:version": "node scripts/stamp-version.mjs",
     "cargo:proxy": "node scripts/cargo-proxy.mjs",
     "test:web": "tsc --noEmit",
     "test:rs": "cargo test --lib --manifest-path src-tauri/Cargo.toml",

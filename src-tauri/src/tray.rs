@@ -190,6 +190,13 @@ fn quit<R: Runtime>(app: &AppHandle<R>) {
         if had_process && crate::strata::stop_strata(&state.strata_slot).is_none() {
             eprintln!("[tray] 退出时停止 Strata 失败：slot 已被清空但进程可能仍在");
         }
+        // 调优进程（python tune）同样会起引擎测速，不能留活口。
+        {
+            let mut jobs = state.strata_tune.lock().unwrap_or_else(|e| e.into_inner());
+            for (_, mut job) in jobs.drain() {
+                crate::strata_tune::stop(&mut job);
+            }
+        }
         // 前门代理也要摘掉：它的监听线程是 GUI 进程内的，句柄不 drop 就走不到释放
         // （虽然进程退出会一起带走，但这里显式关掉，退出路径才对得上）。
         crate::strata_proxy::shutdown(&state);

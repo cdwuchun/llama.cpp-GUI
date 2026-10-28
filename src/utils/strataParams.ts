@@ -18,11 +18,32 @@
 import type { ParamDef, ParamSchema, ParamState } from "./paramSchema";
 import { isFlagToken } from "./extraParams";
 
+/**
+ * 视觉编码器（CPU 解码）的线程数，规则抄自上游 `setup.py` 的 `vision_threads()`：
+ * `max(1, min(逻辑线程数 // 2, VISION_THREADS_CAP))`，`VISION_THREADS_CAP = 16`。
+ * 浏览器里拿不到「物理核」，`navigator.hardwareConcurrency` 给的是逻辑线程数，与上游 `os.cpu_count()` 同义。
+ */
+function visionThreads(): number {
+  const logical =
+    typeof navigator !== "undefined" && Number(navigator.hardwareConcurrency) > 0
+      ? Number(navigator.hardwareConcurrency)
+      : 8;
+  return Math.max(1, Math.min(Math.floor(logical / 2), 16));
+}
+
 // 转发给界面层：表单状态类型与 llama.cpp 侧同名，避免组件里两处 import
 export type { ParamState };
 
 /** 无值开关：出现即真，不消费下一个 token */
-const FLAG_ONLY = new Set(["vision", "kv-grow", "prompt-cache-tail", "no-ple", "batch-mtp"]);
+const FLAG_ONLY = new Set([
+  "vision",
+  "kv-grow",
+  "prompt-cache-tail",
+  "no-ple",
+  "batch-mtp",
+  "resident-experts",
+  "expert-cache-per-layer",
+]);
 
 /**
  * 安装事实类参数：由 Strata 的安装器（`START-HERE.bat` / `setup.py`）写下，
@@ -249,6 +270,81 @@ const PARAM_META: Omit<ParamDef, "abbr" | "delimiter" | "mergeInto" | "mergeValu
     defaultEnabled: true,
   },
   {
+    key: "resident-experts",
+    flag: "--resident-experts",
+    type: "LOGIC",
+    uiType: null,
+    default: "false",
+    values: [],
+    label: "低内存模式",
+    desc: "低内存机器的常驻模式（setup 用）：等价于 --mmap-experts --resident-cpu-experts —— 显存缓存装不下的专家常驻在内存里，副本能页锁定就页锁定，保留 4 GiB 余量，装不下时退回纯 mmap。同一个 placement 下答案与 --mmap-experts 相同。",
+    group: "speed",
+    order: 8,
+    sort: 8,
+    defaultEnabled: false,
+  },
+  {
+    key: "adapt-async",
+    flag: "--adapt-async",
+    type: "INTEGER",
+    uiType: null,
+    default: "1",
+    values: [],
+    label: "异步适应",
+    desc: "专家交换在 verify 窗口之间推进，不等一整轮验证结束（单卡 + CUDA，走专家 arena 或低内存常驻模式时才有意义）。代价是不可复现：同一个 prompt 两次运行，即使 temperature 0 也可能出现个别不同的 token —— 评测、回归、A/B 对比时不要开。0 = 关闭，引擎默认就是 0。",
+    group: "speed",
+    order: 9,
+    sort: 9,
+    defaultEnabled: false,
+  },
+  {
+    key: "expert-cache-per-layer",
+    flag: "--expert-cache-per-layer",
+    type: "LOGIC",
+    uiType: null,
+    default: "false",
+    values: [],
+    label: "逐层分配缓存",
+    desc: "给每一层自己的专家槽位，而不是让先到的位置把槽位吃光（引擎默认按到达顺序共用一个计数器，256 槽时几乎全给了第 0 位置的 26 层，命中率只有 2.97%）。引擎实测：同样的路由，8 槽/层命中 21.4%、64 槽/层 70.4%；4096 槽与它一起用时命中 54.4%、CPU 池排水 19.1 → 10.3 ms/token。小显存卡收益最大，建议实测对比。",
+    group: "speed",
+    order: 10,
+    sort: 10,
+    defaultEnabled: false,
+  },
+  {
+    key: "host-core",
+    flag: "--host-core",
+    type: "STRING",
+    uiType: "dropdown",
+    default: "first",
+    values: [
+      { value: "first", label: "first（默认，第一个物理核）" },
+      { value: "last", label: "last（最后一个物理核）" },
+      { value: "sibling", label: "sibling（第一个核的 SMT 兄弟）" },
+    ],
+    label: "宿主线程核",
+    desc: "宿主（调度）线程钉在哪个核：Windows 把 GPU 中断都发给第一个逻辑处理器，而每次专家拷贝落地都会抬一次中断，宿主在同一个核上自旋时会等它。sibling = 宿主挪到第一个核的另一个硬件线程，workers 仍吃满所有核（混合核 CPU 上也能用）。只挪线程，不改结果。",
+    group: "speed",
+    order: 11,
+    sort: 11,
+    defaultEnabled: false,
+  },
+  {
+    key: "pin-by-need",
+    flag: "",
+    type: "LOGIC",
+    uiType: null,
+    default: "true",
+    values: [],
+    label: "优先锁定所需专家",
+    desc: "写进 config 的 env 块（STRATA_PIN_BY_NEED=1），不是命令行参数。Windows 一次只能给显卡锁定约一半内存，开了它先锁显卡真正要用的那些专家（不再按文件顺序锁）。官方在 RTX 5070 上测得 prompt 读取 +4.4%；副作用是启动时的锁页顺序变了。",
+    group: "speed",
+    order: 12,
+    sort: 12,
+    defaultEnabled: false,
+    env: "STRATA_PIN_BY_NEED",
+  },
+  {
     key: "batch",
     flag: "--batch",
     type: "INTEGER",
@@ -392,7 +488,7 @@ const PARAM_META: Omit<ParamDef, "abbr" | "delimiter" | "mergeInto" | "mergeValu
     default: "",
     values: [],
     label: "多模态模型",
-    desc: "视觉投影模型（config 顶层 vision.mmproj）：让视觉编码器把图像嵌入成模型能读的向量，勾选「多模态（视觉）」后必填。保存时 GUI 会把 vision.exe 补成引擎组件目录里的 strata-vision.exe（`engine-bundle\\<版本>-<平台>-<后端>`），把 vision.model 同步成启动参数里的 --model。",
+    desc: "视觉投影模型（config 顶层 vision.mmproj）：让视觉编码器把图像嵌入成模型能读的向量，勾选「多模态（视觉）」后必填。保存时 GUI 会把 vision.exe 补成引擎组件目录里的 strata-vision.exe（`components\\engine\\<版本>-<平台>-<后端>`），把 vision.model 同步成启动参数里的 --model。",
     group: "vision",
     order: 2,
     sort: 2,
@@ -730,6 +826,14 @@ export function validateStrataParams(
     const error = checkStrataParamEnable(key, state, args);
     if (error) return error;
   }
+  // --host-core 只认引擎列的这三个值，手输别的值会让引擎启动失败
+  const hostCore = state["host-core"];
+  if (hostCore?.enabled) {
+    const v = hostCore.value.trim();
+    if (v !== "first" && v !== "last" && v !== "sibling") {
+      return `宿主线程核只能是 first、last 或 sibling（现在是「${v || "空"}」）。`;
+    }
+  }
   return null;
 }
 
@@ -755,6 +859,11 @@ export { isFlagToken };
 export function argsToState(args: unknown[]): Record<string, ParamState> {
   const state: Record<string, ParamState> = {};
   for (const def of strataParamSchema.params) {
+    // 走 env 块的参数不在 args 里，由 configToState 从 `env` 读
+    if (def.env) {
+      state[def.key] = { enabled: false, value: def.default };
+      continue;
+    }
     // 同义写法（--slots = --batch）都算「这个参数在 args 里出现过」
     const at = args.findIndex(
       (t) => typeof t === "string" && FLAG_TO_KEY.get(t) === def.key,
@@ -798,7 +907,13 @@ export function stateToArgs(args: unknown[], state: Record<string, ParamState>):
       continue;
     }
     const entry = state[key];
-    if (!entry?.enabled) continue;
+    if (!entry?.enabled) {
+      // 取消勾选要连它的值 token 一起删：`--kv-resident 32768` 只删 flag 会留下裸的
+      // `32768`，引擎按「未知参数」直接启动失败（与 argsToState 的取值判据保持一致）。
+      const next = args[i + 1];
+      if (!FLAG_ONLY.has(key) && next != null && !isFlagToken(String(next))) i += 1;
+      continue;
+    }
     out.push(token);
     if (FLAG_ONLY.has(key)) continue;
     const next = args[i + 1];
@@ -814,6 +929,7 @@ export function stateToArgs(args: unknown[], state: Record<string, ParamState>):
     const entry = state[def.key];
     if (!entry?.enabled) continue;
     if (TOP_LEVEL_KEYS.has(def.key)) continue; // 顶层字段永不进 args
+    if (def.env) continue; // env 变量写 config 的 env 块，见 stateToConfig
     // 保留原 args 里的写法（--slots 仍是 --slots，顺序也不动）；只有完全没有时
     // 才追加规范写法 --batch。
     if (KEY_FLAGS.get(def.key)?.some((flag) => args.includes(flag))) continue;
@@ -842,6 +958,17 @@ export function installFactFlags(args: unknown[]): string[] {
  */
 export function configToState(cfg: Record<string, unknown>): Record<string, ParamState> {
   const state = argsToState(Array.isArray(cfg.args) ? (cfg.args as unknown[]) : []);
+  // env 块：只有表单认识的变量（`ParamDef.env`）进状态，其余键由 stateToConfig 原样保留
+  const env =
+    cfg.env && typeof cfg.env === "object" ? (cfg.env as Record<string, unknown>) : undefined;
+  for (const def of strataParamSchema.params) {
+    if (!def.env) continue;
+    const v = env?.[def.env];
+    state[def.key] = {
+      enabled: v != null && String(v).trim() !== "",
+      value: def.default,
+    };
+  }
   const vision =
     cfg.vision && typeof cfg.vision === "object" ? (cfg.vision as Record<string, unknown>) : undefined;
   const mmproj = vision?.mmproj != null ? String(vision.mmproj) : "";
@@ -880,22 +1007,25 @@ export function configToState(cfg: Record<string, unknown>): Record<string, Para
  * `vision.model` 是主模型，不由用户在这里选：GUI 从启动参数里的 `--model` 同步过来
  * （上游 `server.py` 把 exe/mmproj/model 三键都当必需键）。
  *
- * `root` = 设置里的 Strata 安装目录；`engineExe` = 后端解析出的**真实引擎可执行文件**
- * （`engine-bundle\<版本>-<平台>-<后端>\strata.exe`）。
+ * `engineExe` = 后端解析出的**真实引擎可执行文件**
+ * （官方布局 `<根>\components\engine\<版本>-<平台>-<后端>\strata.exe`）。
  *
- * 用户 m02686：config 里不留 `component:strata-engine` 这种引用，落盘时直接写真实路径。
- * 所以拿到 `engineExe` 就同时改写顶层 `exe`，并用它的父目录拼 `vision.exe`
- * （上游 `server.py` 把 vision.exe/mmproj/model 三键都当必需键）。
+ * **`exe` 只在原值是绝对路径时才跟着 engineExe 走**：原值是 `component:strata-engine`
+ * 引用时保持引用（设置页「自动使用最新版本」就是它，展开成绝对路径会让引擎升级换代后
+ * 指向已删掉的旧版本目录）。`vision.exe` 则必须写真实路径，用 engineExe 的父目录拼。
  */
 export function stateToConfig(
   cfg: Record<string, unknown>,
   state: Record<string, ParamState>,
-  root?: string | null,
   engineExe?: string | null,
 ): Record<string, unknown> {
   const args = Array.isArray(cfg.args) ? (cfg.args as unknown[]) : [];
   const next: Record<string, unknown> = { ...cfg, args: stateToArgs(args, state) };
-  if (engineExe) next.exe = engineExe;
+  if (engineExe) {
+    const prevExe = typeof cfg.exe === "string" ? cfg.exe : "";
+    // 引用形态（`component:strata-engine`）保持不动；绝对路径才同步成当前解析结果
+    if (!prevExe.startsWith("component:")) next.exe = engineExe;
+  }
 
   // 采样默认值：写回 config 顶层 sampling 块。GUI 不认识的键原样保留
   // （上游 0.1.39+ 往里放过实验开关键，例如 experimental_speed_projection）；
@@ -926,28 +1056,42 @@ export function stateToConfig(
   // 「多模态（视觉）」勾选 = args 里带 --vision
   const visionOn = !!state["vision"]?.enabled;
   const mmproj = (state["vision-mmproj"]?.value || "").trim();
-  // vision.model 是主模型：从启动参数里的 --model 同步，用户不在这里选
+  // vision.model 是主模型：从启动参数里的模型路径同步，用户不在这里选。
+  // Strata 的 config 把主模型写成 `--native <gguf>`（另有一份 `--ple-gguf` 同路径），
+  // 老版本/llama.cpp 风格的才是 `--model` —— 两个都认，`--native` 优先。
   const argList = next.args as unknown[];
-  const modelIdx = argList.indexOf("--model");
-  const mainModel =
-    modelIdx >= 0 && modelIdx + 1 < argList.length ? String(argList[modelIdx + 1]) : "";
+  const firstArgAfter = (flag: string): string => {
+    const i = argList.indexOf(flag);
+    return i >= 0 && i + 1 < argList.length ? String(argList[i + 1]) : "";
+  };
+  const mainModel = firstArgAfter("--native") || firstArgAfter("--model") || "";
   if (visionOn || prevVision) {
     const v: Record<string, unknown> = prevVision ?? {};
     if (mmproj) v.mmproj = mmproj;
+    // 三键（exe / mmproj / model）是上游 server.py 的必需键：拿不到新值就保留原值
     if (mainModel) v.model = mainModel;
-    // vision.exe 必须指向这一次安装的引擎组件（0.2.x 是 `engine-bundle\<版本>-…`）。
+    // vision.exe 必须指向这一次安装的引擎组件（官方布局是 `components\engine\<版本>-…`）。
     // 旧版 config 里可能是已不存在的 `<安装目录>\engine\strata-vision.exe`，
     // 所以只要拿到引擎路径就覆盖，而不是「没有才补」。
     const engineDir = engineExe ? parentDir(engineExe) : "";
     if (engineDir) {
       const sep = engineDir.includes("\\") ? "\\" : "/";
       v.exe = `${engineDir}${sep}strata-vision.exe`;
-    } else if (!v.exe && root) {
-      const sep = root.includes("\\") ? "\\" : "/";
-      v.exe = `${root}${sep}engine${sep}strata-vision.exe`;
     }
+    // 拿不到引擎 exe 时不猜路径：官方布局的组件目录带 `<版本>-<平台>-<后端>` 后缀，
+    // 拼出来的 `…\components\engine\strata-vision.exe` 一定不存在，写进去只会让视觉启动失败。
     // 值与 vision.gpu 一致：value 是权威（ParamForm 的 LOGIC 控件以 value 为准）
-    v.gpu = (state["vision-gpu"]?.value ?? "true") !== "false";
+    const gpu = (state["vision-gpu"]?.value ?? "true") !== "false";
+    v.gpu = gpu;
+    // CPU 解码（gpu = false）时上游还写 `threads`：视觉编码器的线程数，
+    // `setup.py` 的 vision_threads() = max(1, min(逻辑线程数 // 2, 16))（VISION_THREADS_CAP = 16）。
+    // GPU 解码不写这个键（上游只有 `--vision cpu` 分支才写），所以切到 GPU 时删掉。
+    if (gpu) {
+      delete v.threads;
+    } else {
+      const prev = Number(v.threads);
+      v.threads = Number.isFinite(prev) && prev > 0 ? Math.trunc(prev) : visionThreads();
+    }
     const mt = state["vision-max-tokens"];
     const n = mt?.enabled ? Number(mt.value) : NaN;
     if (Number.isFinite(n) && n > 0) v.max_tokens = Math.trunc(n);
@@ -957,5 +1101,17 @@ export function stateToConfig(
 
   if (state["open-browser"]?.enabled) next.open_browser = true;
   else if ("open_browser" in cfg) next.open_browser = false;
+
+  // env 块：勾选的写 "1"，取消的删掉；GUI 不认识的其他变量原样保留
+  const prevEnv =
+    cfg.env && typeof cfg.env === "object" ? { ...(cfg.env as Record<string, unknown>) } : {};
+  const env: Record<string, unknown> = { ...prevEnv };
+  for (const def of strataParamSchema.params) {
+    if (!def.env) continue;
+    if (state[def.key]?.enabled) env[def.env] = "1";
+    else delete env[def.env];
+  }
+  if (Object.keys(env).length > 0) next.env = env;
+  else delete next.env;
   return next;
 }

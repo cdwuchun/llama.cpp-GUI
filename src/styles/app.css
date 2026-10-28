@@ -426,6 +426,21 @@
   display: block;
 }
 
+/* 参数弹窗里的裁剪容器有三层（`#loadModelModal .param-group` 是 overflow:hidden，
+ * `#dynamicParamsContainer` 与 `.right-param-area` 也各自 overflow）：绝对定位的菜单一旦
+ * 越过分组下边界就被裁掉，而且它不参与滚动内容的高度，外层怎么滚都露不出来 ——
+ * Strata 配置弹窗里「上下文容量 / KV 量化」下拉的最后一条点不到就是这个原因。
+ * 所以展开时走 portal 挂到 body 上，改 fixed 按锚点定位，坐标与高度由 DropdownInput 现算。
+ * z-index 必须高于 `.modal`（1000），否则菜单会被弹窗盖住。 */
+.ctx-cb-menu.is-portal {
+  position: fixed;
+  top: auto;
+  right: auto;
+  left: auto;
+  z-index: 1100;
+  margin-top: 0;
+}
+
 .ctx-cb-opt {
   padding: 9px 12px;
   cursor: pointer;
@@ -444,13 +459,28 @@
   background: rgb(var(--st-accent-rgb) / 0.08);
 }
 
+/* 选项左栏：名字（int8），右栏小字：label 里拆出来的括注（省一半显存）或取值（32768）。
+   两栏都可能很长（`k8v4` / `INT8 K + 旋转 Q4_0 V`），各自省略，悬停看完整文案。 */
 .ctx-cb-opt-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 14px;
   font-weight: 600;
   color: var(--text-primary);
 }
 
 .ctx-cb-opt-val {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 62%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-left: 12px;
+  text-align: right;
   font-size: 12px;
   color: var(--text-secondary);
   font-family: var(--st-font-mono);
@@ -959,7 +989,8 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  padding: 16px;
+  /* 左右 40px：与模型页 .content-scrollable 的 2.5rem 对齐（用户 m02516 要求四页统一） */
+  padding: 16px 40px;
 }
 
 .logs-wrap {
@@ -1056,7 +1087,7 @@
 
 @media (max-width: 900px) {
   .page-fill {
-    padding: 12px;
+    padding: 12px 16px;
   }
 
   .log-sources {
@@ -1761,3 +1792,46 @@
 
 /* 通用弹窗图标（Sheet） */
 .sheet-icon { width: 24px; height: 24px; object-fit: contain; }
+
+/* 单选：选中态为绿底 + 白点（用户 m02711 指定的样式，全站统一） */
+input[type="radio"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  border: 1.5px solid var(--st-line);
+  border-radius: 50%;
+  background: var(--st-surface);
+  cursor: pointer;
+  flex: none;
+  position: relative;
+  transition: border-color var(--st-dur) var(--st-ease), background var(--st-dur) var(--st-ease);
+}
+
+input[type="radio"]:hover:not(:disabled) {
+  border-color: var(--st-accent);
+}
+
+input[type="radio"]:checked {
+  border-color: var(--st-accent);
+  background: var(--st-accent);
+}
+
+input[type="radio"]:checked::after {
+  content: "";
+  position: absolute;
+  inset: 4px;
+  border-radius: 50%;
+  background: var(--st-accent-ink);
+}
+
+input[type="radio"]:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+input[type="radio"]:focus-visible {
+  outline: 2px solid var(--st-focus);
+  outline-offset: 2px;
+}

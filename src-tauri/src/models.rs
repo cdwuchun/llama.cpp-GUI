@@ -1,4 +1,4 @@
-//! 模型递归扫描与 `presets.ini` 读写。
+//! 模型递归扫描；配置读写见 `model_config`（`config\llamacpp-<id>.json`）。
 //!
 //! 设计要点（方案 §1.2 / §4.3）：
 //! - **不改动用户的模型目录结构**：递归扫描任意层级，把结果写成 router 原生的 preset 文件；
@@ -239,11 +239,6 @@ fn quant_re() -> &'static Regex {
 fn shard_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^(?P<prefix>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})$").expect("shard regex"))
-}
-
-fn entry_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^\s*([A-Za-z0-9_.\-]+)\s*=").expect("entry regex"))
 }
 
 fn to_forward_slash(path: &Path) -> String {
@@ -1000,82 +995,6 @@ impl<R: Read> GgufStream<R> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// presets.ini 读写（字符串级操作，尽可能保留用户手写内容）
-// ---------------------------------------------------------------------------
-
-/// 列出文件中的所有段名（不含 `[*]`）。
-pub fn list_sections(text: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    for line in text.lines() {
-        if let Some(name) = section_header(line) {
-            if name != "*" {
-                names.push(name);
-            }
-        }
-    }
-    names
-}
-
-fn section_header(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with('[') {
-        return None;
-    }
-    let end = trimmed.find(']')?;
-    let name = trimmed[1..end].trim();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
-}
-
-/// 找到段的起始行与结束行（`[start, end)`，以行索引计）。
-///
-/// **段名按大小写不敏感比较**（`list_sections` 返回的仍是磁盘上原始大小写）。
-/// 用户手写 `[qwen3-4b]` 而扫描出的 id 是 `Qwen3-4B` 时，精确比较会认不出这是同一个
-/// 模型，于是同步 preset 又 append 一段 —— router 里就出现两个段指向同一个 gguf
-/// （一个带参数、一个是空段）。段名重复时只认**第一个**，与 router 的
-/// 「同名段后者清空前者」并不一致，见 [`upsert_entries`] 里的说明。
-fn section_bounds(lines: &[&str], section: &str) -> Option<(usize, usize)> {
-    let start = lines
-        .iter()
-        .position(|l| section_header(l).map_or(false, |name| name.eq_ignore_ascii_case(section)))?;
-    let end = lines
-        .iter()
-        .enumerate()
-        .skip(start + 1)
-        .find(|(_, l)| section_header(l).is_some())
-        .map(|(i, _)| i)
-        .unwrap_or(lines.len());
-    Some((start, end))
-}
-
-/// 读取某个段内的键值对。
-pub fn section_entries(text: &str, section: &str) -> Vec<(String, String)> {
-    let lines: Vec<&str> = text.lines().collect();
-    let Some((start, end)) = section_bounds(&lines, section) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for line in &lines[start + 1..end] {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
-            continue;
-        }
-        if let Some(caps) = entry_re().captures(line) {
-            let key = caps[1].to_string();
-            let value = line
-                .split_once('=')
-                .map(|(_, v)| v.trim().to_string())
-                .unwrap_or_default();
-            out.push((key, value));
-        }
-    }
-    out
-}
-
 /// 已经被 llama.cpp 淘汰的 preset 键：写回时**直接丢掉**（不做等价转换）。
 ///
 /// 留着的代价是**整个 router 起不来**，而不是只有那一段失效：
@@ -1090,7 +1009,7 @@ pub const RETIRED_PRESET_KEYS: &[&str] = &["no-mmap"];
 //   { "<模型名>": { "configs": { "<配置名>": { "cmd": "--ctx-size 4096 ...",
 //                                            "extraParams": "--pooling cls" } },
 //                   "selectedConfig": "<配置名>" } }
-// 这里把它翻译成 presets.ini 段里的 `键 = 值`。hub 的 cmd 就是给 llama-server 的参数，
+// 这里把它翻译成配置里的 `键 = 值`。hub 的 cmd 就是给 llama-server 的参数，
 // 所以键名天然等于 llama.cpp 的选项名（去掉 `--`）。三点注意：
 // 1. `--port` / `--host` / `--model` / `--no-webui` 等由 router 与应用自己管理，必须丢掉；
 // 2. hub 对"可选值"参数用 `--spec-type_ngram-mod` 这种下划线写法（全库仅此一例），
@@ -1123,7 +1042,7 @@ struct HubEntry {
 #[derive(Debug, Default, Serialize)]
 pub struct HubImportReport {
     pub hub_path: String,
-    /// presets.ini 里的段总数
+    /// hub 里的模型总数
     pub total: usize,
     /// 在 hub 里找到配置并写入的段数
     pub matched: usize,

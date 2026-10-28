@@ -46,6 +46,11 @@ export interface ParamDef {
   order: number;
   sort: number;
   defaultEnabled: boolean;
+  /**
+   * 环境变量名：有这个字段的参数**不写 args**，而是写进 config 顶层 `env` 块
+   * （例如 Strata 的 `STRATA_PIN_BY_NEED`）。勾选时写入该变量名与取值，取消勾选时删掉。
+   */
+  env?: string;
 }
 
 export interface ParamGroupDef {

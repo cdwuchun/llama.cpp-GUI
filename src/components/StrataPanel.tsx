@@ -17,7 +17,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useApp } from "../store";
 import { ipc } from "../ipc";
-import type { StrataModelEntry } from "../types";
+import type { StrataLaunchPreset, StrataModelEntry, StrataTuneApplyRecord, StrataTuneSnapshot } from "../types";
 import { ParamForm } from "./ParamForm";
 import type { ParamState } from "../utils/paramSchema";
 import {
@@ -54,21 +54,18 @@ function saveScrollTop(key: string, top: number) {
 }
 
 const basename = (p: string) => p.split(/[\\/]/).pop() || p;
+
 /** IPC 一律用文件名（Rust 侧按 file_name 匹配 config） */
 const fileOf = (e: StrataModelEntry) => basename(e.config_path);
+
 const nameOf = (e: StrataModelEntry) => e.model_name || fileOf(e);
 
-/** 只读信息卡 */
-function InfoCard({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
-  return (
-    <div className="info-card">
-      <div className="info-card-label">{label}</div>
-      <div className={`info-card-value ${mono ? "mono" : ""}`}>{value}</div>
-    </div>
-  );
+/** 一张 config 卡片（对应模型列表的 ModelCard） */
+/** 目录比较：统一斜杠、去尾部反斜杠、忽略大小写（Windows 路径）。 */
+function normFolder(path: string): string {
+  return path.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
 }
 
-/** 一张 config 卡片（对应模型列表的 ModelCard） */
 function ConfigCard({
   entry,
   isFavourite,
@@ -83,8 +80,10 @@ function ConfigCard({
   onToggleFavourite,
   onToggle,
   onWebui,
+  onTune,
   onConfigure,
-  onDetail,
+
+  launchPreset,
 }: {
   entry: StrataModelEntry;
   isFavourite: boolean;
@@ -102,8 +101,11 @@ function ConfigCard({
   onToggleFavourite: () => void;
   onToggle: () => void;
   onWebui: () => void;
+  onTune: () => void;
   onConfigure: () => void;
-  onDetail: () => void;
+
+  /** 这份模型的 launch 预设：有就按它生成运行配置再启动（与 `strata launch` 一致） */
+  launchPreset: StrataLaunchPreset | null;
 }) {
   const name = nameOf(entry);
   const file = fileOf(entry);
@@ -139,9 +141,17 @@ function ConfigCard({
       ? "模型自带 MTP 草稿头（config 已装 --mtp 权重），但 MTP 验证窗口 --spec=0，当前未启用投机解码"
       : `模型自带 MTP 草稿头（config 已装 --mtp 权重），MTP 验证窗口 --spec=${entry.spec ?? "未设（引擎默认）"}`
     : undefined;
-  const hasBadges = entry.vision || entry.mtp || !entry.engine_exists || !!entry.kv_resident;
+  const hasBadges = entry.vision || entry.mtp || !entry.engine_exists || !!entry.kv_resident || !!launchPreset;
+  // launch 预设（用户 m02055）：启动时不直接用 install 那份 config，而是先按预设
+  // 重新生成 `launch\<file>.json` —— 端口、context、kv、视觉、卡、extra 环境变量都按预设。
+  const launchTitle = launchPreset
+    ? `启动前会按 launch 预设「${launchPreset.name}」重新生成 launch\\${launchPreset.file}.json：` +
+      `端口 ${launchPreset.port}、context ${launchPreset.context ?? "默认"}、kv ${launchPreset.kv ?? "默认"}` +
+      `${launchPreset.vision ? `、视觉 ${launchPreset.vision}` : ""}，与 strata launch 起出来的一致`
+    : undefined;
   const badges = (
     <span className="mc-badges">
+      {launchPreset && <span title={launchTitle}>launch 预设</span>}
       {entry.vision && <span>视觉</span>}
       {entry.mtp && (
         <span title={mtpTitle} className={mtpDisabled ? "mc-badge-muted" : undefined}>
@@ -228,7 +238,7 @@ function ConfigCard({
       >
         <i className={`fas ${isRunning ? "fa-stop" : "fa-play"}`} />
       </button>
-      {isRunning && (
+      {isRunning ? (
         <button
           type="button"
           className="btn-icon"
@@ -237,12 +247,18 @@ function ConfigCard({
         >
           <i className="fas fa-external-link-alt" />
         </button>
-      )}
+      ) : null}
       <button type="button" className="btn-icon" title="参数配置" onClick={onConfigure}>
         <i className="fas fa-sliders" />
       </button>
-      <button type="button" className="btn-icon" title="详情 / config 原文" onClick={onDetail}>
-        <i className="fas fa-info-circle" />
+      <button
+        type="button"
+        className="btn-icon"
+        disabled={busy}
+        title="参数调优：用官方 strata tune 反复实测吞吐，把最快的那组参数直接写进 config（记录留在 Strata 目录的 tune-records 下，重启模型生效）"
+        onClick={onTune}
+      >
+        <i className="fas fa-wand-magic-sparkles" />
       </button>
     </div>
   );
@@ -276,13 +292,21 @@ function ConfigCard({
 }
 
 /** 参数配置 Sheet：双栏 + 写回 config 的 args（对应模型列表的 ConfigSheet） */
-function StrataConfigSheet({ entry, onClose }: { entry: StrataModelEntry; onClose: () => void }) {
+function StrataConfigSheet({
+  entry,
+  onClose,
+  launchPreset,
+}: {
+  entry: StrataModelEntry;
+  onClose: () => void;
+  /** 这份模型的 launch 预设：启动会按它生成 `launch\<file>.json`（端口/context/kv/视觉会被覆盖） */
+  launchPreset?: StrataLaunchPreset | null;
+}) {
   const busy = useApp((s) => s.busy);
   const status = useApp((s) => s.strataStatus);
   const startStrata = useApp((s) => s.startStrata);
   const stopStrata = useApp((s) => s.stopStrata);
   const writeStrataConfig = useApp((s) => s.writeStrataConfig);
-  const strataRoot = useApp((s) => s.settings?.strata_root ?? null);
   /** 真实引擎可执行文件（用户 m02686：config 落盘直接写它，不留 `component:` 引用）。
    *  后端解析成功时 `engine` 才是绝对路径，解析失败会原样保留引用字符串。 */
   const engineExe =
@@ -399,7 +423,7 @@ function StrataConfigSheet({ entry, onClose }: { entry: StrataModelEntry; onClos
     // args 只改参数表认识的 flag（顺序不变、未收录的原样保留）；
     // 顶层只写 vision.mmproj / vision.model / vision.exe / vision.gpu / vision.max_tokens / open_browser
     // 以及 sampling.{temperature,top_p,top_k,min_p}，其余顶层键不动（R6）
-    const next = stateToConfig(formConfig, formState, strataRoot, engineExe);
+    const next = stateToConfig(formConfig, formState, engineExe);
     const ok = await writeStrataConfig(file, JSON.stringify(next, null, 1));
     setFormError(ok ? "" : "写回 config 失败，见右上角错误");
     // 写盘成功就把基线挪到当前表单，否则之后点「取消」还要被问一次
@@ -416,7 +440,7 @@ function StrataConfigSheet({ entry, onClose }: { entry: StrataModelEntry; onClos
   const onFormChange = (next: Record<string, ParamState>) => {
     setFormState(next);
     if (!formConfig) return;
-    setRawText(JSON.stringify(stateToConfig(formConfig, next, strataRoot, engineExe), null, 1));
+    setRawText(JSON.stringify(stateToConfig(formConfig, next, engineExe), null, 1));
     setRawError("");
   };
 
@@ -465,7 +489,7 @@ function StrataConfigSheet({ entry, onClose }: { entry: StrataModelEntry; onClos
 
   const right = (
     <div>
-      <ParamForm
+<ParamForm
         state={formState}
         onChange={onFormChange}
         schema={strataParamSchema}
@@ -540,6 +564,24 @@ function StrataConfigSheet({ entry, onClose }: { entry: StrataModelEntry; onClos
             {formError}
           </div>
         )}
+        {launchPreset && (
+          <div className="notice">
+            <i className="fas fa-rocket" />
+            <div>
+              <div>
+                <strong>启动按 launch 预设「{launchPreset.name}」生成配置</strong>
+              </div>
+              <div>
+                启动前会用官方 <code>strata launch</code> 的同一套逻辑重新生成
+                <code> launch\{launchPreset.file}.json</code> 再起引擎：端口 {launchPreset.port}
+                （本页改的端口会被它覆盖）、context {launchPreset.context ?? "默认"}、kv{" "}
+                {launchPreset.kv ?? "默认"}
+                {launchPreset.vision ? `、视觉 ${launchPreset.vision}` : ""}；模型与引擎参数沿用这份
+                config。
+              </div>
+            </div>
+          </div>
+        )}
         <div className="load-model-layout" data-mobile-tab={mobileTab}>
           <div className="load-model-mobile-tabs">
             <button
@@ -575,96 +617,232 @@ function StrataConfigSheet({ entry, onClose }: { entry: StrataModelEntry; onClos
 }
 
 /** 详情 Sheet：运行状态 + config 原文（**只读**，用户 m01689；要改参数走「配置」弹层） */
-function StrataDetailSheet({ entry, onClose }: { entry: StrataModelEntry; onClose: () => void }) {
-  const status = useApp((s) => s.strataStatus);
-
+/**
+ * 「参数调优」Sheet（用户 m01357）。
+ *
+ * 跑的是官方 `strata tune auto`：它自己起引擎、逐组改参数实测吞吐，把赢的那组写进
+ * **预设**（`%APPDATA%\Strata\presets\*.json`），不改 config；下次启动时由
+ * `serve\server.py` 的 `apply_saved_tuning` 叠加生效（在这里点「启动」也一样）。
+ */
+function StrataTuneSheet({ entry, onClose }: { entry: StrataModelEntry; onClose: () => void }) {
+  const [mode, setMode] = useState("quick");
+  const [snap, setSnap] = useState<StrataTuneSnapshot | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  // 用户自己点了「停止」：硬杀后子进程退出码非 0，界面要说「已停止」而不是「失败」
+  const [stopped, setStopped] = useState(false);
+  /** 上一次调优写进 config 的记录（用户 m01543：调优完自动落盘，打开面板能回看） */
+  const [record, setRecord] = useState<StrataTuneApplyRecord | null>(null);
+  const [applying, setApplying] = useState(false);
+  const appliedRef = useRef(false);
+  const wasRunning = useRef(false);
   const file = fileOf(entry);
-  const running = !!status.running && !!status.config_path && basename(status.config_path) === file;
 
-  const [text, setText] = useState("");
-  const [error, setError] = useState("");
-
+  // 打开面板时读上次的记录（没有就显示「还没写过」）
   useEffect(() => {
-    let cancelled = false;
+    let alive = true;
     void (async () => {
       try {
-        const raw = await ipc.strataConfigRead(file);
-        if (cancelled) return;
-        const pretty = (() => {
-          try {
-            return JSON.stringify(JSON.parse(raw), null, 1);
-          } catch {
-            return raw;
-          }
-        })();
-        setText(pretty);
-        setError("");
-      } catch (e) {
-        if (!cancelled) setError(`${file} 读取失败：${String(e)}`);
+        const next = await ipc.strataTuneHistory(file);
+        if (alive) setRecord(next);
+      } catch {
+        /* 没有记录 */
       }
     })();
     return () => {
-      cancelled = true;
+      alive = false;
     };
   }, [file]);
 
+  // 每 1.5 秒读一次进度。后端在「没有任务」时返回 Err —— 忽略，当作未开始。
+  useEffect(() => {
+    let alive = true;
+    const tick = async () => {
+      let next: StrataTuneSnapshot;
+      try {
+        next = await ipc.strataTuneStatus(file);
+      } catch {
+        return; /* 没有正在进行的调优 */
+      }
+      if (!alive) return;
+      setSnap(next);
+      if (next.running) {
+        wasRunning.current = true;
+        return;
+      }
+      // 刚跑完：自动把这次调优生效的参数写进 config，并把记录留在 tune-records 下。
+      if (!wasRunning.current || appliedRef.current || next.state !== "done") return;
+      appliedRef.current = true;
+      setApplying(true);
+      try {
+        const applied = await ipc.strataTuneApply(file);
+        if (alive) setRecord(applied);
+      } catch (err) {
+        if (alive) setError(String(err));
+      } finally {
+        if (alive) setApplying(false);
+      }
+    };
+    void tick();
+    const id = window.setInterval(() => void tick(), 1500);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  }, [file]);
+
+  const running = snap?.running ?? false;
+
+  const start = async () => {
+    setBusy(true);
+    setError(null);
+    setStopped(false);
+    appliedRef.current = false;
+    wasRunning.current = false;
+    try {
+      await ipc.strataTuneStart(file, mode);
+      setSnap(await ipc.strataTuneStatus(file));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const stop = async () => {
+    try {
+      await ipc.strataTuneStop(file);
+      setStopped(true);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  // 结果只在结束后有：outcome = improved / default_confirmed / cancelled
+  const result = snap?.result ?? null;
+  const outcome = typeof result?.["outcome"] === "string" ? (result["outcome"] as string) : null;
+  const gain = typeof result?.["gain_pct"] === "number" ? (result["gain_pct"] as number) : null;
+  const preset = (result?.["preset"] ?? null) as { name?: string } | null;
+  const message = typeof result?.["message"] === "string" ? (result["message"] as string) : null;
+
   return (
     <Modal
-      domId="loadModelModal"
-      title={`详情 · ${nameOf(entry)}`}
-      icon={getModelIcon(nameOf(entry), file) ?? undefined}
+      domId="strata-tune-modal"
+      title={`参数调优 · ${nameOf(entry)}`}
+      iconClass="fas fa-wand-magic-sparkles"
       onClose={onClose}
-      bodyClass="model-detail"
+      bodyClass="strata-tune"
       footer={
-        <button type="button" className="btn btn-secondary btn-uniform" onClick={onClose}>
-          关闭
-        </button>
+        <>
+          {running ? (
+            <button type="button" className="btn btn-secondary btn-uniform" onClick={() => void stop()}>
+              <i className="fas fa-stop" /> 停止调优
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn btn-primary btn-uniform"
+              disabled={busy}
+              onClick={() => void start()}
+            >
+              <i className={`fas ${busy ? "fa-spinner fa-spin" : "fa-play"}`} /> 开始调优
+            </button>
+          )}
+          <button type="button" className="btn btn-secondary btn-uniform" onClick={onClose}>
+            关闭
+          </button>
+        </>
       }
     >
-      <div>
-        <div className="form-group">
-          <label className="form-label">运行状态</label>
-          <div className="grid2">
-            <InfoCard label="进程" value={running ? `运行中 · pid ${status.pid ?? "?"}` : "已停止"} />
-            <InfoCard label="引擎版本" value={running && status.version ? status.version : "未运行（启动后从 /props 读）"} />
-            <InfoCard
-              label="生效上下文"
-              value={running && status.live_max_context != null ? String(status.live_max_context) : "未知"}
-            />
-            <InfoCard
-              label="prompt / 输出上限"
-              value={
-                running && status.prompt_tokens != null
-                  ? `${status.prompt_tokens} / ${status.max_tokens ?? "?"}`
-                  : "未知"
-              }
-            />
-          </div>
-          {running && status.busy && (
-            <small className="form-text">队列忙（单序列 FIFO）：Strata 只有一个 slot，请求排队执行。</small>
-          )}
-        </div>
-
-        <div className="form-group">
-          <label className="form-label">config 原文（{file}）</label>
-          {error && (
-            <div className="form-group text-danger">
-              {error}
-            </div>
-          )}
-          <textarea
-            className="form-control mono"
-            rows={16}
-            spellCheck={false}
-            readOnly
-            value={text}
-          />
-          <small className="form-text">
-            只读展示（用户 m01689）。要改参数请点这张卡片的「配置」：那边左栏是同一份 config 原文，
-            右栏是参数表单，两边互相映射、在那改名或改值都可以。
-          </small>
-        </div>
+      <div className="form-group">
+        <label className="form-label">调优方式</label>
+        <select
+          className="form-control"
+          value={mode}
+          disabled={running || busy}
+          onChange={(e) => setMode(e.currentTarget.value)}
+        >
+          <option value="quick">快速：约 20 分钟，只试几组常用参数</option>
+          <option value="thorough">彻底：最长约 2 小时，穷举更多组合（本机 IQ3 那次跑了约 80 分钟）</option>
+        </select>
+        <small className="form-text">
+          调优要独占显存（反复起引擎加载模型）：Strata 正在运行时会被拦下，得先停止。
+          跑完会把这次生效的参数直接写进 config（新增 / 删除了哪些记在 Strata 目录的
+          <code>tune-records</code> 下），重启这个模型后生效。
+        </small>
       </div>
+
+      {error && <div className="form-group text-danger">{error}</div>}
+
+      <div className="form-group">
+        <label className="form-label">进度</label>
+        {running ? (
+          <div className="form-text">
+            <i className="fas fa-spinner fa-spin" /> {snap?.message || snap?.text || "运行中"}
+            {snap?.stage ? `（${snap.stage}）` : ""}
+            {snap?.minutes_left != null ? `，预计还剩约 ${snap.minutes_left} 分钟` : ""}
+          </div>
+        ) : snap ? (
+          <div className="form-text">
+            {stopped ? (
+              <>已停止（没有写预设）。</>
+            ) : snap.state === "exited" || (snap.exit_code != null && snap.exit_code !== 0) ? (
+              <>
+                失败（退出码 {snap.exit_code ?? "?"}）
+                {snap.log_tail.length > 0 ? `：${snap.log_tail[snap.log_tail.length - 1]}` : ""}
+              </>
+            ) : outcome === "improved" ? (
+              <>
+                完成：比默认快 <b>{gain != null ? `${gain.toFixed(1)}%` : "若干"}</b>
+                {preset?.name ? `，已存为预设「${preset.name}」` : ""}。重启这个模型后生效。
+              </>
+            ) : outcome === "default_confirmed" ? (
+              <>完成：默认参数已经是最快，没有改动。</>
+            ) : outcome === "cancelled" ? (
+              <>已取消（没有写预设）。</>
+            ) : (
+              <>完成：{message ?? "结果见 Strata 日志"}</>
+            )}
+          </div>
+        ) : (
+          <div className="form-text">还没开始。</div>
+        )}
+      </div>
+
+      {(applying || record) && (
+        <div className="form-group">
+          <label className="form-label">写入 config 的记录</label>
+          {applying ? (
+            <div className="form-text">
+              <i className="fas fa-spinner fa-spin" /> 正在把这次调优生效的参数写进 config…
+            </div>
+          ) : (
+            record && (
+              <>
+                <div className="form-text">
+                  {record.message}
+                  {record.preset ? `（预设「${record.preset}」）` : ""}
+                  {record.atMs > 0 ? ` · ${new Date(record.atMs).toLocaleString("zh-CN")}` : ""}
+                </div>
+                {(record.added.length > 0 || record.removed.length > 0) && (
+                  <ul className="form-text">
+                    {record.added.map((item) => (
+                      <li key={`add-${item}`}>
+                        新增 <code>{item}</code>
+                      </li>
+                    ))}
+                    {record.removed.map((item) => (
+                      <li key={`del-${item}`}>
+                        删除 <code>{item}</code>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </>
+            )
+          )}
+        </div>
+      )}
     </Modal>
   );
 }
@@ -701,7 +879,30 @@ export function StrataPanel({
   // 筛选与排序按通道换值域，所以那边各存一份。
   const { query, filter, sortKey, pinned, grid } = tools;
   const [configFile, setConfigFile] = useState<string | null>(null);
-  const [detailFile, setDetailFile] = useState<string | null>(null);
+
+  // 参数调优的 Sheet：存的是 config 文件名（与 configFile 同一套键）
+  const [tuneFile, setTuneFile] = useState<string | null>(null);
+
+  // launch 预设（用户 m02055）：`%APPDATA%\Strata\launch-presets\*.json` 里按 model_path 认领。
+  // 有预设的模型，启动时后端会先按预设重新生成 `launch\<file>.json` 再用它起 serve。
+  const [launchPresets, setLaunchPresets] = useState<StrataLaunchPreset[]>([]);
+  useEffect(() => {
+    let alive = true;
+    void ipc
+      .strataLaunchPresets()
+      .then((list) => {
+        if (alive) setLaunchPresets(list);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [entries.length]);
+  const presetOf = (entry: StrataModelEntry): StrataLaunchPreset | null => {
+    const folder = normFolder(entry.model_path ?? "");
+    if (!folder) return null;
+    return launchPresets.find((preset) => normFolder(preset.model_path) === folder) ?? null;
+  };
 
   // 「在跑的是哪份 config」：优先按 config_path 认（GUI 槽位与探测都能给出），拿不到时
   // 退回按 `/health` 报的模型名认。引擎从启动到端口监听之间探测不到，单看 `running`
@@ -772,31 +973,37 @@ export function StrataPanel({
 
 
   const configEntry = entries.find((e) => fileOf(e) === configFile) ?? null;
-  const detailEntry = entries.find((e) => fileOf(e) === detailFile) ?? null;
+
+  const tuneEntry = entries.find((e) => fileOf(e) === tuneFile) ?? null;
+
+  /**
+   * WebUI 按钮：引擎没在跑时不显示（用户 m01795 要求取消常显）。
+   *
+   * WebUI 是**引擎进程自己**在它的端口上提供的页面，所以打开的是这张卡片的端口
+   * （`status.port` 优先：端口被占用时后端会换一个）。
+   */
+  const openWebui = useCallback(
+    (entry: StrataModelEntry) => {
+      void ipc.openLocalUrl(`http://127.0.0.1:${status.port || entry.port}/`);
+    },
+    [status.port],
+  );
 
   return (
     <>
       <div className="content-scrollable">
         <div className="model-list-container">
           <div id="modelsList" className={grid ? "grid-view" : undefined}>
-            {!settings?.strata_root ? (
+            {entries.length === 0 ? (
               <div className="empty-state">
                 <div className="empty-state-icon">
                   <i className="fas fa-brain" />
                 </div>
-                <div className="empty-state-title">还没有设置 Strata 目录</div>
+                <div className="empty-state-title">没有找到 Strata 模型</div>
                 <div className="empty-state-text">
-                  到「设置 → 目录」里填 Strata 安装目录（其下含 serve\server.py 与 strata-*.json），保存后回到本页点刷新。
-                </div>
-              </div>
-            ) : entries.length === 0 ? (
-              <div className="empty-state">
-                <div className="empty-state-icon">
-                  <i className="fas fa-box-open" />
-                </div>
-                <div className="empty-state-title">这个目录下没有 strata-*.json</div>
-                <div className="empty-state-text">
-                  在 Strata 目录跑 <code>python setup.py</code> 装一个模型后，回本页点刷新。
+                  {settings?.strata_root
+                    ? `${settings.strata_root} 下没有 strata-*.json。用 Strata 官方脚本装好模型后回到本页点刷新。`
+                    : "还没指定 Strata 目录 —— 到「设置 → 通用 → Strata 目录」填上 Strata 的安装位置（没有默认路径），再回本页点刷新。"}
                 </div>
               </div>
             ) : shown.length === 0 ? (
@@ -839,15 +1046,15 @@ export function StrataPanel({
                   // `entry.port`，不能用「当前在跑引擎的端口」：前者保证打开的就是这张卡片的模型，
                   // 后者在代理背后切换引擎时会开成**另一个模型**的页面（用户 m02028「About 里的
                   // 模型不对」就是这么来的：那次开出来的是当时在跑的 sc117 的页面）。
-                  onWebui={() => void ipc.openLocalUrl(`http://127.0.0.1:${e.port}/`)}
+                  onWebui={() => void openWebui(e)}
+                  onTune={() => {
+                    setConfigFile(null);
+                    setTuneFile(fileOf(e));
+                  }}
                   onConfigure={() => {
-                    setDetailFile(null);
                     setConfigFile(fileOf(e));
                   }}
-                  onDetail={() => {
-                    setConfigFile(null);
-                    setDetailFile(fileOf(e));
-                  }}
+                  launchPreset={presetOf(e)}
                 />
               ))
             )}
@@ -858,17 +1065,19 @@ export function StrataPanel({
       {configEntry && (
         <StrataConfigSheet
           entry={configEntry}
+          launchPreset={presetOf(configEntry)}
           onClose={() => {
             setConfigFile(null);
             void refreshStrata();
           }}
         />
       )}
-      {detailEntry && (
-        <StrataDetailSheet
-          entry={detailEntry}
+      {tuneEntry && (
+        <StrataTuneSheet
+          entry={tuneEntry}
           onClose={() => {
-            setDetailFile(null);
+            setTuneFile(null);
+            // 调优只写预设，不碰 config；刷新一次是为了让卡片上的「已装预设」类提示（若有）跟上
             void refreshStrata();
           }}
         />

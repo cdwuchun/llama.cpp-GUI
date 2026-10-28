@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { createPortal } from "react-dom";
 
 import { useApp } from "../store";
 import { boolText, paramSchema, type ParamDef, type ParamSchema, type ParamState } from "../utils/paramSchema";
+import { splitOptionText } from "../utils/paramOptionText";
 import { Modal } from "./Sheet";
 
 /** 路径候选（下拉里的一行） */
@@ -10,6 +12,12 @@ type PathOption = { value: string; label: string };
 /** 值是「跑在哪张卡上」的参数：候选来自当前枚举到的设备（外加 `none`） */
 const DEVICE_PARAMS = new Set(["mmproj-device", "spec-draft-device"]);
 
+/** 菜单的自然高度上限（超出就在菜单里滚），与 CSS `.ctx-cb-menu` 的 max-height 对齐 */
+const CTX_MENU_MAX_HEIGHT = 220;
+/** 菜单距输入框、距视口边缘的留白 */
+const CTX_MENU_GAP = 6;
+const CTX_MENU_VIEWPORT = 8;
+
 /**
  * 带下拉菜单的输入框 —— 照 hub 旧版的 `.ctx-cb-*` 实现。
  *
@@ -17,6 +25,14 @@ const DEVICE_PARAMS = new Set(["mmproj-device", "spec-draft-device"]);
  * 用户根本不知道有候选可点，看起来就是个普通输入框。hub 的做法是自绘下拉：
  * 输入框右侧一个 `▾` 按钮，展开后每项左边是名字、右边是取值（`8K` / `8192`）。
  * 输入框仍然可以直接打字 —— 常用档位只是方便，不把用户锁死在枚举里。
+ *
+ * 菜单为什么挂到 `document.body`（Strata 配置弹窗里上下文 / KV 量化的最后一条点不到）：
+ * 参数弹窗的裁剪容器有三层 —— `#loadModelModal .param-group`（overflow:hidden）、
+ * `#dynamicParamsContainer`（overflow-y:auto）、`.right-param-area`（overflow:hidden）。
+ * 菜单原来是绝对定位的 `.ctx-cb-menu`，一旦超出分组下边界就被裁掉；而绝对定位元素不参与
+ * 父容器滚动高度，外层再怎么滚也露不出来。改成 portal + `position:fixed` 后它脱离所有
+ * 裁剪容器，位置按锚点与视口空间算：下方装得下就向下、装不下且上方更宽裕就向上翻，
+ * 高度封在可用空间内（仍不超过 220px，超出时菜单自己滚）。
  */
 function DropdownInput({
   id,
@@ -34,24 +50,71 @@ function DropdownInput({
   onChange: (next: ParamState) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [position, setPosition] = useState<CSSProperties>({});
   const boxRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
 
-  // 点别处或按 Esc 关掉菜单
+  const place = () => {
+    const rect = boxRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const width = Math.max(160, Math.min(rect.width, window.innerWidth - CTX_MENU_VIEWPORT * 2));
+    const left = Math.max(
+      CTX_MENU_VIEWPORT,
+      Math.min(rect.left, window.innerWidth - width - CTX_MENU_VIEWPORT),
+    );
+    // 每项约 38px（上下内边距各 9px + 一行文字）：只用来判断该往上还是往下，实际高度由 maxHeight 兜
+    const natural = Math.min(CTX_MENU_MAX_HEIGHT, options.length * 38 + 2);
+    const below = window.innerHeight - rect.bottom - CTX_MENU_GAP - CTX_MENU_VIEWPORT;
+    const above = rect.top - CTX_MENU_GAP - CTX_MENU_VIEWPORT;
+    const up = below < Math.min(natural, 140) && above > below;
+    setPosition(
+      up
+        ? {
+            left,
+            width,
+            bottom: window.innerHeight - rect.top + CTX_MENU_GAP,
+            maxHeight: Math.max(96, Math.min(natural, above)),
+          }
+        : {
+            left,
+            width,
+            top: rect.bottom + CTX_MENU_GAP,
+            maxHeight: Math.max(96, Math.min(natural, below)),
+          },
+    );
+  };
+
+  // 点别处 / 按 Esc 关掉菜单；菜单是 fixed 的，外层滚动或窗口尺寸变了要重新贴回锚点
   useEffect(() => {
     if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (!boxRef.current?.contains(e.target as Node)) setOpen(false);
+    const outside = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (boxRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+      setOpen(false);
     };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
+    const keys = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setOpen(false);
+      }
     };
-    document.addEventListener("mousedown", onDown);
-    document.addEventListener("keydown", onKey);
+    const reposition = () => place();
+    document.addEventListener("pointerdown", outside);
+    document.addEventListener("keydown", keys);
+    window.addEventListener("resize", reposition);
+    window.addEventListener("scroll", reposition, true);
     return () => {
-      document.removeEventListener("mousedown", onDown);
-      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("pointerdown", outside);
+      document.removeEventListener("keydown", keys);
+      window.removeEventListener("resize", reposition);
+      window.removeEventListener("scroll", reposition, true);
     };
-  }, [open]);
+  }, [open, options.length]);
+
+  const pick = (value: string) => {
+    onChange({ ...state, value });
+    setOpen(false);
+  };
 
   return (
     <div className="ctx-cb" ref={boxRef}>
@@ -69,26 +132,37 @@ function DropdownInput({
           className="ctx-cb-btn"
           tabIndex={-1}
           title="选择预设"
-          onClick={() => setOpen((v) => !v)}
+          onClick={() => {
+            // 先量位置再打开：useEffect 在首帧之后才跑，不先算会看到菜单闪一下左上角
+            if (!open) place();
+            setOpen((v) => !v);
+          }}
         >
           ▾
         </button>
       </div>
-      <div className={`ctx-cb-menu ${open ? "open" : ""}`}>
-        {options.map((o) => (
-          <div
-            key={o.value}
-            className="ctx-cb-opt"
-            onClick={() => {
-              onChange({ ...state, value: o.value });
-              setOpen(false);
-            }}
-          >
-            <span className="ctx-cb-opt-label">{o.label}</span>
-            <span className="ctx-cb-opt-val">{o.value}</span>
-          </div>
-        ))}
-      </div>
+      {open &&
+        createPortal(
+          <div className="ctx-cb-menu open is-portal" ref={menuRef} style={position}>
+            {options.map((o) => {
+              // label 里的括注挪到右边当小字：左栏只剩名字（int8），右栏写解释（省一半显存）
+              const { name, sub } = splitOptionText(o.label, o.value);
+              return (
+                <div key={o.value} className="ctx-cb-opt" onClick={() => pick(o.value)}>
+                  <span className="ctx-cb-opt-label" title={o.label}>
+                    {name}
+                  </span>
+                  {sub && (
+                    <span className="ctx-cb-opt-val" title={sub}>
+                      {sub}
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }

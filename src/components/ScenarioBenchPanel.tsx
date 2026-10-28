@@ -67,7 +67,6 @@ export function ScenarioBenchPanel() {
   const bench = useApp((s) => s.scenarioBench);
   const run = useApp((s) => s.runScenarioBench);
   const cancel = useApp((s) => s.cancelScenarioBench);
-  const clear = useApp((s) => s.clearScenarioBench);
   const select = useApp((s) => s.selectScenarioBench);
   const setNotice = useApp((s) => s.setNotice);
 
@@ -574,14 +573,6 @@ export function ScenarioBenchPanel() {
                 )}
               </div>
             )}
-            <button
-              type="button"
-              className="st-btn st-btn--secondary bench-clear"
-              disabled={bench.running || !selected}
-              onClick={() => clear(selected?.id)}
-            >
-              清除记录
-            </button>
           </div>
         </div>
 

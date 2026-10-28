@@ -15,7 +15,13 @@ mod search;
 mod settings;
 mod state;
 mod strata;
+mod strata_community;
+mod strata_download;
+mod strata_orca;
+mod strata_launch;
 mod strata_proxy;
+mod strata_tune;
+mod strata_upgrade;
 mod tray;
 mod tray_icon;
 mod versions;
@@ -71,9 +77,15 @@ fn settings_get(state: State<'_, AppState>) -> Settings {
 fn settings_set(state: State<'_, AppState>, patch: SettingsPatch) -> Settings {
     // 「同时加载模型上限」要**保存当时**就生效，不能等下一次加载新模型才判定（用户 m06652）。
     let cap_changed = patch.models_max.is_some();
+    // Strata 根目录 / 控制器版本：保存后立刻让全局解析切过去，否则本次运行仍读旧位置。
+    let strata_moved = patch.strata_root.is_some() || patch.strata_controller.is_some();
     let next = state.settings.patch(patch);
     if cap_changed {
         crate::scheduler::enforce_capacity(&state);
+    }
+    if strata_moved {
+        strata::configure_root(next.strata_root.clone());
+        strata::configure_controller(next.strata_controller.clone());
     }
     next
 }
@@ -196,12 +208,9 @@ fn find_strata_entry(
     state: &AppState,
     config_file: &str,
 ) -> Result<strata::StrataModelEntry, String> {
-    let root = state
-        .settings
-        .get()
-        .strata_root
-        .clone()
-        .ok_or_else(|| "尚未设置 Strata 目录".to_string())?;
+    let root = strata::root()
+        .filter(|root| root.is_dir())
+        .ok_or_else(|| "未找到 Strata 目录（设置 → 通用 → Strata 目录 可指定）".to_string())?;
     // 设置页选定的引擎版本是权威（用户 m04069）：扫到的每份 config 都按它显示，
     // 不一致时顺手把 config 的 exe 改回来。
     let preferred =
@@ -261,12 +270,10 @@ fn strata_status(state: State<'_, AppState>) -> strata::StrataStatus {
 /// 重复扫的冤枉开销。用户手速再快也不会每秒点刷新，这一次全量扫可以接受。
 #[tauri::command]
 async fn strata_scan(state: State<'_, AppState>) -> Result<Vec<strata::StrataModelEntry>, String> {
-    let Some(root) = state.settings.get().strata_root.clone() else {
+    // 根目录固定为官方安装位置（用户 m00732），不再读 settings
+    let Some(root) = strata::root().filter(|root| root.is_dir()) else {
         return Ok(Vec::new());
     };
-    if !root.is_dir() {
-        return Err(format!("Strata 目录不存在: {}", root.display()));
-    }
     let preferred = strata::preferred_engine(state.settings.get().strata_engine.as_deref());
     // 没写端口的 config 先补一个（用户 m05322：与 llama.cpp 侧同一套分配规则，9091 起）
     let fixed = strata::ensure_ports(&root);
@@ -280,39 +287,31 @@ async fn strata_scan(state: State<'_, AppState>) -> Result<Vec<strata::StrataMod
     Ok(entries)
 }
 
-/// 列出安装目录下所有可用的引擎组件（可能多版本并存），供面板选择。
+/// 列出官方安装目录下所有可用的引擎组件（可能多版本并存），供面板选择。
 #[tauri::command]
 async fn strata_engines(
     state: State<'_, AppState>,
-    root: String,
 ) -> Result<Vec<strata::EngineInfo>, String> {
-    let root_path = std::path::PathBuf::from(&root);
+    let root_path = strata::root()
+        .filter(|root| root.is_dir())
+        .ok_or_else(|| "未找到 Strata 目录（设置 → 通用 → Strata 目录 可指定）".to_string())?;
     let list = strata::list_engines(&root_path);
-    // 设置里记的引擎有两个失效场景，都要自动对齐，但**动的范围不同**：
-    // - 引擎目录被升级替换（用户 m04254：`engine-bundle` → `engine`，0.1.46 → 0.1.47）：
-    //   `settings.strata_engine` 指向的文件没了 → 落到列表最新的那台，并把各 config 的 `exe`
-    //   也一起对齐（config 里可能还写着那个已经消失的旧路径）。
-    // - 列表里只有一个版本（用户 m04430）：它必须是选中项，否则设置页一个都不勾，
-    //   看着像「没找到引擎」。这种情况**只更新 settings，不改 config** —— config 里写的可能是
-    //   `component:strata-engine` 组件引用（用户 2026-10-22 的会话），自动改写会把它降级成绝对路径。
+    // 设置里记的引擎有两种形态：
+    // - `component:strata-engine` 引用：本身就代表「跟着组件目录走最新」，**不做任何对齐**
+    //   （`is_file()` 必然为 false，不能当成「路径失效」，否则每次打开设置页都会把引用降级成
+    //   绝对路径，用户 m04934）。
+    // - 绝对路径：自动模式下**总是取最新版本**（用户 m00194）。老实现只在「记的路径已失效」时
+    //   才跟随，而升级后新旧版本是并存的 —— 旧路径一直有效，于是永远不跟，表格勾着旧引擎、
+    //   各 config 的 `exe` 也还指着旧目录。手动模式下完全尊重选择（他可以故意固定在旧版本）。
     let saved = state.settings.get().strata_engine.clone();
-    let saved_alive = saved
-        .as_deref()
-        .map(|path| std::path::Path::new(path).is_file())
-        .unwrap_or(false);
-    // 引用形态（`component:strata-engine`，设置页「自动使用最新版本」）**不做任何对齐**：
-    // 它本身就代表「跟着控制器组件目录走最新」，`is_file()` 必然为 false，不能当成「路径失效」，
-    // 否则每次打开设置页都会把引用降级成绝对路径（用户 m04934）。
     let saved_reference = saved
         .as_deref()
         .map(|path| path.starts_with("component:"))
         .unwrap_or(false);
-    let wanted = if saved_reference {
+    let wanted = if !state.settings.get().strata_auto_engine || saved_reference {
         None
-    } else if list.len() == 1 || (saved.is_some() && !saved_alive) {
-        list.first()
     } else {
-        None
+        list.first()
     };
     if let Some(wanted) = wanted {
         let exe = wanted.exe.to_string_lossy().to_string();
@@ -321,14 +320,11 @@ async fn strata_engines(
                 strata_engine: Some(Some(exe.clone())),
                 ..Default::default()
             });
-            let saved_gone = !saved_reference && saved.is_some() && !saved_alive;
-            if saved_gone {
-                let _ = strata::apply_engine(&root_path, &exe);
-                state.store_strata_scan(
-                    &root_path,
-                    &strata::scan_configs(&root_path, Some(&wanted.exe)),
-                );
-            }
+            let _ = strata::apply_engine(&root_path, &exe);
+            state.store_strata_scan(
+                &root_path,
+                &strata::scan_configs(&root_path, Some(&wanted.exe)),
+            );
         }
     }
     Ok(list)
@@ -336,8 +332,11 @@ async fn strata_engines(
 
 /// 把某份 config 的 `exe` 换成选定的那个引擎可执行文件。
 #[tauri::command]
-async fn strata_set_engine(root: String, config_file: String, exe: String) -> Result<(), String> {
-    strata::set_engine(std::path::Path::new(&root), &config_file, &exe)
+async fn strata_set_engine(config_file: String, exe: String) -> Result<(), String> {
+    let root = strata::root()
+        .filter(|root| root.is_dir())
+        .ok_or_else(|| "未找到 Strata 目录（设置 → 通用 → Strata 目录 可指定）".to_string())?;
+    strata::set_engine(&root, &config_file, &exe)
 }
 
 /// 把选定的引擎批量写进装配目录下的全部 config，返回被改过的文件名（设置页用）。
@@ -349,9 +348,9 @@ async fn strata_apply_engine(
     state: State<'_, AppState>,
     exe: String,
 ) -> Result<Vec<String>, String> {
-    let Some(root) = state.settings.get().strata_root.clone() else {
-        return Err("还没设置 Strata 安装目录".into());
-    };
+    let root = strata::root()
+        .filter(|root| root.is_dir())
+        .ok_or_else(|| "未找到 Strata 目录（设置 → 通用 → Strata 目录 可指定）".to_string())?;
     let changed = strata::apply_engine(&root, &exe)?;
     state.settings.patch(crate::settings::SettingsPatch {
         strata_engine: Some(Some(exe.clone())),
@@ -361,6 +360,86 @@ async fn strata_apply_engine(
     let preferred = strata::preferred_engine(Some(&exe));
     state.store_strata_scan(&root, &strata::scan_configs(&root, preferred.as_deref()));
     Ok(changed)
+}
+
+/// 列出 Strata 根目录下并存的控制器版本（设置页「Strata 控制器版本」表格用）。
+///
+/// 手动解压布局：`<根>\control\<版本>`；官方安装器布局：`<根>\terminal\<版本>`。
+///
+/// **默认选最新的可用版本**（用户 m00875）：没记过版本、或记的版本已经不在列表里，
+/// 就把最新版本写进设置并**顺手改写 bat / config**（表格里勾着谁，脚本就指着谁）。
+#[tauri::command]
+async fn strata_controllers(
+    state: State<'_, AppState>,
+) -> Result<Vec<strata::ControllerInfo>, String> {
+    let Some(root) = strata::root().filter(|root| root.is_dir()) else {
+        return Ok(Vec::new());
+    };
+    let list = strata::list_controllers(&root);
+    let saved = state.settings.get().strata_controller.clone();
+    let saved_alive = saved
+        .as_deref()
+        .map(|version| list.iter().any(|info| info.version == version))
+        .unwrap_or(false);
+    let auto = state.settings.get().strata_auto_controller;
+    // 自动跟随：**每次都落到最新可用版本**（用户 m00194）。老实现只在「没记过版本、或记的版本
+    // 已经不在列表里」时才跟随，可升级后新旧版本并存 —— 旧版本一直在列表里，于是永远不跟：
+    // 表格勾着旧控制器、`run-*.bat` 与 config 的 `cwd` 也还指着旧目录。
+    // 手动模式（auto 关）完全尊重选择：用户在表格里点哪个，下次进来还是哪个，哪怕它不是最新的。
+    let newest = list.iter().find(|info| info.usable);
+    if let Some(newest) = newest.filter(|_| auto) {
+        if saved.as_deref() != Some(newest.version.as_str()) {
+            // 写文件失败不该让整张表显示不出来：记下选择，错误交给 apply 的调用方（用户手点）去暴露。
+            let _ = strata::apply_controller(&root, &newest.version);
+            state.settings.patch(SettingsPatch {
+                strata_controller: Some(Some(newest.version.clone())),
+                ..Default::default()
+            });
+            strata::configure_controller(Some(newest.version.clone()));
+            let preferred = strata::preferred_engine(state.settings.get().strata_engine.as_deref());
+            state.store_strata_scan(&root, &strata::scan_configs(&root, preferred.as_deref()));
+        }
+    } else if auto && saved.is_some() && !saved_alive {
+        // 自动模式下记的版本已经不在了、又没有能用的可用版本：清掉失效的选择，别让前端勾一个不存在的版本。
+        state.settings.patch(SettingsPatch {
+            strata_controller: Some(None),
+            ..Default::default()
+        });
+        strata::configure_controller(None);
+    }
+    Ok(list)
+}
+
+/// 切换控制器版本：重写全部 `run-*.bat` 与 `strata-*.json` 的控制器相关参数，并记住选择。
+///
+/// 「控制器相关参数」= `run-*.bat` 里的解释器路径、`serve\server.py` 路径、`cd /d` 工作目录，
+/// 以及 config 的顶层 `cwd` 与 `args` 里指向控制器 `data\` 的 `--expert-profile`。
+/// 引擎参数（`exe`）不在这里动 —— 那是「Strata 引擎版本」卡片的事。
+#[tauri::command]
+async fn strata_apply_controller(
+    state: State<'_, AppState>,
+    version: String,
+) -> Result<strata::ApplyControllerResult, String> {
+    let root = strata::root()
+        .filter(|root| root.is_dir())
+        .ok_or_else(|| "尚未指定 Strata 目录（设置 → 通用 → Strata 目录）".to_string())?;
+    let result = strata::apply_controller(&root, &version)?;
+    let chosen = result.version.clone();
+    state.settings.patch(SettingsPatch {
+        strata_controller: Some(Some(chosen.clone())),
+        ..Default::default()
+    });
+    strata::configure_controller(Some(chosen));
+    // 各 config 的 cwd 已经变了，扫描缓存必须重来
+    let preferred = strata::preferred_engine(state.settings.get().strata_engine.as_deref());
+    state.store_strata_scan(&root, &strata::scan_configs(&root, preferred.as_deref()));
+    Ok(result)
+}
+
+/// 打开官方安装向导（加模型走它）：开一个新的控制台窗口，返回控制器目录。
+#[tauri::command]
+async fn strata_open_setup() -> Result<String, String> {
+    strata::open_setup()
 }
 
 /// 探测运行时状态（生效上下文、版本、加载状态、token 占用）。
@@ -537,15 +616,11 @@ async fn strata_probe(app: AppHandle, state: State<'_, AppState>) -> Result<stra
     Ok(snap)
 }
 
-/// `strata_probe` 用的根目录：没设或目录不存在时给一个空路径
+/// `strata_probe` 用的根目录：官方安装位置，没装时给一个空路径
 /// （`scan_configs` 读不到目录就返回空表）。
-fn strata_probe_root(state: &AppState) -> PathBuf {
-    state
-        .settings
-        .get()
-        .strata_root
-        .clone()
-        .filter(|r| r.is_dir())
+fn strata_probe_root(_state: &AppState) -> PathBuf {
+    strata::root()
+        .filter(|root| root.is_dir())
         .unwrap_or_default()
 }
 
@@ -681,6 +756,14 @@ pub(crate) fn strata_start_engine(
     config_file: Option<&str>,
 ) -> Result<strata::StrataStatus, String> {
     {
+        // 调优要独占显存：`strata tune auto` 自己起引擎加载模型，正在调优时再起引擎
+        // 只会两份权重抢同一张卡（tune 会以超时/加载失败收场），直接拦下更清楚。
+        let mut tunes = state.strata_tune.lock().unwrap_or_else(|e| e.into_inner());
+        if tunes.values_mut().any(|job| job.running()) {
+            return Err("参数调优正在进行（要独占显存），等它结束或先停止调优".into());
+        }
+    }
+    {
         let guard = state.strata_slot.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = guard.as_ref() {
             // 同端口互斥（用户 m00001）：一个引擎只服务一份 config，报错必须点名
@@ -704,7 +787,7 @@ pub(crate) fn strata_start_engine(
     let settings = state.settings.get();
     let wanted = config_file
         .or(settings.strata_selected_config.as_deref())
-        .ok_or_else(|| "尚未选择 Strata 模型（也没有设置 strata_root）".to_string())?;
+        .ok_or_else(|| "尚未选择 Strata 模型".to_string())?;
     let entry = find_strata_entry(state, wanted)?;
 
     // host / 端口 / 密钥全部来自 config（R2）：设置页「服务」分组是直接把这些值
@@ -776,18 +859,6 @@ async fn strata_stop(app: AppHandle, state: State<'_, AppState>) -> Result<strat
     Ok(status)
 }
 
-/// 记住 Strata 根目录（**GUI 侧唯一需要用户提供的路径**）。
-#[tauri::command]
-async fn strata_set_root(state: State<'_, AppState>, path: String) -> Result<settings::Settings, String> {
-    let trimmed = path.trim().to_string();
-    if !trimmed.is_empty() && !Path::new(&trimmed).is_dir() {
-        return Err(format!("目录不存在: {trimmed}"));
-    }
-    Ok(state.settings.update(|s| {
-        s.strata_root = (!trimmed.is_empty()).then(|| PathBuf::from(trimmed.clone()));
-    }))
-}
-
 /// 只记住选中的模型，不启动（前端下拉/卡片选中时用）。
 #[tauri::command]
 async fn strata_pick(state: State<'_, AppState>, config_file: String) -> Result<settings::Settings, String> {
@@ -814,11 +885,439 @@ async fn strata_config_write(
     find_strata_entry(&state, &config_file)
 }
 
+/// 卡片「参数调优」：对这份 config 跑官方 `strata tune auto`。
+///
+/// 调优要独占显存（它自己反复起引擎、加载模型），所以运行中的引擎会先被拦下；
+/// 反过来，调优在跑时 `strata_start_engine` 也不会放行。
+#[tauri::command]
+async fn strata_tune_start(
+    state: State<'_, AppState>,
+    config_file: String,
+    mode: String,
+) -> Result<(), String> {
+    let entry = find_strata_entry(&state, &config_file)?;
+    let engine_running = state
+        .strata_slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
+    if engine_running {
+        return Err("Strata 正在运行，先停止它再调优（调优要独占显存）".into());
+    }
+    let mut jobs = state.strata_tune.lock().unwrap_or_else(|e| e.into_inner());
+    // 先收尸：上一轮结束的任务留着只为让前端读到最终结果，再调优时清掉
+    jobs.retain(|_, job| job.running());
+    if !jobs.is_empty() {
+        return Err("已有调优在进行，等它结束或先停止".into());
+    }
+    let job = strata_tune::start(state.logs.clone(), &entry.config_path, &mode)?;
+    jobs.insert(config_file, job);
+    Ok(())
+}
+
+/// 读调优进度（前端每 1.5 秒轮询一次，直到 `running` 变 false）。
+#[tauri::command]
+async fn strata_tune_status(
+    state: State<'_, AppState>,
+    config_file: String,
+) -> Result<strata_tune::TuneSnapshot, String> {
+    let mut jobs = state.strata_tune.lock().unwrap_or_else(|e| e.into_inner());
+    let job = jobs
+        .get_mut(&config_file)
+        .ok_or_else(|| "没有正在进行的调优".to_string())?;
+    Ok(strata_tune::snapshot(job))
+}
+
+/// 停止调优（硬杀进程树；模型与配置都不会被改动）。
+#[tauri::command]
+async fn strata_tune_stop(state: State<'_, AppState>, config_file: String) -> Result<(), String> {
+    let mut jobs = state.strata_tune.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mut job) = jobs.remove(&config_file) {
+        strata_tune::stop(&mut job);
+    }
+    Ok(())
+}
+
+/// 把这次调优生效的参数写进 config，返回这次的记录（用户 m01543 第 3 条）。
+///
+/// 调优结果原本只活在前端预设里（引擎启动时才叠），这里让它落到 config 里，
+/// 并把「新增/删除了哪些参数」记进 `launch\<slug>.tune-applied.json`。
+#[tauri::command]
+async fn strata_tune_apply(
+    state: State<'_, AppState>,
+    config_file: String,
+) -> Result<strata_tune::TuneRecord, String> {
+    let entry = find_strata_entry(&state, &config_file)?;
+    tauri::async_runtime::spawn_blocking(move || strata_tune::apply_overlay(&entry.config_path))
+        .await
+        .map_err(|err| format!("应用调优结果失败：{err}"))?
+}
+
+/// 上一次调优写进 config 的记录（没有就返回 null，用户 m01543 第 3 条）。
+#[tauri::command]
+fn strata_tune_history(state: State<'_, AppState>, config_file: String) -> Option<strata_tune::TuneRecord> {
+    let entry = find_strata_entry(&state, &config_file).ok()?;
+    strata_tune::last_record(&entry.config_path)
+}
+
+/// 把设置页「服务」里的 API Key 写进全部 Strata config（用户 m01543 第 1 条）。
+///
+/// 空字符串 = 清掉（写 `null`，引擎就不要求鉴权）。
+#[tauri::command]
+async fn strata_set_api_key(api_key: String) -> Result<serde_json::Value, String> {
+    let root = strata::root().filter(|root| root.is_dir()).ok_or_else(|| {
+        "未找到 Strata 目录（设置 → 通用 → Strata 目录 可指定）".to_string()
+    })?;
+    let key = if api_key.trim().is_empty() {
+        None
+    } else {
+        Some(api_key.trim().to_string())
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let (written, failed) = strata::set_api_key_all(&root, key.as_deref());
+        serde_json::json!({ "written": written, "failed": failed })
+    })
+    .await
+    .map_err(|err| format!("写入 API Key 失败：{err}"))
+}
+
+/// 列 Strata 的 launch 预设（`%APPDATA%\Strata\launch-presets\*.json`）。
+#[tauri::command]
+fn strata_launch_presets() -> Vec<strata_launch::LaunchPreset> {
+    strata_launch::list()
+}
+
+/// 控制器跟踪的引擎版本（`strata components engine`）：设置页只读显示 + 回退按钮（用户 m02756 第 2 条）。
+///
+/// 版本由控制器决定，不在 GUI 里选，所以这里只读不写。
+#[tauri::command]
+async fn strata_engine_state() -> Result<strata::StrataEngineState, String> {
+    tauri::async_runtime::spawn_blocking(strata::engine_state)
+        .await
+        .map_err(|err| format!("读取引擎状态失败：{err}"))?
+        .map_err(|err| format!("{err:#}"))
+}
+
+/// 回退到上一版引擎（`strata components rollback`），返回给用户看的一句结果。
+#[tauri::command]
+async fn strata_engine_rollback() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(strata::rollback_engine)
+        .await
+        .map_err(|err| format!("回退引擎失败：{err}"))?
+        .map_err(|err| format!("{err:#}"))
+}
+
+/// 把设置页的 API Key 写进全部 launch 预设（用户 m02313：GUI 的 key 要存进预设）。
+#[tauri::command]
+async fn strata_sync_launch_keys(api_key: String) -> Result<usize, String> {
+    let root = strata::root().ok_or("找不到 Strata 安装根目录")?;
+    let terminal = strata_tune::terminal_dir(&root)
+        .ok_or_else(|| "未找到 Strata 控制端（<根>\\control\\<版本> 或 <根>\\terminal\\<版本>，缺 python\\python.exe）".to_string())?;
+    tauri::async_runtime::spawn_blocking(move || strata_launch::sync_keys(&terminal, &api_key))
+        .await
+        .map_err(|err| format!("写入 launch 预设失败：{err}"))?
+}
+
+/// 检查官网 feed 有没有新版本（只读，不下载），返回控制端的原始报告。
+#[tauri::command]
+async fn strata_upgrade_check() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(strata_upgrade::check)
+        .await
+        .map_err(|err| format!("升级检查失败：{err}"))?
+}
+
+/// 起一次升级（`scope` = `all` / `engine` / `control`）。
+///
+/// 先 `--check`：没有新版本就直接返回 `started: false`，不白拉几百 MB。
+#[tauri::command]
+async fn strata_upgrade_start(
+    state: State<'_, AppState>,
+    scope: String,
+) -> Result<serde_json::Value, String> {
+    let wanted = strata_upgrade::Scope::parse(&scope);
+    {
+        let mut slot = state
+            .strata_upgrade
+            .lock()
+            .map_err(|_| "升级状态锁不可用".to_string())?;
+        if let Some(job) = slot.as_mut() {
+            if job.running() {
+                return Err("已有升级任务在进行，请等它结束或先取消".into());
+            }
+        }
+        *slot = None;
+    }
+    let hub = state.logs.clone();
+    let (job, message) = tauri::async_runtime::spawn_blocking(move || {
+        strata_upgrade::start(hub, wanted)
+    })
+    .await
+    .map_err(|err| format!("启动升级失败：{err}"))??;
+    let started = job.is_some();
+    if job.is_some() {
+        let mut slot = state
+            .strata_upgrade
+            .lock()
+            .map_err(|_| "升级状态锁不可用".to_string())?;
+        *slot = job;
+    }
+    // 升级会换掉引擎/控制器目录，扫描缓存里存的是旧路径
+    *state
+        .strata_scan_cache
+        .lock()
+        .map_err(|_| "扫描缓存锁不可用".to_string())? = None;
+    Ok(serde_json::json!({ "started": started, "message": message }))
+}
+
+/// 升级进度（前端每秒轮询）。没有任务时返回 `running: false` 的空快照。
+#[tauri::command]
+fn strata_upgrade_status(
+    state: State<'_, AppState>,
+) -> Result<strata_upgrade::UpgradeSnapshot, String> {
+    let mut slot = state
+        .strata_upgrade
+        .lock()
+        .map_err(|_| "升级状态锁不可用".to_string())?;
+    match slot.as_mut() {
+        Some(job) => Ok(job.snapshot()),
+        None => Ok(strata_upgrade::UpgradeSnapshot {
+            running: false,
+            message: String::new(),
+            ..Default::default()
+        }),
+    }
+}
+
+/// 取消升级：连子进程树一起杀（解压 / 校验的半截子进程留着会继续写文件）。
+///
+/// 任务槽位**不清空**：快照里还留着「已取消升级」这条消息与前几十行输出，
+/// 前端下一次轮询才能拿到收尾状态；下次 `strata_upgrade_start` 会把它顶掉。
+#[tauri::command]
+fn strata_upgrade_stop(state: State<'_, AppState>) -> Result<(), String> {
+    let mut slot = state
+        .strata_upgrade
+        .lock()
+        .map_err(|_| "升级状态锁不可用".to_string())?;
+    if let Some(job) = slot.as_mut() {
+        strata_upgrade::stop(job);
+    }
+    Ok(())
+}
+
+/// 起一次「下载模型」：非交互跑官方的 `setup.py --family … --yes --no-start`。
+///
+/// 先判槽位：同一次安装会写 `Strata-data` 的分片目录与打包缓存，两个并发实例会互相
+/// 踩。`request.ggufDir` 有值就走「使用已有 GGUF」那条路（`--gguf-dir`）。
+#[tauri::command]
+async fn strata_download_start(
+    state: State<'_, AppState>,
+    request: strata_download::DownloadRequest,
+) -> Result<serde_json::Value, String> {
+    {
+        let mut slot = state
+            .strata_download
+            .lock()
+            .map_err(|_| "下载状态锁不可用".to_string())?;
+        if let Some(job) = slot.as_mut() {
+            if job.running() {
+                return Err("已有下载任务在进行，请等它结束或先取消".into());
+            }
+        }
+        *slot = None;
+    }
+    let hub = state.logs.clone();
+    let (job, message) = tauri::async_runtime::spawn_blocking(move || {
+        strata_download::start(hub, request)
+    })
+    .await
+    .map_err(|err| format!("启动下载失败：{err}"))??;
+    let started = job.is_some();
+    if job.is_some() {
+        let mut slot = state
+            .strata_download
+            .lock()
+            .map_err(|_| "下载状态锁不可用".to_string())?;
+        *slot = job;
+    }
+    Ok(serde_json::json!({ "started": started, "message": message }))
+}
+
+/// 下载进度（前端每秒轮询）。没有任务时返回 `running: false` 的空快照。
+#[tauri::command]
+fn strata_download_status(
+    state: State<'_, AppState>,
+) -> Result<strata_download::DownloadSnapshot, String> {
+    let mut scan_cache = match state.strata_scan_cache.lock() {
+        Ok(guard) => Some(guard),
+        Err(_) => None,
+    };
+    let mut slot = state
+        .strata_download
+        .lock()
+        .map_err(|_| "下载状态锁不可用".to_string())?;
+    let snapshot = match slot.as_mut() {
+        Some(job) => job.snapshot(),
+        None => strata_download::DownloadSnapshot {
+            running: false,
+            phase: String::new(),
+            message: String::new(),
+            ..Default::default()
+        },
+    };
+    // 装完会新写一份 `config\strata-*.json`，扫描缓存里没有它 —— 让下一次
+    // `strata_scan` 真的重扫。幂等，最多让缓存失效一两次（前端看到结束就停止轮询）。
+    if !snapshot.running && snapshot.ok == Some(true) {
+        if let Some(cache) = scan_cache.as_mut() {
+            **cache = None;
+        }
+    }
+    Ok(snapshot)
+}
+
+/// 取消下载：整棵进程树一起杀（打包子进程与下载线程留着会继续写半截文件）。
+///
+/// 槽位**不清空**，理由同 `strata_upgrade_stop`。
+#[tauri::command]
+fn strata_download_stop(state: State<'_, AppState>) -> Result<(), String> {
+    let mut slot = state
+        .strata_download
+        .lock()
+        .map_err(|_| "下载状态锁不可用".to_string())?;
+    if let Some(job) = slot.as_mut() {
+        strata_download::stop(job);
+    }
+    Ok(())
+}
+
+/// 下载前的磁盘预检（模型目录所在卷的可用空间）。
+#[tauri::command]
+async fn strata_download_preflight(
+    need_bytes: u64,
+    data_dir: Option<String>,
+) -> Result<strata_download::DiskPreflight, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        strata_download::preflight(need_bytes, data_dir.as_deref())
+    })
+    .await
+    .map_err(|err| format!("磁盘预检失败：{err}"))
+}
+
+/// 本机信息：物理内存 GB 与显卡名单（「适合这台电脑」与适配判断用）。
+#[tauri::command]
+async fn strata_download_host() -> Result<strata_download::HostInfo, String> {
+    tauri::async_runtime::spawn_blocking(strata_download::host_info)
+        .await
+        .map_err(|err| format!("读取本机信息失败：{err}"))
+}
+
+/// 扫描一个目录里的本地 GGUF（「使用已有模型」区块）。
+#[tauri::command]
+async fn strata_download_scan_gguf(dir: String) -> Result<Vec<strata_download::LocalGguf>, String> {
+    tauri::async_runtime::spawn_blocking(move || strata_download::scan_gguf(&dir))
+        .await
+        .map_err(|err| format!("扫描 GGUF 失败：{err}"))?
+}
+
+/// 检查「MTP 草稿层」目录：返回它在安装器眼里对应哪个数据目录。
+#[tauri::command]
+async fn strata_download_check_mtp(dir: String) -> Result<strata_download::MtpCheck, String> {
+    tauri::async_runtime::spawn_blocking(move || strata_download::check_mtp(&dir))
+        .await
+        .map_err(|err| format!("检查 MTP 目录失败：{err}"))
+}
+
+/// 从 Hugging Face 发现可安装的社区 GGUF（前端切到「社区」时调用）。
+///
+/// 走系统 curl.exe，所以放阻塞线程池；结果在模块内缓存 24 小时，`force` 跳过缓存。
+#[tauri::command]
+async fn strata_community_discover(
+    force: bool,
+    endpoint: Option<String>,
+) -> Result<strata_community::Discovery, String> {
+    tauri::async_runtime::spawn_blocking(move || strata_community::discover_community(force, endpoint))
+        .await
+        .map_err(|err| format!("发现社区模型失败：{err}"))
+}
+
+/// ORCA 导入的前置探测（前端展开 ORCA 面板时调用）。
+#[tauri::command]
+async fn strata_orca_probe() -> Result<strata_orca::OrcaProbe, String> {
+    tauri::async_runtime::spawn_blocking(strata_orca::probe)
+        .await
+        .map_err(|err| format!("探测 ORCA 环境失败：{err}"))
+}
+
+/// 起一次 ORCA 导入：下载两个分片 → `tools/iq_pack.py` 打包 → 写 `strata-orca-*.json`。
+#[tauri::command]
+fn strata_orca_start(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    {
+        let mut slot = state
+            .strata_orca
+            .lock()
+            .map_err(|_| "ORCA 状态锁不可用".to_string())?;
+        if let Some(job) = slot.as_mut() {
+            if job.running() {
+                return Err("已有 ORCA 导入任务在进行，请等它结束或先取消".into());
+            }
+        }
+        *slot = None;
+    }
+    let (job, message) = strata_orca::start(state.logs.clone())?;
+    if job.is_some() {
+        let mut slot = state
+            .strata_orca
+            .lock()
+            .map_err(|_| "ORCA 状态锁不可用".to_string())?;
+        *slot = job;
+    }
+    Ok(serde_json::json!({ "started": true, "message": message }))
+}
+
+/// ORCA 导入进度（前端每秒轮询）。
+#[tauri::command]
+fn strata_orca_status(state: State<'_, AppState>) -> Result<strata_orca::OrcaSnapshot, String> {
+    let mut scan_cache = match state.strata_scan_cache.lock() {
+        Ok(guard) => Some(guard),
+        Err(_) => None,
+    };
+    let mut slot = state
+        .strata_orca
+        .lock()
+        .map_err(|_| "ORCA 状态锁不可用".to_string())?;
+    let snapshot = match slot.as_mut() {
+        Some(job) => job.snapshot(),
+        None => strata_orca::OrcaSnapshot {
+            running: false,
+            phase: String::new(),
+            message: String::new(),
+            ..Default::default()
+        },
+    };
+    if !snapshot.running && snapshot.ok == Some(true) {
+        if let Some(cache) = scan_cache.as_mut() {
+            **cache = None;
+        }
+    }
+    Ok(snapshot)
+}
+
+/// 取消 ORCA 导入（杀当前阶段的子进程）。
+#[tauri::command]
+fn strata_orca_stop(state: State<'_, AppState>) -> Result<(), String> {
+    let mut slot = state
+        .strata_orca
+        .lock()
+        .map_err(|_| "ORCA 状态锁不可用".to_string())?;
+    if let Some(job) = slot.as_mut() {
+        strata_orca::stop(job);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn logs_snapshot(state: State<'_, AppState>, limit: Option<usize>) -> Vec<LogLine> {
     state.logs.snapshot(limit.unwrap_or(logs::LOG_BUFFER_CAP))
 }
-
 #[tauri::command]
 fn logs_clear(state: State<'_, AppState>) {
     state.logs.clear();
@@ -1606,6 +2105,14 @@ pub fn run() {
                 None
             };
             let store = settings::SettingsStore::load(config_dir.join("settings.json"));
+            // Strata 根目录与控制器版本：**只认用户指定**，没有 `%LOCALAPPDATA%\Strata`
+            // 之类的兜底（用户 m00308）；没设置时 `strata::root()` 返回 `None`，界面提示去设置页填。
+            // 挂到全局是因为 strata / strata_tune / strata_proxy 里四十多处推导路径时拿不到 AppState。
+            {
+                let saved = store.get();
+                strata::configure_root(saved.strata_root.clone());
+                strata::configure_controller(saved.strata_controller.clone());
+            }
             // GGUF 元数据（架构/量化）的解析结果按模型缓存到这里，
             // 避免每次启动都去顺序读十几 MB 的词表区
             models::set_meta_cache_path(Some(config_dir.join("gguf-meta-cache.json")));
@@ -1623,40 +2130,6 @@ pub fn run() {
             // 前门与调度器里的诊断函数拿不到 AppState，靠这个全局句柄写日志（用户 m05816）
             logs::register_global(std::sync::Arc::clone(&state.logs));
             app.manage(state);
-
-            // 一次性迁移：老的 `presets.ini` → `<配置目录>\config\llamacpp-<id>.json`。
-            // 幂等（ini 不存在就直接跳过）；**全部段成功才**把 ini 改名成 `.bak-<时间戳>`，
-            // 有失败段就原样留着，下次启动接着迁。
-            {
-                let state = app.state::<AppState>();
-                let ini_path = state.preset_path();
-                if ini_path.is_file() {
-                    let config_dir = state.model_config_dir();
-                    match model_config::migrate_from_ini(&ini_path, &config_dir, LLAMACPP_PORT_BASE)
-                    {
-                        Ok(outcome) if !outcome.is_noop() => {
-                            let backup = outcome
-                                .backup_path
-                                .as_deref()
-                                .map(|path| path.display().to_string())
-                                .unwrap_or_else(|| "（有段没迁成功，ini 保留原样）".to_string());
-                            let message = format!(
-                                "[config] 已把 {} 个模型配置迁到 {}，备份 {}",
-                                outcome.migrated.len(),
-                                config_dir.display(),
-                                backup
-                            );
-                            state.logs.push("system", message);
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            state
-                                .logs
-                                .push("system", format!("[config] 迁移 presets.ini 失败: {err:#}"));
-                        }
-                    }
-                }
-            }
 
             // settings.json 读不出来或内容坏了，必须让用户看见：
             // 以前这两种情况都是静默回落默认值，随后一次写盘就把用户的设置覆盖掉了，
@@ -1890,15 +2363,43 @@ pub fn run() {
             strata_engines,
             strata_set_engine,
             strata_apply_engine,
+            strata_controllers,
+            strata_apply_controller,
+            strata_open_setup,
             strata_probe,
             strata_start,
             strata_stop,
             strata_proxy::strata_proxy_start,
             strata_proxy::strata_proxy_stop,
-            strata_set_root,
             strata_pick,
             strata_config_read,
             strata_config_write,
+            strata_tune_start,
+            strata_tune_status,
+            strata_tune_stop,
+            strata_tune_apply,
+            strata_tune_history,
+            strata_set_api_key,
+            strata_launch_presets,
+            strata_sync_launch_keys,
+            strata_engine_state,
+            strata_engine_rollback,
+            strata_upgrade_check,
+            strata_upgrade_start,
+            strata_upgrade_status,
+            strata_upgrade_stop,
+            strata_download_start,
+            strata_download_status,
+            strata_download_stop,
+            strata_download_preflight,
+            strata_download_host,
+            strata_download_scan_gguf,
+            strata_download_check_mtp,
+            strata_community_discover,
+        strata_orca_probe,
+        strata_orca_start,
+        strata_orca_status,
+        strata_orca_stop,
             strata::strata_unload_model,
             strata::strata_load_model,
             logs_snapshot,
@@ -1985,6 +2486,14 @@ pub fn run() {
                         .is_some();
                     if strata_was_running && strata::stop_strata(&state.strata_slot).is_none() {
                         eprintln!("[exit] Strata 停止失败：slot 已被清空但进程可能仍在");
+                    }
+                    // 调优是长任务（quick ≈ 20 分钟，thorough 最长约 2 小时），它自己会起
+                    // `strata.exe` 测速；GUI 退出必须连进程树一起停，否则显存一直被占着。
+                    {
+                        let mut jobs = state.strata_tune.lock().unwrap_or_else(|e| e.into_inner());
+                        for (_, mut job) in jobs.drain() {
+                            strata_tune::stop(&mut job);
+                        }
                     }
                 }
             }

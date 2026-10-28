@@ -320,7 +320,9 @@
         .content-scrollable {
             flex: 1;
             overflow-y: auto;
-            padding: 0 2rem 2rem;
+            /* 左右 40px（原 2rem = 32px）：模型下载/监控/性能测试/系统日志页的卡片统一左
+               右 40px，与导航栏图标列对齐（用户 m02516） */
+            padding: 0 2.5rem 2rem;
         }
         
         .stats-grid {

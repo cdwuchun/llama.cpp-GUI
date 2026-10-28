@@ -516,6 +516,13 @@ interface AppStore {
 
   refreshVersions: (probe?: boolean) => Promise<void>;
   refreshDevices: () => Promise<void>;
+  /**
+   * 重读 settings。
+   *
+   * 有些命令会在后端**顺手改设置**（`strata_engines` / `strata_controllers` 在「自动跟随最新
+   * 版本」开着时会写入选中的版本），前端读到的 settings 还是旧的，得再拉一次才勾得对。
+   */
+  refreshSettings: () => Promise<void>;
   saveSettings: (patch: SettingsPatch) => Promise<boolean>;
   clearLogs: () => Promise<void>;
   fixAscii: (path: string) => Promise<string | null>;
@@ -544,7 +551,6 @@ interface AppStore {
   /** 拉一次运行时状态（生效上下文 / 加载状态 / token 占用） */
   probeStrata: () => Promise<void>;
   pickStrata: (configFile: string) => Promise<void>;
-  setStrataRoot: (path: string) => Promise<boolean>;
   /** 参数编辑 L2：写 config 原文，成功后刷新该条目（用于"需重启生效"比对） */
   writeStrataConfig: (configFile: string, text: string) => Promise<boolean>;
   startStrataPolling: () => void;
@@ -566,8 +572,6 @@ interface AppStore {
     knownMaxContext?: number | null,
   ) => Promise<void>;
   cancelContextBench: () => void;
-  /** 删掉指定的那份记录（不传 id 就只清当前显示），剩下最近的会自动接手 */
-  clearContextBench: (id?: string) => void;
   /** 结果面板切换要看的报告（null = 回到最新那一份） */
   selectContextBench: (id: string | null) => void;
   /** 场景测试（照上游 suite 模式）：一次跑多个场景 */
@@ -577,10 +581,12 @@ interface AppStore {
     options?: Partial<ScenarioBenchOptions>,
   ) => Promise<void>;
   cancelScenarioBench: () => void;
-  /** 删掉指定记录（不传 id 只清当前显示），剩下最近的自动接手 */
-  clearScenarioBench: (id?: string) => void;
   /** 结果面板切换要看的报告（null = 回到最新那一份） */
   selectScenarioBench: (id: string | null) => void;
+  /** 删掉某个模型的全部压测记录（上下文 + 场景各一份）：模型删掉后清残留（用户 m03137） */
+  forgetBenchModel: (model: string) => void;
+  /** 删掉某类压测里的指定几条记录（按报告 id；用户 m03319 第 3 条） */
+  forgetBenchRecords: (kind: "context" | "scenario", ids: string[]) => void;
   /** 并发阶梯（照上游 stress 的 ramp 模式）：1 → 2 → 4 逐级加压 */
   ladder: LadderState;
   runLadder: (model: string, slots?: number | null) => Promise<void>;
@@ -981,16 +987,17 @@ export const useApp = create<AppStore>((set, get) => ({
         // 探测定时器**常驻**：Strata 可以由用户自己跑 run-<model>.bat 拉起来，
         // 那种实例不在 GUI 的进程槽里，只有按选中 config 的端口探测才能发现它；
         // 若只在 running=true 时才轮询，快照永远是未运行，就永远轮询不起来。
-        if (settings.strata_root) {
-          void get().refreshStrata();
-          get().startStrataPolling();
-        }
+        // 根目录只认用户在设置页填的那个（没有 `%LOCALAPPDATA%\Strata` 兜底，用户 m00308），
+        // 没填时后端直接返回空列表，不报错：扫不到 config 时后端返回空列表，探测定时器照样常驻 ——
+        // 用户可能自己跑 `run-<model>.bat` 把引擎拉起来，只有轮询才认得出那种实例。
+        void get().refreshStrata();
+        get().startStrataPolling();
         // Strata 状态这次没读到就别做这个判断：那样会把「其实在运行」当成未运行，
         // 白白再启一次（探测轮询随后会把真实状态补上）。
         // 前门随程序常开（后端 setup 里已经 autostart 过一次），这里只是兜底：那次若失败
         // （比如端口被占），前端初始化后再补一次。前门不加载模型、不占显存 —— 模型由客户端
         // 的第一个请求或卡片上的「加载」按需拉起（用户 m02258 第 2 点：引擎不再默认启动）。
-        if (strataResult.status === "fulfilled" && !strataStatus.proxy && settings.strata_root) {
+        if (strataResult.status === "fulfilled" && !strataStatus.proxy) {
           void get().startStrataProxy();
         }
 
@@ -1047,6 +1054,14 @@ export const useApp = create<AppStore>((set, get) => ({
       set({ error: errText(err) });
     } finally {
       set({ busy: false });
+    }
+  },
+
+  async refreshSettings() {
+    try {
+      set({ settings: await ipc.settingsGet() });
+    } catch (err) {
+      set({ error: errText(err) });
     }
   },
 
@@ -1372,11 +1387,6 @@ export const useApp = create<AppStore>((set, get) => ({
 
   /** 卸载运行中 Strata 的模型（引擎进程留着，显存释放） */
   async stopStrataModel(configFile) {
-    const root = get().settings?.strata_root;
-    if (!root) {
-      set({ error: "请先在「设置」里指定 Strata 安装目录" });
-      return;
-    }
     const st = get().strataStatus;
     if (!st.running) {
       set({ notice: "Strata 未运行" });
@@ -1389,7 +1399,7 @@ export const useApp = create<AppStore>((set, get) => ({
     }
     set({ busy: true, error: null, notice: null, strataStopping: configFile });
     try {
-      await ipc.strataUnloadModel(root, configFile);
+      await ipc.strataUnloadModel(configFile);
       set({ notice: "已卸载 Strata 模型（引擎仍在运行，显存已释放）" });
       await get().probeStrata();
     } catch (err) {
@@ -1414,11 +1424,6 @@ export const useApp = create<AppStore>((set, get) => ({
    *  退出、上游顺手保存 learned expert profile、显存立刻释放），再杀进程树，然后起新引擎、
    *  最后 /load。只起引擎不 /load 的话模型停在未加载态，卡片看起来仍然是「已停止」。 */
   async startStrataModel(configFile) {
-    const root = get().settings?.strata_root;
-    if (!root) {
-      set({ error: "请先在「设置」里指定 Strata 安装目录" });
-      return;
-    }
     const file = configFile ?? get().settings?.strata_selected_config ?? null;
     if (!file) {
       set({ error: "请先选择一个 Strata 模型" });
@@ -1442,7 +1447,7 @@ export const useApp = create<AppStore>((set, get) => ({
         // 本 GUI 管，卸它没道理，停它会在下面的 strataStop 里拿到点名报错。
         if (st.loaded && !st.external && runningFile) {
           try {
-            await ipc.strataUnloadModel(root, runningFile);
+            await ipc.strataUnloadModel(runningFile);
           } catch {
             /* 旧引擎忙或者已经退出：照旧走下面的进程树强杀 */
           }
@@ -1462,7 +1467,7 @@ export const useApp = create<AppStore>((set, get) => ({
       // 卡片按钮的语义是「启动并加载这个模型」：两条分支都要走到 /load，
       // 否则引擎起来了模型还是没加载，卡片一直显示「已停止」= 看起来启动失败
       set({ notice: `引擎已就绪，正在加载模型…\n${strataBaseName(file)}` });
-      await ipc.strataLoadModel(root, file);
+      await ipc.strataLoadModel(file);
       const name = strataBaseName(file);
       set({
         notice: `${switching ? `已停止 ${runningName}（同端口互斥）\n` : ""}已加载 Strata 模型\n${name} · :${get().strataStatus.port}${mutexNote}`,
@@ -1561,20 +1566,6 @@ export const useApp = create<AppStore>((set, get) => ({
     }
   },
 
-  async setStrataRoot(path) {
-    set({ busy: true, error: null });
-    try {
-      set({ settings: await ipc.strataSetRoot(path) });
-      await get().refreshStrata();
-      return true;
-    } catch (err) {
-      set({ error: errText(err) });
-      return false;
-    } finally {
-      set({ busy: false });
-    }
-  },
-
   async writeStrataConfig(configFile, text) {
     set({ busy: true, error: null });
     try {
@@ -1629,12 +1620,11 @@ export const useApp = create<AppStore>((set, get) => ({
     // 反方向（先加载 Strata 模型 → 卸 llama.cpp 侧的模型）在 unloadRouterLoaded 里，
     // 两向合起来才是用户 m03160 第 2 点要的「Strata 与 llama.cpp 显存互斥」。
     const st = get().strataStatus;
-    const strataRoot = get().settings?.strata_root;
-    if (get().settings?.strata_router_mutex && st.running && strataRoot && st.loaded) {
+    if (get().settings?.strata_router_mutex && st.running && st.loaded) {
       const strataFile = st.config_path ? strataBaseName(st.config_path) : null;
       if (strataFile) {
         try {
-          await ipc.strataUnloadModel(strataRoot, strataFile);
+          await ipc.strataUnloadModel(strataFile);
           set({ notice: "显存互斥：已卸载 Strata 的模型（引擎仍在运行，显存已释放）" });
           void get().probeStrata();
         } catch (err) {
@@ -1742,10 +1732,13 @@ export const useApp = create<AppStore>((set, get) => ({
   },
 
   async removeModelSection(section) {
+    // 删之前记下模型名：压测历史按名字存（`report.model`），删完就查不到了（用户 m03137）
+    const removedName = get().configs.find((c) => c.id === section)?.name ?? section;
     set({ busy: true, error: null, notice: null });
     try {
       await ipc.configRemove(section);
       set({ notice: `已删除配置「${section}」` });
+      if (removedName) get().forgetBenchModel(removedName);
       if (get().strataStatus.proxy) {
         await get().refreshRouterModels(true);
       }
@@ -1988,29 +1981,6 @@ export const useApp = create<AppStore>((set, get) => ({
     benchAbort?.abort();
   },
 
-  clearContextBench(id) {
-    const bench = get().contextBench;
-    // 「清空」= 删掉当前这一份记录（用户 m13216 第 3 点：只清屏不删记录，下拉里还留着它），
-    // 删完 selectedId 置空，组件自然回落到这个模型剩下的最近一份；没有剩的就显示空表。
-    const history = id ? bench.history.filter((r) => r.id !== id) : bench.history;
-    saveBenchHistory(history);
-    set({
-      contextBench: {
-        ...bench,
-        currentTier: null,
-        completed: 0,
-        failed: 0,
-        cancelled: 0,
-        total: 0,
-        startedAt: null,
-        samples: [],
-        selectedId: null,
-        history,
-        error: null,
-      },
-    });
-  },
-
   selectContextBench(id) {
     set({ contextBench: { ...get().contextBench, selectedId: id } });
   },
@@ -2197,31 +2167,35 @@ export const useApp = create<AppStore>((set, get) => ({
     scenarioAbort?.abort();
   },
 
-  clearScenarioBench(id) {
-    const bench = get().scenarioBench;
-    const history =
-      id === undefined
-        ? bench.history
-        : saveScenarioHistory(bench.history.filter((r) => r.id !== id));
+  selectScenarioBench(id) {
+    set({ scenarioBench: { ...get().scenarioBench, selectedId: id } });
+  },
+
+  /**
+   * 删掉某个模型的全部压测记录（用户 m03137）。
+   *
+   * 两类记录都按**模型名**存（`report.model` 来自下拉里的 name），所以模型删掉之后
+   * 面板里再也选不到它，记录就变成了没人能清的残留 —— 这里按名字一把清掉。
+   */
+  forgetBenchModel(model) {
+    const contextHistory = saveBenchHistory(get().contextBench.history.filter((r) => r.model !== model));
+    const scenarioHistory = saveScenarioHistory(get().scenarioBench.history.filter((r) => r.model !== model));
     set({
-      scenarioBench: {
-        running: bench.running,
-        current: null,
-        completed: 0,
-        failed: 0,
-        cancelled: 0,
-        total: 0,
-        startedAt: null,
-        samples: [],
-        selectedId: null,
-        history,
-        error: null,
-      },
+      contextBench: { ...get().contextBench, history: contextHistory, selectedId: null },
+      scenarioBench: { ...get().scenarioBench, history: scenarioHistory, selectedId: null },
     });
   },
 
-  selectScenarioBench(id) {
-    set({ scenarioBench: { ...get().scenarioBench, selectedId: id } });
+  forgetBenchRecords(kind, ids) {
+    if (ids.length === 0) return;
+    const drop = new Set(ids);
+    if (kind === "context") {
+      const history = saveBenchHistory(get().contextBench.history.filter((r) => !drop.has(r.id)));
+      set({ contextBench: { ...get().contextBench, history, selectedId: null } });
+      return;
+    }
+    const history = saveScenarioHistory(get().scenarioBench.history.filter((r) => !drop.has(r.id)));
+    set({ scenarioBench: { ...get().scenarioBench, history, selectedId: null } });
   },
 
   async runLadder(model, slots) {

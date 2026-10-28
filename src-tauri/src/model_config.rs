@@ -1,7 +1,7 @@
 //! llama.cpp 侧配置层：「一个模型一份 JSON」。
 //!
-//! 依据 `PROXY_SCHEDULER_PLAN.md` §3.1（2026-10-14 用户定稿）：模型配置从
-//! `presets\presets.ini`（单文件多段）改为 `<配置目录>\config\llamacpp-<id>.json`
+//! 依据 `PROXY_SCHEDULER_PLAN.md` §3.1（2026-10-14 用户定稿）：模型配置存
+//! `<配置目录>\config\llamacpp-<id>.json`
 //! （一个模型一份），与 Strata 通道的 `strata-<model>.json` 同构。
 //!
 //! 契约要点：
@@ -37,7 +37,8 @@ fn default_host() -> String {
 
 /// 一份模型配置。
 ///
-/// 字段顺序即写盘顺序；`extra` 用 `#[serde(flatten)]` 兜住所有未知键。
+/// 字段顺序即写盘顺序；参数以 `#[serde(flatten)]` 的顶层键写出（`ctx-size`: 4096），
+/// 旧格式的 `"args": [...]` 只读兼容。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// 请求里用的模型名（= 原 preset 段名）。
@@ -71,12 +72,19 @@ pub struct ModelConfig {
     /// 额外环境变量。
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// `llama-server` 参数（不含 [`RESERVED_ARGS`]）。
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// 未知字段，原样保留。
+    /// `llama-server` 参数，**磁盘形态**：键 = 选项名（不含 `--`），值 = 数字 / 字符串 /
+    /// 布尔。用户 m02314：按 llama.cpp 的参数名写，不要 Strata 那种 `args` 数组。
     #[serde(flatten)]
-    pub extra: Map<String, Value>,
+    pub params: Map<String, Value>,
+    /// `llama-server` 参数，**内存形态**（命令行数组，不落盘）。
+    ///
+    /// 读入时由 [`Self::params`]（或旧格式的 `"args": [...]` 数组）编译出来，各处拼
+    /// 命令行、参数表都读它；写盘时再反编译回 [`Self::params`]。
+    #[serde(skip)]
+    pub args: Vec<String>,
+    /// 旧格式的 `"args": ["--ctx-size", "4096"]`：只读兼容，写盘不再输出。
+    #[serde(default, rename = "args", skip_serializing)]
+    legacy_args: Option<Vec<String>>,
 }
 
 impl ModelConfig {
@@ -94,13 +102,28 @@ impl ModelConfig {
             log: None,
             cwd: None,
             env: BTreeMap::new(),
+            params: Map::new(),
             args: Vec::new(),
-            extra: Map::new(),
+            legacy_args: None,
         }
     }
 
-    /// 写盘前规范化：把 `args` 里的保留参数剥掉，其余不动。
+    /// 写盘前规范化：把参数编译成命令行，并把保留参数剥掉。
+    ///
+    /// 参数来源：旧 `"args"` 数组（迁移期读到的）与顶层参数键，两者出现时合并
+    /// （旧数组在前，保持它原来的顺序）。
     pub fn normalized(mut self) -> (Self, Vec<String>) {
+        let mut compiled: Vec<String> = Vec::new();
+        if let Some(legacy) = self.legacy_args.take() {
+            compiled.extend(legacy);
+        }
+        if !self.params.is_empty() {
+            compiled.extend(params_to_args(&self.params));
+        }
+        if !compiled.is_empty() {
+            self.args.extend(compiled);
+        }
+        self.params.clear();
         let (args, removed) = strip_reserved_args(&self.args);
         self.args = args;
         (self, removed)
@@ -140,6 +163,133 @@ pub fn strip_reserved_args(args: &[String]) -> (Vec<String>, Vec<String>) {
     (kept, removed)
 }
 
+// ---------------------------------------------------------------------------
+// 参数两种形态：磁盘上的「选项名 = 值」↔ 内存里的命令行数组
+//
+// 磁盘形态（用户 m02314 定的）：键就是 llama.cpp 的选项名，去掉 `--`：
+//
+// ```json
+// { "ctx-size": 4096, "n-gpu-layers": 999, "flash-attn": "on", "no-mmap": true }
+// ```
+//
+// 约定：布尔 `true` = 裸开关（`--no-mmap`），`false` = 不传；数字 / 字符串 = 带值
+// （`--ctx-size 4096` / `--spec-type draft-mtp`）；取值型布尔（`flash-attn` 之类）
+// 必须给字符串，因为裸写会把下一个参数当成它的值。
+// ---------------------------------------------------------------------------
+
+fn option_name(arg: &str) -> Option<&str> {
+    let rest = arg.strip_prefix("--")?;
+    Some(rest.split('=').next().unwrap_or(rest))
+}
+
+/// 值字符串 → JSON 值：纯整数/小数存数字，其余存字符串。
+fn json_value(raw: &str) -> Value {
+    let raw = raw.trim();
+    if let Ok(number) = raw.parse::<i64>() {
+        return Value::from(number);
+    }
+    // `0.7` / `1e-5` 这类；`1.8B`、`draft-mtp` 解析失败自然是字符串
+    if raw.contains('.') || raw.contains('e') || raw.contains('E') {
+        if let Ok(number) = raw.parse::<f64>() {
+            if let Some(num) = serde_json::Number::from_f64(number) {
+                return Value::Number(num);
+            }
+        }
+    }
+    Value::String(raw.to_string())
+}
+
+/// 命令行数组 → 磁盘形态。
+pub fn args_to_params(args: &[String]) -> Map<String, Value> {
+    let mut out = Map::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let Some(rest) = arg.strip_prefix("--") else {
+            index += 1; // 位置参数（理论上不该有）
+            continue;
+        };
+        if let Some((key, value)) = rest.split_once('=') {
+            if !key.is_empty() {
+                out.insert(key.to_string(), json_value(value));
+            }
+            index += 1;
+            continue;
+        }
+        if rest.is_empty() {
+            index += 1;
+            continue;
+        }
+        match args.get(index + 1) {
+            Some(next) if !next.starts_with("--") => {
+                out.insert(rest.to_string(), json_value(next));
+                index += 2;
+            }
+            _ => {
+                out.insert(rest.to_string(), Value::Bool(true));
+                index += 1;
+            }
+        }
+    }
+    out
+}
+
+fn push_param(out: &mut Vec<String>, key: &str, value: &Value) {
+    match value {
+        Value::Null => {}
+        Value::Bool(true) => out.push(format!("--{key}")),
+        Value::Bool(false) => {}
+        Value::Number(number) => {
+            out.push(format!("--{key}"));
+            out.push(number.to_string());
+        }
+        Value::String(raw) => {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                return;
+            }
+            if needs_explicit_value(key) {
+                out.push(format!("--{key}"));
+                out.push(raw.to_string());
+            } else if TRUE_WORDS.iter().any(|word| word.eq_ignore_ascii_case(raw)) {
+                out.push(format!("--{key}"));
+            } else if FALSE_WORDS.iter().any(|word| word.eq_ignore_ascii_case(raw)) {
+                // 省略即等价于关
+            } else {
+                out.push(format!("--{key}"));
+                out.push(raw.to_string());
+            }
+        }
+        // 数组：同名选项重复给（llama.cpp 的列表型参数）
+        Value::Array(items) => {
+            for item in items {
+                push_param(out, key, item);
+            }
+        }
+        Value::Object(_) => {}
+    }
+}
+
+/// 磁盘形态 → 命令行数组（按选项名排序，顺序稳定）。
+pub fn params_to_args(params: &Map<String, Value>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (key, value) in params {
+        let key = key.trim();
+        if key.is_empty() || is_reserved_name(key) || is_retired_key(key) {
+            continue;
+        }
+        push_param(&mut out, key, value);
+    }
+    out
+}
+
+/// 是否是 [`RESERVED_ARGS`] 里的项（顶层字段生成，不接受手写）。
+fn is_reserved_name(key: &str) -> bool {
+    RESERVED_ARGS
+        .iter()
+        .any(|flag| option_name(flag) == Some(key))
+}
+
 /// `<id>` → 合法文件名主体。
 ///
 /// 非法字符（`/ \ : * ? " < > |`）、控制字符、以及**首尾**的空格与点统一替换为
@@ -163,7 +313,7 @@ pub fn sanitize_id(id: &str) -> String {
     out
 }
 
-/// `config\` 目录（与 `settings.json`、`presets\` 同级）。
+/// `config\` 目录（与 `settings.json` 同级）。
 pub fn config_dir(base: &Path) -> PathBuf {
     base.join(CONFIG_SUBDIR)
 }
@@ -286,14 +436,16 @@ pub fn load(path: &Path) -> Result<LoadedConfig> {
 /// 与 `models::write_preset` 的取舍相同：配置文件是用户调参的唯一载体，就地截断写
 /// 一旦崩溃/断电就留下半截文件。临时名带 pid + 序号，避免两个并发写互相截断。
 pub fn write(path: &Path, config: &ModelConfig) -> Result<()> {
-    let (config, removed) = config.clone().normalized();
+    let (mut config, removed) = config.clone().normalized();
     if !removed.is_empty() {
         eprintln!(
-            "[config] {} 的 args 里出现由顶层字段生成的参数，已忽略：{}",
+            "[config] {} 的参数里出现由顶层字段生成的项，已忽略：{}",
             path.display(),
             removed.join(" ")
         );
     }
+    // 落盘形态：参数键（`ctx-size`: 4096），不是命令行数组
+    config.params = args_to_params(&config.args);
     let body = serde_json::to_string_pretty(&config).context("序列化模型配置失败")?;
     write_text(path, &body)
 }
@@ -316,7 +468,7 @@ pub fn write_text(path: &Path, body: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// 存量迁移：presets.ini → 一个模型一份 JSON
+// 键值 ↔ 命令行参数的布尔语义
 // ---------------------------------------------------------------------------
 
 /// preset 里的「真」：转成不带值的命令行开关。
@@ -345,52 +497,6 @@ fn needs_explicit_value(key: &str) -> bool {
         .any(|known| known.eq_ignore_ascii_case(key))
 }
 
-/// 一个 ini 段 → 一份模型配置。
-///
-/// ini 里的键是 llama.cpp preset 的短名（`ctx-size`、`flash-attn`…），而 `args` 存的是
-/// 真正的命令行参数（`--ctx-size 0`、`--flash-attn`）—— 前门拿到就能拼命令行。
-/// `model` / `mmproj` 进顶层字段，`no-webui` 进 `no_webui`（AGENTS.md 铁律 1 的开关）。
-pub fn config_from_section(name: &str, entries: &[(String, String)]) -> ModelConfig {
-    let mut cfg = ModelConfig::new(name, None);
-    for (key, value) in entries {
-        let key = key.trim();
-        let value = value.trim();
-        match key.to_ascii_lowercase().as_str() {
-            "model" => {
-                cfg.model = Some(value.to_string());
-                continue;
-            }
-            "mmproj" => {
-                cfg.mmproj = Some(value.to_string());
-                continue;
-            }
-            "no-webui" | "no_webui" => {
-                cfg.no_webui = TRUE_WORDS.contains(&value.to_ascii_lowercase().as_str());
-                continue;
-            }
-            _ => {}
-        }
-        let lower = value.to_ascii_lowercase();
-        if needs_explicit_value(key) {
-            // 取值型（`flash-attn`）：`on` 与 `off` 都要写出来 —— 不写是 auto，跟 off 不等价
-            if TRUE_WORDS.contains(&lower.as_str()) || FALSE_WORDS.contains(&lower.as_str()) {
-                cfg.args.push(format!("--{key}"));
-                cfg.args.push(lower);
-            } else if !value.is_empty() {
-                cfg.args.push(format!("--{key}"));
-                cfg.args.push(value.to_string());
-            }
-        } else if TRUE_WORDS.contains(&lower.as_str()) {
-            cfg.args.push(format!("--{key}"));
-        } else if FALSE_WORDS.contains(&lower.as_str()) {
-            // 关闭语义：命令行上不写这个参数就是关的
-        } else if !value.is_empty() {
-            cfg.args.push(format!("--{key}"));
-            cfg.args.push(value.to_string());
-        }
-    }
-    cfg
-}
 
 /// 给一份新配置挑端口：从 `port_base` 起取第一个既没被别的配置声明、也没被系统占用的
 /// （`PROXY_SCHEDULER_PLAN.md` §3.3；端口只增不回收）。
@@ -411,106 +517,11 @@ pub fn allocate_port(config_dir: &Path, port_base: u16) -> u16 {
     port_base
 }
 
-/// 迁移报告。
-#[derive(Debug, Clone, Serialize)]
-pub struct MigrationOutcome {
-    pub ini_path: PathBuf,
-    pub config_dir: PathBuf,
-    /// 原 ini 改名后的路径。**只有全部段都成功才改名**；没改名说明还有段要处理。
-    pub backup_path: Option<PathBuf>,
-    /// 新写出的配置：(id, 路径, 端口)。
-    pub migrated: Vec<(String, PathBuf, u16)>,
-    /// 已经有配置、本次跳过（不是失败）。
-    pub existing: Vec<String>,
-    /// 失败的段：(段名, 原因)。有任何一项就不动 ini，用户改完再启动会接着迁。
-    pub failed: Vec<(String, String)>,
-}
-
-impl MigrationOutcome {
-    /// 本次是否什么都没做（没有 ini 或已迁完）。
-    pub fn is_noop(&self) -> bool {
-        self.migrated.is_empty() && self.failed.is_empty()
-    }
-}
-
-fn timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// 把存量 `presets.ini` 迁移成 `config\llamacpp-<id>.json`。
-///
-/// 取舍（`PROXY_SCHEDULER_PLAN.md` §3.1）：
-/// - **幂等**：目标 JSON 已存在就跳过，不覆盖用户后来改过的参数。
-/// - **不删原件**：只有每个段都成功才把 ini 改名成 `presets.ini.bak-<时间戳>`；
-///   只要有一段失败就原样留着，下次启动接着迁（已迁的段会被跳过）。
-pub fn migrate_from_ini(
-    ini_path: &Path,
-    config_dir: &Path,
-    port_base: u16,
-) -> Result<MigrationOutcome> {
-    let mut outcome = MigrationOutcome {
-        ini_path: ini_path.to_path_buf(),
-        config_dir: config_dir.to_path_buf(),
-        backup_path: None,
-        migrated: Vec::new(),
-        existing: Vec::new(),
-        failed: Vec::new(),
-    };
-    if !ini_path.exists() {
-        return Ok(outcome);
-    }
-    let text = fs::read_to_string(ini_path)
-        .with_context(|| format!("读取 {} 失败", ini_path.display()))?;
-    let retired: Vec<String> = crate::models::RETIRED_PRESET_KEYS
-        .iter()
-        .map(|k| format!("--{k}"))
-        .collect();
-
-    for section in crate::models::list_sections(&text) {
-        if path_for_id(config_dir, &section).exists() {
-            outcome.existing.push(section);
-            continue;
-        }
-        let entries = crate::models::section_entries(&text, &section);
-        let mut cfg = config_from_section(&section, &entries);
-        match cfg.model.as_deref().map(str::trim) {
-            Some(path) if !path.is_empty() => {}
-            _ => {
-                outcome
-                    .failed
-                    .push((section, "段里没有可用的 model 键".to_string()));
-                continue;
-            }
-        }
-        // 淘汰键（铁律 5）不进命令行：`--no-mmap` 之类会让进程起不来
-        cfg.args.retain(|arg| !retired.contains(arg));
-        let port = allocate_port(config_dir, port_base);
-        cfg.port = Some(port);
-        let path = unique_path(config_dir, &section);
-        match write(&path, &cfg) {
-            Ok(()) => outcome.migrated.push((section, path, port)),
-            Err(err) => outcome.failed.push((section, format!("{err:#}"))),
-        }
-    }
-
-    if outcome.failed.is_empty() && !outcome.migrated.is_empty() {
-        let backup = ini_path.with_extension(format!("ini.bak-{}", timestamp()));
-        fs::rename(ini_path, &backup)
-            .with_context(|| format!("备份 {} 失败", ini_path.display()))?;
-        outcome.backup_path = Some(backup);
-    }
-    Ok(outcome)
-}
-
 // --------------------------------------------------------------- 键值视图
 //
 // 前端参数表单读的是 ini 风格的「键 = 值」。JSON 是真源，但为了让后端切换这一刀
 // 不必同时改前端，这里提供一层双向转换：`entries_from_config` 把配置摊成键值，
-// `apply_entries` 把键值合并回去，`render_ini_view` 把整个 config 目录渲染成
-// 一份 ini 文本视图（只读投影，供模型卡片、参数弹窗沿用原有解析器）。
+// `apply_entries` 把键值合并回去（只读投影，供模型卡片、参数弹窗沿用原有解析器）。
 
 /// 配置 → ini 风格键值对（顺序：`model` / `mmproj` / `no-webui` / `args` 原序）。
 ///
@@ -859,100 +870,9 @@ mod tests {
         dir
     }
 
-    /// 干跑：拿真实 `presets.ini` 只做转换、不写盘，用来看 14 段转出来长什么样。
-    ///
-    /// `$env:LLAMACPP_GUI_REAL_INI='E:\AI\llama.cpp-gui\presets\presets.ini'` 后跑
-    /// `cargo test --lib dry_run_real_ini -- --ignored --nocapture`。
-    #[test]
-    #[ignore = "手工跑：把真实 presets.ini 迁移到临时目录再渲染视图，逐段核对键值有没有丢"]
-    fn dry_run_migrate_and_render() {
-        let Ok(path) = std::env::var("LLAMACPP_GUI_REAL_INI") else {
-            return;
-        };
-        let source = fs::read_to_string(&path).expect("读真实 ini");
-        let dir = temp_dir("dry-migrate");
-        let cfg_dir = config_dir(&dir);
-        let _ = fs::remove_dir_all(&cfg_dir);
-        let ini = dir.join("presets.ini");
-        fs::write(&ini, &source).unwrap();
-
-        let outcome = migrate_from_ini(&ini, &cfg_dir, 18211).unwrap();
-        let items = load_dir(&cfg_dir);
-
-        let mut lost = 0usize;
-        for section in crate::models::list_sections(&source) {
-            let before = crate::models::section_entries(&source, &section);
-            // 第三刀：没有 ini 文本视图了，直接比配置里的表单条目
-            let after = items
-                .iter()
-                .find(|item| same_id(&item.config.name, &section))
-                .map(|item| entries_from_config(&item.config))
-                .unwrap_or_default();
-            println!("[{section}] 迁移前 {} 键 / 视图 {} 键", before.len(), after.len());
-            for (key, value) in &before {
-                match after
-                    .iter()
-                    .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
-                {
-                    Some((_, got)) if got == value => {}
-                    Some((_, got)) => println!("  变值: {key} = {value} → {got}"),
-                    None => {
-                        lost += 1;
-                        println!("  丢了: {key} = {value}");
-                    }
-                }
-            }
-        }
-        println!(
-            "迁移 {} 段，失败 {:?}，视图丢键 {lost} 处",
-            outcome.migrated.len(),
-            outcome.failed
-        );
-    }
 
     #[test]
-    #[ignore = "手工跑：读真实 presets.ini 做干跑转换检查"]
-    fn dry_run_real_ini() {
-        let Some(path) = std::env::var_os("LLAMACPP_GUI_REAL_INI") else {
-            return;
-        };
-        let text = fs::read_to_string(PathBuf::from(path)).unwrap();
-        for section in crate::models::list_sections(&text) {
-            let entries = crate::models::section_entries(&text, &section);
-            let cfg = config_from_section(&section, &entries);
-            println!(
-                "[{section}] no_webui={} mmproj={} args={}",
-                cfg.no_webui,
-                cfg.mmproj.is_some(),
-                cfg.args.join(" ")
-            );
-        }
-    }
-
-    /// 一段真实形态的 presets.ini（键是 llama.cpp preset 的短名）。
-    const SAMPLE_INI: &str = r#"version = 1
-
-[BAAI/bge-m3]
-model = E:/AI/models/BAAI/bge-m3/bge-m3-q8_0.gguf
-
-ctx-size = 0
-flash-attn = on
-load-mode = mmap+mlock
-gpu-layers = 99
-
-no-webui = true
-
-[Unsloth/Hy-MT2-1.8B]
-model = E:/AI/models/Unsloth/Hy-MT2-1.8B/Hy-MT2-1.8B-Q4_K_M.gguf
-mmproj = E:/AI/models/Unsloth/Hy-MT2-1.8B/mmproj-F16.gguf
-spec-type = draft-mtp
-spec-draft-n-max = 2
-no-mmap = true
-reserve = off
-"#;
-
-    #[test]
-    fn section_to_config_maps_booleans_and_reserved_keys() {
+    fn entries_map_booleans_and_reserved_keys() {
         let entries: Vec<(String, String)> = [
             ("model", "E:/m/a.gguf"),
             ("mmproj", "E:/m/mmproj.gguf"),
@@ -965,7 +885,8 @@ reserve = off
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-        let cfg = config_from_section("Hy-MT2-1.8B", &entries);
+        let mut cfg = ModelConfig::new("Hy-MT2-1.8B", None);
+        apply_entries(&mut cfg, &entries);
         assert_eq!(cfg.name, "Hy-MT2-1.8B");
         assert_eq!(cfg.model.as_deref(), Some("E:/m/a.gguf"));
         assert_eq!(cfg.mmproj.as_deref(), Some("E:/m/mmproj.gguf"));
@@ -977,66 +898,6 @@ reserve = off
         );
     }
 
-    #[test]
-    fn migrate_ini_writes_one_json_per_section_and_backs_up_ini() {
-        let dir = temp_dir("migrate");
-        let ini = dir.join("presets.ini");
-        fs::write(&ini, SAMPLE_INI).unwrap();
-        let cfg_dir = config_dir(&dir);
-        // 用高位端口，避免撞上本机正在跑的服务
-        let base = 18211;
-
-        let first = migrate_from_ini(&ini, &cfg_dir, base).unwrap();
-        assert_eq!(first.migrated.len(), 2, "{first:?}");
-        assert!(first.failed.is_empty(), "不该有失败段：{:?}", first.failed);
-        assert!(!ini.exists(), "全部成功才应把 ini 改名");
-        let backup = first.backup_path.clone().unwrap();
-        assert!(backup.exists());
-        assert!(backup
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("presets.ini.bak-"));
-
-        // 文件名：`/` → `-`；`name` 字段保留原段名
-        let m3 = load(&path_for_id(&cfg_dir, "BAAI/bge-m3")).unwrap();
-        assert_eq!(m3.config.name, "BAAI/bge-m3");
-        assert!(m3.config.no_webui);
-        assert_eq!(m3.config.port, Some(base));
-        assert!(m3.config.args.contains(&"--load-mode".to_string()));
-
-        let hy = load(&path_for_id(&cfg_dir, "Unsloth/Hy-MT2-1.8B")).unwrap();
-        assert_eq!(hy.config.name, "Unsloth/Hy-MT2-1.8B");
-        assert_eq!(hy.config.port, Some(base + 1));
-        assert_eq!(
-            hy.config.mmproj.as_deref(),
-            Some("E:/AI/models/Unsloth/Hy-MT2-1.8B/mmproj-F16.gguf")
-        );
-        // 淘汰键不能进命令行（铁律 5）
-        assert!(!hy.config.args.iter().any(|a| a == "--no-mmap"));
-
-        // 幂等：ini 已经不存在 → 什么都不做
-        let again = migrate_from_ini(&ini, &cfg_dir, base).unwrap();
-        assert!(again.is_noop());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn migrate_leaves_ini_alone_when_a_section_fails() {
-        let dir = temp_dir("migrate-fail");
-        let ini = dir.join("presets.ini");
-        fs::write(&ini, "version = 1\n\n[good]\nmodel = E:/m/a.gguf\n\n[broken]\nctx-size = 4096\n")
-            .unwrap();
-        let cfg_dir = config_dir(&dir);
-
-        let out = migrate_from_ini(&ini, &cfg_dir, 18251).unwrap();
-        assert_eq!(out.migrated.len(), 1);
-        assert_eq!(out.failed.len(), 1);
-        assert_eq!(out.failed[0].0, "broken");
-        assert!(ini.exists(), "有失败段就不能动 ini");
-        assert!(out.backup_path.is_none());
-        let _ = fs::remove_dir_all(&dir);
-    }
 
     #[test]
     fn entries_round_trip_through_apply_entries() {
@@ -1209,8 +1070,9 @@ reserve = off
     fn valued_bool_keys_keep_an_explicit_value() {
         // `flash-attn = on` 必须写成 `--flash-attn on`：裸写会把下一个参数当成它的值，
         // 子实例直接以退出码 1 结束（b11482 实测）。
-        let cfg = config_from_section(
-            "m",
+        let mut cfg = ModelConfig::new("m", None);
+        apply_entries(
+            &mut cfg,
             &[
                 ("model".to_string(), "x.gguf".to_string()),
                 ("flash-attn".to_string(), "on".to_string()),
@@ -1312,17 +1174,18 @@ reserve = off
     }
 
     #[test]
-    fn write_then_load_keeps_unknown_fields_and_drops_reserved_args() {
+    fn write_then_load_keeps_params_and_drops_reserved_args() {
         let dir = temp_dir("roundtrip");
         let path = path_for_id(&dir, "Hy-MT2-1.8B");
         let mut cfg = ModelConfig::new("Hy-MT2-1.8B", Some("E:\\m\\a.gguf".into()));
         cfg.port = Some(8211);
         cfg.args = vec!["--ctx-size".into(), "4096".into()];
-        // 手写进 args 的保留参数：读入时应被剥掉
+        // 手写进 args 的保留参数：写盘时剥掉
         cfg.args.push("--port".into());
         cfg.args.push("9999".into());
-        cfg.extra
-            .insert("my_note".into(), Value::String("手写字段".into()));
+        // 未知顶层键按参数对待，原样保留
+        cfg.params
+            .insert("my-note".into(), Value::String("手写字段".into()));
         write(&path, &cfg).unwrap();
 
         let loaded = load(&path).unwrap();
@@ -1330,15 +1193,16 @@ reserve = off
         assert_eq!(loaded.config.port, Some(8211));
         assert_eq!(loaded.config.host, "127.0.0.1");
         // 写盘时就剥掉了保留参数：磁盘上不该出现第二个 `--port`
-        assert_eq!(loaded.config.args, vec!["--ctx-size", "4096"]);
+        assert_eq!(loaded.config.args, vec!["--ctx-size", "4096", "--my-note", "手写字段"]);
         assert!(loaded.removed_args.is_empty());
         let raw = fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("--port"), "写盘内容不得带保留参数：{raw}");
-        // 未知字段活下来
-        assert_eq!(
-            loaded.config.extra.get("my_note"),
-            Some(&Value::String("手写字段".into()))
-        );
+        // 落盘是参数键形式：`"ctx-size": 4096`，不再有 `args` 数组
+        assert!(!raw.contains("\"args\""), "不该再写 args 数组：{raw}");
+        assert!(raw.contains("\"ctx-size\": 4096"), "应为参数键形式：{raw}");
+        // 未知参数活下来（读入后统一编译进 args，params 只在磁盘形态存在）
+        assert!(raw.contains("\"my-note\""), "未知参数应原样落盘：{raw}");
+        assert!(loaded.config.args.iter().any(|a| a == "--my-note"));
 
         // 用户手写进 args 的保留参数：读入时剥掉并回报
         fs::write(
@@ -1352,6 +1216,48 @@ reserve = off
             handwritten.removed_args,
             vec!["--port", "9999", "--host=0.0.0.0"]
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_args_array_upgrades_to_param_keys() {
+        let dir = temp_dir("legacy-args");
+        let path = path_for_id(&dir, "Qwen");
+        fs::write(
+            &path,
+            r#"{"name":"Qwen","model":"E:\\m\\q.gguf","port":8300,"args":["--ctx-size","8192","--flash-attn","on","--jinja"]}"#,
+        )
+        .unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(
+            loaded.config.args,
+            vec!["--ctx-size", "8192", "--flash-attn", "on", "--jinja"]
+        );
+        // 再写一次：旧数组被升级成参数键
+        write(&path, &loaded.config).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("\"args\""), "升级后不该再有 args 数组：{raw}");
+        assert!(raw.contains("\"ctx-size\": 8192"), "{raw}");
+        assert!(raw.contains("\"flash-attn\": \"on\""), "{raw}");
+        assert!(raw.contains("\"jinja\": true"), "{raw}");
+        // 升级后的文件再读一遍，命令行完全一致
+        let again = load(&path).unwrap();
+        assert_eq!(again.config.args, loaded.config.args);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 拿真实部署里的 config 做一次升级演示（只读原件，转换在临时目录里做）：
+    /// `PROBE_CONFIG=<...>\config\llamacpp-xxx.json cargo test --lib probe_upgrade_real_config -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn probe_upgrade_real_config() {
+        let src = PathBuf::from(std::env::var("PROBE_CONFIG").expect("需要 PROBE_CONFIG"));
+        let dir = temp_dir("probe-upgrade");
+        let dst = dir.join(src.file_name().unwrap());
+        fs::copy(&src, &dst).unwrap();
+        let loaded = load(&dst).unwrap();
+        write(&dst, &loaded.config).unwrap();
+        println!("----- 升级后 -----\n{}", fs::read_to_string(&dst).unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 

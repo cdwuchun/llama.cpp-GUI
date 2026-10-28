@@ -53,7 +53,6 @@ export function ContextBenchPanel() {
   const bench = useApp((s) => s.contextBench);
   const run = useApp((s) => s.runContextBench);
   const cancel = useApp((s) => s.cancelContextBench);
-  const clear = useApp((s) => s.clearContextBench);
   const select = useApp((s) => s.selectContextBench);
   const port = useApp((s) => s.strataStatus.proxy_port ?? 9090);
   const strataEntries = useApp((s) => s.strataEntries);
@@ -537,7 +536,8 @@ export function ContextBenchPanel() {
       <div className="panel">
         <div className="bench-head">
           <h2 className="panel-title">各上下文档位实测</h2>
-          {/* 复制图片 + 历史记录 + 清除记录 放在同一行，照上游把控件都挂在标题行右侧（用户 m01993 第 1 点） */}
+          {/* 复制图片 + 历史记录 放在同一行，照上游把控件都挂在标题行右侧（用户 m01993 第 1 点）；
+              删除记录统一挪到「性能测试 → 记录管理」弹窗（用户 m03319 第 3 条） */}
           <div className="bench-head__right">
             <button
               type="button"
@@ -591,15 +591,6 @@ export function ContextBenchPanel() {
                 )}
               </div>
             )}
-            <button
-              type="button"
-              className="st-btn st-btn--secondary bench-clear"
-              disabled={bench.running || resultSamples.length === 0}
-              // 删掉正在看的这份记录（用户 m13216 第 3 点），删完自动显示这个模型剩下的最近一份
-              onClick={() => clear(selected?.id)}
-            >
-              清除记录
-            </button>
           </div>
         </div>
         <div ref={chartsRef}>

@@ -2,7 +2,9 @@
 //!
 //! 设计约束（见 `docs/archive/STRATA_INTEGRATION_PLAN.md` §7 升级解耦规则）：
 //! - **R1 启动命令不自己拼**：从上游生成的 `run-<model>.bat` 解析，上游改了格式这里跟着变。
-//! - **R2 零硬编码**：所有路径来自 config 与 run 脚本，GUI 只存 Strata 根目录。
+//! - **R2 零硬编码 + 零兜底**：根目录**只认用户在设置页指定的那个**（[`root`]），
+//!   config / 引擎 / run 脚本都从它派生。不再猜 `%LOCALAPPDATA%\Strata` 之类的官方默认位置
+//!   （用户 m00308）：Strata 装在哪只有用户知道，猜错只会读到一份不该读的目录。
 //! - **R3 版本从运行时读**：`/props.build_info`，不缓存、不解析文件名。
 //! - **R4 能力探测**：所有运行时字段都是 `Option`，端点缺失时降级而不是报错。
 //! - **R6 受控写入 args**：只改已存在的 flag 值，绝不新增上游不认识的键。
@@ -11,10 +13,10 @@
 //! - 启动的是控制端的 `python.exe serve/server.py`，不是模型引擎；CUDA 由上游自带（config 的
 //!   `lib_dirs`），**不做共享 CUDA 注入**，也**不做 junction 非 ASCII 修复**
 //!   （venv 的 `pyvenv.cfg` 里 home 是绝对路径，换目录会让 venv 失效）。
-//! - 0.2.x（control 0.1.46 起）目录重排：控制端在 `<安装目录>\control\`，引擎是独立组件
-//!   放在 `<安装目录>\engine-bundle\<版本>-<平台>-<后端>\`，config 的 `exe` 写
-//!   `component:strata-engine`（见 [`resolve_component`]）；0.1.x 的 `.venv` + `engine\`
-//!   布局仍然兼容。
+//! - 官方安装布局（`setup.py` 产出，用户把根指到 `%LOCALAPPDATA%\Strata` 时）：
+//!   `install\` 放 config 与 `run-*.bat`、`components\engine\<版本>-<平台>-<后端>\` 放引擎、
+//!   `terminal\` 放控制端；config 的 `exe` 写 `component:strata-engine`（见 [`resolve_component`]）。
+//!   数据目录不在这里，由 `%APPDATA%\Strata\settings.json` 的 `data_dir` 指定（[`data_dir`]）。
 //! - 受保护端点有 `_own_page` Origin 防护，前端 fetch 必被 403，
 //!   所以状态探测一律走 Rust 侧 [`crate::http`]。
 
@@ -211,7 +213,7 @@ fn is_config_file(name: &str) -> bool {
 /// `preferred` 是设置页「Strata 引擎版本」选定的那个可执行文件（用户 m04069：
 /// **引擎由设置页决定**）。它存在时就是权威 —— 不管 config 里写的是什么，都用它，
 /// 并把 config 的 `exe` 改回一致（否则引擎启动时读到的还是旧路径）。
-fn parse_config(path: &Path, preferred: Option<&Path>, extra: &[PathBuf]) -> Option<StrataModelEntry> {
+fn parse_config(path: &Path, preferred: Option<&Path>) -> Option<StrataModelEntry> {
     let raw = fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let obj = value.as_object()?;
@@ -228,17 +230,17 @@ fn parse_config(path: &Path, preferred: Option<&Path>, extra: &[PathBuf]) -> Opt
     let file_stem = path.file_stem()?.to_string_lossy().to_string();
     let slug = file_stem.strip_prefix("strata-").unwrap_or(&file_stem).to_string();
     let root = path.parent()?.to_path_buf();
-    // 引擎路径（用户 m02686 / m02748 / m02795 / m04069 / m04888）：
+    // 引擎路径（用户 m02686 / m02748 / m02795 / m04069 / m04888 / m00460）：
     // - **落盘一律写绝对路径**（用户 m04888：原本写 `component:strata-engine` 的也改成绝对路径）。
-    //   引用仍然认：config 里若还是 `component:strata-engine`（旧的，或手工写的），扫描时按控制器
-    //   组件目录（`STRATA_COMPONENTS_DIR` / `%LOCALAPPDATA%\Strata\components\engine`，常是指向
-    //   `E:\AI\Strata\engine` 的目录联结）解析成真实 exe，并**顺手把 config 改写成绝对路径**。
+    //   引用仍然认：config 里若还是 `component:strata-engine`（旧的，或手工写的），扫描时在
+    //   **同一个 Strata 根目录**下找版本最高的引擎解析成真实 exe，并**顺手把 config 改写成绝对路径**
+    //   （用户 m00460：不再看控制器组件目录 `%LOCALAPPDATA%\Strata\components\engine`）。
     // - 绝对路径的优先级：设置页选定的引擎（`settings.strata_engine`）存在就用它并把 config 改回
     //   一致；没选过就尊重 config 里的路径；那个路径没了（升级删了旧版本目录）才跟到当前版本并写回。
     let reference = engine.starts_with("component:");
     let declared = PathBuf::from(&engine);
     let engine_path = if reference {
-        resolve_component(&root, ENGINE_COMPONENT_ID, extra)
+        resolve_component(&root, ENGINE_COMPONENT_ID)
             .map(|c| c.exe)
             .unwrap_or_else(|| declared.clone())
     } else {
@@ -248,7 +250,7 @@ fn parse_config(path: &Path, preferred: Option<&Path>, extra: &[PathBuf]) -> Opt
                 if declared.is_file() {
                     declared.clone()
                 } else {
-                    resolve_component(&root, ENGINE_COMPONENT_ID, extra)
+                    resolve_component(&root, ENGINE_COMPONENT_ID)
                         .map(|c| c.exe)
                         .unwrap_or_else(|| declared.clone())
                 }
@@ -258,7 +260,7 @@ fn parse_config(path: &Path, preferred: Option<&Path>, extra: &[PathBuf]) -> Opt
     let engine_exists = engine_path.is_file();
     let engine_version =
         component_version_at(&engine_path).or_else(|| engine_version(&engine_path));
-    // 引用是**合法形态**（用户 m04934：设置页保留「自动使用最新版本」一项，写的就是
+    // 引用是**合法形态**（现在的 config 都写 `component:strata-engine`；设置页 2026-10-25 起不再让用户选引擎），写的就是
     // `component:strata-engine`，由控制器的组件目录决定实际版本），所以只解析、不改写；
     // 只有绝对路径才按「设置页选定 / 声明仍在 / 跟当前版本」的规则改写。
     let engine_stale = !reference && engine_path != declared;
@@ -420,12 +422,16 @@ fn version_key(value: &str) -> Vec<u64> {
 ///
 /// 0.2.x（control 0.1.46 起）把引擎拆成**独立组件**：可执行文件在某个目录下的
 /// `<version>-<platform>-<backend>/` 里，文件名由 `engine-component.json` 的 `entrypoint`
-/// 指名。那个「某个目录」前后被安装器叫过 `engine-bundle`（0.1.46）和 `engine`（0.1.47），
-/// 以后还可能再改，所以不硬编码名字（用户 m04258「不要硬编码，就在根目录下查找」）：
-/// 从安装目录自身、它的一级子目录、以及这些子目录的直接子目录里找**引擎文件**
-/// （`engine-component.json` 或 `strata.exe`），有就算一个引擎目录。0.1.x 的
-/// `engine\strata.exe` 目录、以及「安装目录」被直接指到引擎目录的情况都覆盖。
-fn engine_folders(root: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
+/// 指名。官方安装器把它放在 `components\engine\` 下，但目录名不硬编码（用户 m04258
+/// 「不要硬编码，就在根目录下查找」）：从安装目录自身、它的一级子目录、以及这些子目录的
+/// 直接子目录里找**引擎文件**（`engine-component.json` 或 `strata.exe`），有就算一个引擎目录。
+/// 一个根目录下所有引擎版本目录（版本目录里得有 `engine-component.json` / `strata.exe`）。
+///
+/// **只看给定的根目录**（用户 m00460：不考虑控制器组件目录 `STRATA_COMPONENTS_DIR` /
+/// `%LOCALAPPDATA%\Strata\components\engine`）—— 用户手动解压的根 `E:\AI\strata` 下
+/// 已有 `engine\<版本>-…`，再把官方组件目录并进来只会让设置页出现指向别处的重复行。
+/// 官方布局的 `<根>\components\engine\<版本>` 本来就会被下面的两层子目录扫描命中。
+fn engine_folders(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     if is_engine_dir(root) {
@@ -446,45 +452,505 @@ fn engine_folders(root: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
             }
         }
     }
-    // 再按 **Strata 控制器自己的组件目录**找一遍（`engine_component.py:176 components_dir()`：
-    // `STRATA_COMPONENTS_DIR` 优先，否则 `%LOCALAPPDATA%\Strata\components`，其下 `engine/`
-    // 才是版本目录）。用户 2026-10-22 的会话把 `%LOCALAPPDATA%\Strata\components\engine` 做成了
-    // 指向 `E:\AI\Strata\engine` 的目录联结，控制器就是从那儿看见引擎的；GUI 也认这一条，
-    // 两边才不会一边找得到、一边说没引擎。与上面的扫描结果按路径去重。
-    for components in extra {
-        let dirs = if is_engine_dir(components) {
-            vec![components.clone()]
-        } else {
-            subdirs(components)
-        };
-        for dir in dirs {
-            if is_engine_dir(&dir) && seen.insert(dir.clone()) {
-                out.push(dir);
-            }
-        }
-    }
     out
 }
 
-/// Strata 控制器找引擎组件的根（`<组件根>/engine`）。
+/// 用户指定的根目录（`settings.json` 的 `strata_root`）；`None` = 还没指定。
 ///
-/// 顺序照抄 `E:\AI\Strata\control\strata_control\engine_component.py:176`：
-/// `STRATA_COMPONENTS_DIR` → `%LOCALAPPDATA%\Strata\components`。不存在就返回空。
-fn controller_component_dirs() -> Vec<PathBuf> {
-    let base = std::env::var_os("STRATA_COMPONENTS_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("LOCALAPPDATA")
-                .map(|dir| PathBuf::from(dir).join("Strata").join("components"))
-        });
-    let Some(base) = base else {
+/// **没有默认值、没有兜底**（用户 m00308）：Strata 装在哪由用户说了算，不去猜
+/// `%LOCALAPPDATA%\Strata` 之类的官方安装位置 —— 猜错时界面会读到一份本不该读的目录，
+/// 比「提示用户去设置」更糟。没指定时 [`root`] 返回 `None`，调用方一律按
+/// 「尚未设置 Strata 目录」处理。
+///
+/// 放全局而不是塞进 `AppState`：`strata.rs` / `strata_tune.rs` / `strata_proxy.rs` 里有
+/// 四十多处「就地推导根目录」的调用，它们都拿不到 `AppState`。
+static ROOT_OVERRIDE: std::sync::OnceLock<std::sync::RwLock<Option<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+fn root_override() -> &'static std::sync::RwLock<Option<PathBuf>> {
+    ROOT_OVERRIDE.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// 设置自定义根目录（空路径 / `None` = 清空，于是 [`root`] 返回 `None`）。
+///
+/// 调用方负责让扫描缓存失效：缓存里带着扫描时的 `root`，换根之后自然对不上。
+pub fn configure_root(root: Option<PathBuf>) {
+    let mut guard = root_override()
+        .write()
+        .unwrap_or_else(|err| err.into_inner());
+    *guard = root.filter(|dir| !dir.as_os_str().is_empty());
+}
+
+/// 当前生效的 Strata 根目录：**只有用户在设置页指定的那一个**，没指定就是 `None`。
+pub fn root() -> Option<PathBuf> {
+    root_override()
+        .read()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone()
+}
+
+/// config 与 `run-*.bat` 所在目录。
+///
+/// - **用户指定了 Strata 目录时，就是那个目录本身**（用户 m00717：手动解压的
+///   `E:\AI\strata` 把 `run-*.bat` / `strata-*.json` 直接放在根下；此时不再去猜
+///   `<根>\install`，免得用户目录里恰好有个 `install` 就被当成配置目录）。
+/// - 只有单测/诊断显式传 `configured=false` 时才看 `<根>\install`。
+pub fn configs_dir(root: &Path) -> PathBuf {
+    configs_dir_with(root, root_is_configured())
+}
+
+/// 用户是否指定过 Strata 目录（现在只剩「指定过」和「没指定」两种，`root()` 有值就是指定过）。
+fn root_is_configured() -> bool {
+    ROOT_OVERRIDE
+        .get()
+        .map(|slot| {
+            slot.read()
+                .unwrap_or_else(|err| err.into_inner())
+                .is_some()
+        })
+        .unwrap_or(false)
+}
+
+/// [`configs_dir`] 的实现体：`configured` 由调用方给，单测才能不碰全局静态。
+fn configs_dir_with(root: &Path, configured: bool) -> PathBuf {
+    if configured {
+        return root.to_path_buf();
+    }
+    let install = root.join("install");
+    if install.is_dir() {
+        install
+    } else {
+        root.to_path_buf()
+    }
+}
+
+/// 用户在设置页选中的控制器版本目录名（`settings.json` 的 `strata_controller`）。
+///
+/// 与 [`ROOT_OVERRIDE`] 同一个道理：回退启动路径（[`fallback_command`]）与
+/// [`crate::strata_tune::terminal_dir`] 都拿不到 `AppState`。
+static CONTROLLER_OVERRIDE: std::sync::OnceLock<std::sync::RwLock<Option<String>>> =
+    std::sync::OnceLock::new();
+
+fn controller_override() -> &'static std::sync::RwLock<Option<String>> {
+    CONTROLLER_OVERRIDE.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// 记住用户选中的控制器版本（`None` / 空串 = 跟着 `active.json` 走）。
+pub fn configure_controller(version: Option<String>) {
+    let mut guard = controller_override()
+        .write()
+        .unwrap_or_else(|err| err.into_inner());
+    *guard = version.filter(|v| !v.trim().is_empty());
+}
+
+/// 用户选中的控制器版本目录名。
+pub fn controller_preference() -> Option<String> {
+    controller_override()
+        .read()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone()
+}
+
+/// 控制器版本目录的父目录：手动解压布局是 `<根>\control`，官方安装器是 `<根>\terminal`。
+///
+/// 两种布局可能同时存在（官方安装 + 手动解压到同一根），优先 `control`（用户手动解的
+/// 那一份才是他要求 GUI 用的）。
+pub fn controllers_dir(root: &Path) -> PathBuf {
+    let control = root.join("control");
+    if control.is_dir() {
+        return control;
+    }
+    root.join("terminal")
+}
+
+/// 一个目录是不是控制器版本目录：带 `serve\server.py` 或 `strata.py` 即算。
+fn is_controller_dir(dir: &Path) -> bool {
+    dir.join("serve").join("server.py").is_file() || dir.join("strata.py").is_file()
+}
+
+/// 设置页「Strata 控制器版本」列表的一行。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControllerInfo {
+    /// 版本目录名（`0.1.51`）。
+    pub version: String,
+    pub folder: PathBuf,
+    /// 目录里有自带的解释器（`python\python.exe`）。
+    pub python: bool,
+    /// 目录里有 `serve\server.py`。
+    pub server: bool,
+    /// `active.json` 记的当前版本。
+    pub active: bool,
+    /// 能用：带解释器 + `serve\server.py`。
+    pub usable: bool,
+}
+
+/// 列出根目录下并存的控制器版本，新的在前。
+pub fn list_controllers(root: &Path) -> Vec<ControllerInfo> {
+    let base = controllers_dir(root);
+    let active = active_control_folder(&base);
+    let py_name = crate::strata_tune::python_name();
+    let mut out: Vec<ControllerInfo> = subdirs(&base)
+        .into_iter()
+        .filter(|dir| is_controller_dir(dir))
+        .filter_map(|dir| {
+            let version = dir.file_name()?.to_string_lossy().to_string();
+            let python = dir.join("python").join(py_name).is_file();
+            let server = dir.join("serve").join("server.py").is_file();
+            Some(ControllerInfo {
+                active: active.as_deref() == Some(version.as_str()),
+                version,
+                python,
+                server,
+                usable: python && server,
+                folder: dir,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| version_key(&b.version).cmp(&version_key(&a.version)));
+    out
+}
+
+/// 定位某个控制器版本目录（`control\<版本>` 或 `terminal\<版本>`）。
+pub fn controller_dir(root: &Path, version: &str) -> Option<PathBuf> {
+    let version = version.trim();
+    if version.is_empty() {
+        return None;
+    }
+    let dir = controllers_dir(root).join(version);
+    is_controller_dir(&dir).then_some(dir)
+}
+
+/// 当前该用哪个控制器：用户选的 → 最高版本（能用的优先）→ `active.json`。
+///
+/// 顺序是用户 m00875 定的：**默认用最新的控制器**，只有用户手动选过别的版本才用它。
+/// `active.json` 只作最后的兜底 —— 手动解压的目录里它不会自动更新，拿它当首选会用回旧版本。
+pub fn preferred_controller(root: &Path) -> Option<PathBuf> {
+    if let Some(version) = controller_preference() {
+        if let Some(dir) = controller_dir(root, &version) {
+            return Some(dir);
+        }
+    }
+    if let Some(newest) = list_controllers(root).into_iter().find(|info| info.usable) {
+        return Some(newest.folder);
+    }
+    let base = controllers_dir(root);
+    active_control_folder(&base).and_then(|folder| {
+        let dir = base.join(&folder);
+        is_controller_dir(&dir).then_some(dir)
+    })
+}
+
+/// 选中控制器版本后重写 bat 与 config 的结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyControllerResult {
+    pub version: String,
+    pub folder: PathBuf,
+    /// 重写过的 `run-*.bat` 文件名。
+    pub scripts: Vec<String>,
+    /// 改过 `cwd` / `args` 的 config 文件名。
+    pub configs: Vec<String>,
+}
+
+/// 把根目录下所有 `run-*.bat` 与 `strata-*.json` 切到指定控制器版本。
+///
+/// 改两处：
+/// - `run-*.bat`：启动行的解释器与 `serve\server.py` 换成新版本目录里的，
+///   `cd /d` 切到新版本目录；非 serve 侧参数（引擎自己的 `--expert-profile` 等）留在 config 里。
+/// - `strata-*.json`：顶层 `cwd` 指向新版本目录，`args` 里 `--expert-profile` 若位于
+///   其它版本目录的 `data\` 下就跟着换到新目录（同名文件）。
+///
+/// 任何一份写失败都整批报错（与 [`apply_engine`] 同口径）：切一半的安装比不切更难查。
+pub fn apply_controller(
+    root: &Path,
+    version: &str,
+) -> std::result::Result<ApplyControllerResult, String> {
+    let dir = controller_dir(root, version)
+        .ok_or_else(|| format!("控制器版本 {version} 不存在（缺 serve/server.py）"))?;
+    let py_name = crate::strata_tune::python_name();
+    let python = dir.join("python").join(py_name);
+    if !python.is_file() {
+        return Err(format!(
+            "控制器 {} 缺少自带的解释器：{}",
+            version,
+            python.display()
+        ));
+    }
+    let configs = configs_dir(root);
+    let mut scripts = Vec::new();
+    for name in run_script_names(&configs) {
+        let path = configs.join(&name);
+        rewrite_run_script(&path, &dir, &configs).map_err(|err| format!("{name}: {err}"))?;
+        scripts.push(name);
+    }
+    let mut changed = Vec::new();
+    for path in config_files(&configs) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let raw = fs::read_to_string(&path).map_err(|err| format!("读 {name} 失败: {err}"))?;
+        let json: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|err| format!("{name} 不是合法 JSON: {err}"))?;
+        let target = dir.to_string_lossy().to_string();
+        let mut edits: Vec<(String, String)> = Vec::new();
+        if let Some(old) = json.get("cwd").and_then(|value| value.as_str()) {
+            if old != target {
+                edits.push((old.to_string(), target.clone()));
+            }
+        }
+        if let Some(old) = controller_data_arg(&json) {
+            if let Some(file) = controller_data_file_name(Path::new(&old)) {
+                let next = dir.join("data").join(file);
+                let next_text = next.to_string_lossy().to_string();
+                // 新版本目录里没有同名文件就别改：改指过去只会让引擎起不来
+                if next.is_file() && next_text != old {
+                    edits.push((old, next_text));
+                }
+            }
+        }
+        if edits.is_empty() {
+            continue;
+        }
+        // 走文本替换（[`rewrite_config_strings`]）：config 的键序与 1 空格缩进是上游
+        // `setup.py` 写的，序列化回写会把整份文件重排。
+        let pairs: Vec<(&str, &str)> = edits
+            .iter()
+            .map(|(old, next)| (old.as_str(), next.as_str()))
+            .collect();
+        rewrite_config_strings(&path, &pairs).map_err(|err| format!("{name}: {err:#}"))?;
+        changed.push(name);
+    }
+    Ok(ApplyControllerResult {
+        version: version.trim().to_string(),
+        folder: dir,
+        scripts,
+        configs: changed,
+    })
+}
+
+/// 打开控制端自带的安装向导（`setup.py --setup`）。
+///
+/// 上游加模型只有这一条路：向导自己让用户选模型、选卡、写 `strata-<id>.json` 与 `run-<id>.bat`，
+/// 还带试启动。它是交互式 TUI，塞不进 GUI，所以这里开一个新的控制台窗口跑，工作目录设成控制器目录
+/// （`setup.py` 靠自己的位置推 ROOT，换目录就装错地方）。
+///
+/// 返回控制器目录（前端拿来提示用户）。
+pub fn open_setup() -> std::result::Result<String, String> {
+    let root = root().ok_or_else(|| "还没指定 Strata 目录：先到设置页填好再添加模型".to_string())?;
+    let dir = preferred_controller(&root)
+        .ok_or_else(|| format!("{} 下没有可用的控制器版本", root.display()))?;
+    let script = dir.join("setup.py");
+    if !script.is_file() {
+        return Err(format!("控制器缺少 setup.py：{}", script.display()));
+    }
+    let python = dir.join("python").join(crate::strata_tune::python_name());
+    if !python.is_file() {
+        return Err(format!(
+            "控制器缺少自带的解释器：{}",
+            python.display()
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NEW_CONSOLE：向导要真终端（问选项、画进度），不能继承本进程隐藏的控制台
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        std::process::Command::new("cmd.exe")
+            .current_dir(&dir)
+            .arg("/k")
+            .arg(format!(
+                "\"{}\" \"{}\" --setup",
+                python.display(),
+                script.display()
+            ))
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .spawn()
+            .map_err(|err| format!("打开安装向导失败：{err}"))?;
+        Ok(dir.display().to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        Err("当前系统不支持在 GUI 里打开安装向导".to_string())
+    }
+}
+
+/// `configs_dir` 下的 `run-*.bat` / `run-*.sh`。
+fn run_script_names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
-    let engine = base.join("engine");
-    if engine.is_dir() {
-        vec![engine]
-    } else {
-        Vec::new()
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let lower = name.to_ascii_lowercase();
+            (lower.starts_with("run-") && (lower.ends_with(".bat") || lower.ends_with(".sh")))
+                .then_some(name)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// `configs_dir` 下的 `strata-*.json`。
+fn config_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .map(|n| is_config_file(&n.to_string_lossy()))
+                    .unwrap_or(false)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// `args` 里指向控制器数据目录的路径参数（目前只有 `--expert-profile`）。
+///
+/// 上游 `setup.py:9542` 把它写成 `<根>\control\<版本>\data\expert-profile.bin`，
+/// 换控制器版本时这个路径得跟着换。
+fn controller_data_arg(json: &serde_json::Value) -> Option<String> {
+    let args = json.get("args")?.as_array()?;
+    let pos = args
+        .iter()
+        .position(|value| value.as_str() == Some("--expert-profile"))?;
+    args.get(pos + 1)?.as_str().map(|value| value.to_string())
+}
+
+/// `<…>\control\<版本>\data\<文件>` / `<…>\terminal\<版本>\data\<文件>` → `Some("<文件>")`。
+fn controller_data_file_name(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy().to_string();
+    let parent = path.parent()?;
+    if parent.file_name()?.to_string_lossy().to_ascii_lowercase() != "data" {
+        return None;
+    }
+    let version_dir = parent.parent()?;
+    let base = version_dir.parent()?;
+    let base_name = base.file_name()?.to_string_lossy().to_ascii_lowercase();
+    (base_name == "control" || base_name == "terminal").then_some(name)
+}
+
+/// 重写一份 `run-*.bat`：解释器、`server.py`、工作目录与 `--config` 都指向新位置。
+///
+/// 按子串替换而不是重排整行：脚本里的其它参数（`--open` / `--host` …）与行首前缀
+/// （`start "" /b` 一类）原样保留 —— 整行重建等于把脚本改回上游模板，用户自己加的
+/// 东西会静默消失。行尾风格沿用原文件（上游写的是 CRLF）。
+fn rewrite_run_script(
+    path: &Path,
+    dir: &Path,
+    configs_dir: &Path,
+) -> std::result::Result<(), String> {
+    let raw = fs::read_to_string(path).map_err(|err| format!("读 {} 失败: {err}", path.display()))?;
+    let crlf = raw.contains("\r\n");
+    let py_name = crate::strata_tune::python_name();
+    let python = dir.join("python").join(py_name);
+    let server_py = dir.join("serve").join("server.py");
+    // 脚本同名 config（`run-<slug>.bat` → `strata-<slug>.json`）：启动行里的 `--config`
+    // 若还指着官方安装目录，只换控制器版本跑起来读的还是旧 config，所以一并换掉。
+    let own_config = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .and_then(|stem| stem.strip_prefix("run-").map(|slug| slug.to_string()))
+        .map(|slug| configs_dir.join(format!("strata-{slug}.json")))
+        .filter(|candidate| candidate.is_file());
+    let mut out = String::new();
+    let mut rewrote = false;
+    for line in raw.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']).to_string();
+        let trimmed = body.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("cd ") || lower.starts_with("cd/") {
+            let next = match cd_path(trimmed) {
+                Some(old) => replace_first(&body, &old, &dir.to_string_lossy()),
+                None => format!("cd /d \"{}\"", dir.display()),
+            };
+            out.push_str(&next);
+            if crlf {
+                out.push('\r');
+            }
+            out.push('\n');
+            continue;
+        }
+        if !trimmed.is_empty() && lower.contains("server.py") && !rewrote {
+            let tokens = quote_tokens(trimmed);
+            let Some(server_idx) = tokens
+                .iter()
+                .position(|t| t.to_ascii_lowercase().ends_with("server.py"))
+            else {
+                out.push_str(line);
+                continue;
+            };
+            let mut next = body.clone();
+            next = replace_first(&next, &tokens[server_idx], &server_py.to_string_lossy());
+            // 解释器：`server.py` 之前最近的一个「像解释器」的 token
+            if let Some(interp) = tokens[..server_idx]
+                .iter()
+                .rev()
+                .find(|t| looks_like_python(t))
+            {
+                next = replace_first(&next, interp, &python.to_string_lossy());
+            }
+            if let Some(pos) = tokens.iter().position(|t| t == "--config") {
+                if let (Some(old), Some(cfg)) = (tokens.get(pos + 1), own_config.as_ref()) {
+                    next = replace_first(&next, old, &cfg.to_string_lossy());
+                }
+            }
+            out.push_str(&next);
+            if crlf {
+                out.push('\r');
+            }
+            out.push('\n');
+            rewrote = true;
+            continue;
+        }
+        out.push_str(line);
+    }
+    if !rewrote {
+        return Err("脚本里没有 server.py 启动行".to_string());
+    }
+    // 内容没变就不写：设置页每次进来都会对齐最新版本，无谓的写会刷 mtime、惊动别的监听者。
+    if out == raw {
+        return Ok(());
+    }
+    fs::write(path, out).map_err(|err| format!("写 {} 失败: {err}", path.display()))
+}
+
+/// 一个 `cd` 行指向的路径（带引号取引号内，否则取最后一个空白之后）。
+fn cd_path(line: &str) -> Option<String> {
+    if let Some(start) = line.find('"') {
+        let rest = &line[start + 1..];
+        return rest.find('"').map(|end| rest[..end].to_string());
+    }
+    line.split_whitespace().last().map(|token| token.to_string())
+}
+
+/// 这个 token 看起来是 python 解释器（`python.exe` / `…\python`）。
+fn looks_like_python(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    lower.ends_with("python.exe") || lower.ends_with("\\python") || lower.ends_with("/python")
+}
+
+/// 只替换第一处出现；新旧相同或找不到时原样返回。
+fn replace_first(text: &str, old: &str, new: &str) -> String {
+    if old.is_empty() || old == new {
+        return text.to_string();
+    }
+    match text.find(old) {
+        Some(pos) => {
+            let mut out = text.to_string();
+            out.replace_range(pos..pos + old.len(), new);
+            out
+        }
+        None => text.to_string(),
     }
 }
 
@@ -532,8 +998,8 @@ const ENGINE_COMPONENT_ID: &str = "strata-engine";
 /// `platform` 要是本机、版本取最高；同版本多后端时优先 `cuda` 目录（本机是 N 卡）。
 /// 没有清单的目录按 0.1.x 的单目录布局处理（直接找 `strata.exe`），这样旧安装不会
 /// 因为升级到新 GUI 而失效。
-fn resolve_component(root: &Path, id: &str, extra: &[PathBuf]) -> Option<EngineComponent> {
-    resolve_component_in(&engine_folders(root, extra), id)
+fn resolve_component(root: &Path, id: &str) -> Option<EngineComponent> {
+    resolve_component_in(&engine_folders(root), id)
 }
 
 /// [`resolve_component`] 的实现体：候选目录由调用方给，单测才能不碰真实安装。
@@ -596,7 +1062,7 @@ fn component_version_at(exe: &Path) -> Option<String> {
     value.get("version")?.as_str().map(|s| s.to_string())
 }
 
-/// 一份可选引擎（`engine-bundle` 下的一个版本目录），供前端列出让用户挑选。
+/// 一份可选引擎（`components\engine\` 下的一个版本目录），供前端列出让用户挑选。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineInfo {
@@ -612,16 +1078,16 @@ pub struct EngineInfo {
 ///
 /// 升级会把新版本目录加进来、旧的不一定删，所以这里可能有多份；前端让用户选，
 /// 选中的写进 config 的 `exe`（`strata_set_engine`）。候选目录与解析用的是同一套
-/// [`engine_folders`]（按引擎文件找，不认 `engine-bundle` / `engine` 这些名字）。
+/// [`engine_folders`]（按引擎文件找，不认目录名；官方布局在 `components\engine\` 下）。
 pub fn list_engines(root: &Path) -> Vec<EngineInfo> {
-    list_engines_with(root, &controller_component_dirs())
+    list_engines_with(root)
 }
 
-fn list_engines_with(root: &Path, extra: &[PathBuf]) -> Vec<EngineInfo> {
+fn list_engines_with(root: &Path) -> Vec<EngineInfo> {
     let entry_name = if cfg!(windows) { "strata.exe" } else { "strata" };
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for folder in engine_folders(root, extra) {
+    for folder in engine_folders(root) {
         let manifest = fs::read_to_string(folder.join("engine-component.json"))
             .ok()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
@@ -679,12 +1145,16 @@ fn engine_version(exe: &Path) -> Option<String> {
 }
 
 /// 找上游生成的启动脚本（`setup.py:4373-4386 write_run_script`）。
+///
+/// 脚本跟 config 放在一起（官方布局 `<根>\install\run-<slug>.bat`），所以这里也走
+/// [`configs_dir`]，和 config 扫描用同一个目录。
 fn find_run_script(root: &Path, slug: &str) -> Option<PathBuf> {
-    let bat = root.join(format!("run-{slug}.bat"));
+    let dir = configs_dir(root);
+    let bat = dir.join(format!("run-{slug}.bat"));
     if bat.exists() {
         return Some(bat);
     }
-    let sh = root.join(format!("run-{slug}.sh"));
+    let sh = dir.join(format!("run-{slug}.sh"));
     if sh.exists() {
         return Some(sh);
     }
@@ -768,7 +1238,7 @@ fn sync_run_script(root: &Path, slug: &str, port: u16) {
 /// 用来连它的元数据（见 [`spawn_strata`] 的校验）。写盘走 [`write_config_raw`]：
 /// 先备份固定名 `.json.bak`、原子替换、JSON 合法性自检。
 pub fn set_port(root: &Path, config_file: &str, port: u16) -> Result<()> {
-    let path = root.join(config_file);
+    let path = configs_dir(root).join(config_file);
     let raw = fs::read_to_string(&path).with_context(|| format!("读不到 {}", path.display()))?;
     let next = match replace_json_port(&raw, port) {
         Some(text) => text,
@@ -846,7 +1316,7 @@ pub fn ensure_ports(root: &Path) -> usize {
 /// 设置页「Strata 引擎版本」选定的可执行文件（`settings.strata_engine`）。
 ///
 /// 只在文件真的存在时返回 —— 选过的版本被删掉/升级移走时当作没选，回退到
-/// config 声明或 `engine-bundle` 里的最高版本，而不是把所有 config 都指到空路径。
+/// config 声明或引擎组件目录里的最高版本，而不是把所有 config 都指到空路径。
 pub fn preferred_engine(engine: Option<&str>) -> Option<PathBuf> {
     engine
         .map(str::trim)
@@ -855,13 +1325,13 @@ pub fn preferred_engine(engine: Option<&str>) -> Option<PathBuf> {
         .filter(|p| p.is_file())
 }
 
-/// 扫描 Strata 根目录下的全部 config，按 mtime 倒序（照抄 `setup.py:3723-3725`）。
+/// 扫描 config 目录下的全部 config，按 mtime 倒序（照抄 `setup.py:3723-3725`）。
 ///
+/// `root` 可以是官方安装根（此时扫 `<根>\install`），也可以直接是 config 目录。
 /// `preferred` 见 [`parse_config`]：设置页选定的引擎版本，存在时对每份 config 都生效。
 pub fn scan_configs(root: &Path, preferred: Option<&Path>) -> Vec<StrataModelEntry> {
     let mut out = Vec::new();
-    let extra = controller_component_dirs();
-    let Ok(read_dir) = fs::read_dir(root) else {
+    let Ok(read_dir) = fs::read_dir(configs_dir(root)) else {
         return out;
     };
     for item in read_dir.flatten() {
@@ -872,7 +1342,7 @@ pub fn scan_configs(root: &Path, preferred: Option<&Path>) -> Vec<StrataModelEnt
         if !is_config_file(&name) {
             continue;
         }
-        if let Some(entry) = parse_config(&path, preferred, &extra) {
+        if let Some(entry) = parse_config(&path, preferred) {
             out.push(entry);
         }
     }
@@ -1044,13 +1514,14 @@ fn quote_tokens(line: &str) -> Vec<String> {
     out
 }
 
-/// 回退启动命令（run 脚本缺失/解析失败时）：照抄上游默认布局。
+/// 回退启动命令（run 脚本缺失/解析失败时）：照官方安装器的目录布局找控制端。
 ///
-/// control 0.1.46 起控制端自带解释器：`<安装目录>\control\python\python.exe` +
-/// `<安装目录>\control\serve\server.py`；0.1.x 是 `<安装目录>\.venv\Scripts\python.exe`
-/// + `<安装目录>\serve\server.py`。两套都试，先看哪套的文件真的在。
-/// 安装目录若被指到引擎子目录（如 `E:\AI\Strata\engine`），control 在上一级，
-/// 所以父目录也进候选（用户 m04254）。
+/// 官方布局（用户 m00732：只认这一套）：
+/// `<根>\terminal\<版本>\python\python.exe` + `<根>\terminal\<版本>\serve\server.py`，
+/// `<根>\terminal\current` 是指向当前版本的目录联结 —— 升级换版本只换联结，旧版本目录留着可回退。
+///
+/// 旧布局（`control\` 自带解释器 / 安装根下的 `.venv`）作为兜底保留：`root` 可能被指到
+/// 引擎子目录（`<根>\components\engine\<版本>-…`），父目录也进候选（用户 m04254）。
 fn fallback_command(
     root: &Path,
     config_path: &Path,
@@ -1059,10 +1530,62 @@ fn fallback_command(
     let py_name = if cfg!(windows) { "python.exe" } else { "python" };
     let mut candidates: Vec<(PathBuf, PathBuf, Option<PathBuf>)> = Vec::new();
     for base in std::iter::once(root).chain(root.parent()) {
+        // ⓪ 设置页「Strata 控制器版本」选中的那一份：用户显式选的排在最前
+        if let Some(version) = controller_preference() {
+            if let Some(dir) = controller_dir(base, &version) {
+                candidates.push((
+                    dir.join("python").join(py_name),
+                    dir.join("serve").join("server.py"),
+                    Some(dir),
+                ));
+            }
+        }
+        // ① 官方脚本布局：`terminal\current` 优先，其余版本目录按名字排（新版本在前）
+        let terminal = base.join("terminal");
+        let mut term_dirs: Vec<PathBuf> = Vec::new();
+        let current = terminal.join("current");
+        if current.join("python").join(py_name).is_file() {
+            term_dirs.push(current);
+        }
+        for dir in subdirs(&terminal) {
+            if !dir.join("python").join(py_name).is_file() {
+                continue;
+            }
+            // `current` 也是 `terminal` 的一个入口（目录联结），按真实路径去重
+            if term_dirs
+                .iter()
+                .any(|known| canonical_key(known) == canonical_key(&dir))
+            {
+                continue;
+            }
+            term_dirs.push(dir);
+        }
+        for dir in term_dirs {
+            candidates.push((
+                dir.join("python").join(py_name),
+                dir.join("serve").join("server.py"),
+                Some(dir),
+            ));
+        }
+        // ② 手动解压 / 旧布局：`control\<版本>\`（控制端自带解释器）
+        //    `active.json` 记的版本优先，其次按版本号从高到低
         let control = base.join("control");
-        // control 0.1.47 起控制端在 `control\<版本>\`，版本号记在 `active.json`（用户 m05626）
+        let mut control_dirs: Vec<PathBuf> = Vec::new();
         if let Some(folder) = active_control_folder(&control) {
-            let dir = control.join(&folder);
+            control_dirs.push(control.join(&folder));
+        }
+        let mut local = subdirs(&control);
+        local.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        for dir in local {
+            if is_controller_dir(&dir)
+                && !control_dirs
+                    .iter()
+                    .any(|known| canonical_key(known) == canonical_key(&dir))
+            {
+                control_dirs.push(dir);
+            }
+        }
+        for dir in control_dirs {
             candidates.push((
                 dir.join("python").join(py_name),
                 dir.join("serve").join("server.py"),
@@ -1074,6 +1597,7 @@ fn fallback_command(
             control.join("serve").join("server.py"),
             Some(control),
         ));
+        // ③ 更早期的 `.venv` + `serve`：手动解包安装才会出现
         let venv_py = if cfg!(windows) {
             base.join(".venv").join("Scripts").join(py_name)
         } else {
@@ -1141,6 +1665,38 @@ pub fn loopback_host(host: &str) -> String {
     }
 }
 
+/// 把 `args` 里 `flag` 后面那个值换成 `value`；没有这个 flag 就补一对。
+fn replace_flag(args: &[String], flag: &str, value: &str) -> Vec<String> {
+    let mut out = args.to_vec();
+    if let Some(index) = out.iter().position(|arg| arg == flag) {
+        if index + 1 < out.len() && !out[index + 1].starts_with("--") {
+            out[index + 1] = value.to_string();
+        } else {
+            out.insert(index + 1, value.to_string());
+        }
+    } else {
+        out.push(flag.to_string());
+        out.push(value.to_string());
+    }
+    out
+}
+
+/// 按这份模型的 launch 预设生成运行配置（没有预设、或生成失败则 `None`）。
+fn launch_sync(
+    hub: &Arc<LogHub>,
+    entry: &StrataModelEntry,
+) -> Option<crate::strata_launch::LaunchSync> {
+    let terminal = crate::strata::root()
+        .and_then(|root| crate::strata_tune::terminal_dir(&root))?;
+    let folder = entry.model_path.as_ref()?;
+    crate::strata_launch::sync_for_entry(
+        hub,
+        &terminal,
+        &folder.to_string_lossy(),
+        &entry.config_path,
+    )
+}
+
 /// 就绪探测用的地址：`0.0.0.0` / `::` 这类通配监听在本地按 loopback 连。
 fn probe_addr(host: &str, port: u16) -> std::net::SocketAddr {
     let h = match host.trim() {
@@ -1171,16 +1727,24 @@ pub fn spawn_strata(
         .context("config 路径异常")?
         .to_path_buf();
 
-    let host = entry.host.clone();
+    let mut host = entry.host.clone();
     let mut port = entry.port;
-    let api_key = entry.api_key.clone();
+    let mut api_key = entry.api_key.clone();
+    // 这份模型有没有 launch 预设：有的话端口 / config 都由预设决定，安装器那份不动
+    // （否则自动分配端口会把 `install\strata-<tag>.json` 改掉，而启动根本不用它）。
+    let model_folder = entry
+        .model_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let has_launch = crate::strata_launch::find_for(&model_folder).is_some();
 
     // 端口自动分配（用户 m05322）：config 里没写端口、写的是安装器默认 8080（用户 m05516）、
     // 或写的端口已被占用（别的模型先起来了），就从 9091 起挑一个空闲的（逻辑同 llama.cpp 侧），
     // 写回 config 与 `run-<slug>.bat` 再启动。
     // 以前这里是「占用就报错、不顺延」—— 用户要求自己挑，所以改成自动分配。
     let unconfigured = port == 0 || port == STRATA_PORT_DEFAULT;
-    if unconfigured || winfix::port_in_use(port) {
+    if !has_launch && (unconfigured || winfix::port_in_use(port)) {
         let (_, config_file, _) = split_config_path(&entry.config_path).context("config 路径异常")?;
         let next = allocate_port(&root, &config_file);
         if next != port {
@@ -1205,7 +1769,7 @@ pub fn spawn_strata(
         }
     }
 
-    let (exe, args, script_cwd) = match entry
+    let (exe, mut args, script_cwd) = match entry
         .run_script
         .as_ref()
         .and_then(|p| parse_run_script(p))
@@ -1216,18 +1780,34 @@ pub fn spawn_strata(
     // 脚本里的 `cd /d` 目标优先：control 0.1.47 起引擎要以 `control\<版本>` 为工作目录
     let cwd = script_cwd.unwrap_or_else(|| entry.cwd.clone());
 
+    // launch 预设优先（用户 m02055）：在预设里就按它重新生成 `launch\<slug>.json`，把命令里的
+    // --config / --port 换掉，host 与 key 也换成预设的 —— 与 `strata launch` 起出来的服务一致
+    // （context / kv / vision / 卡 / extra env 全在生成出来的配置里）。
+    if has_launch {
+        if let Some(sync) = launch_sync(&hub, entry) {
+            args = replace_flag(&args, "--config", &sync.config);
+            args = replace_flag(&args, "--port", &sync.port.to_string());
+            host = sync.host;
+            port = sync.port;
+            api_key = sync.api_key;
+        }
+    }
+
     // run 脚本里的 `--port` 才是引擎真正绑定的端口：`server.py` 只认 CLI 参数
     // （`cfg["port"]` 没有回退），config 里的 `port` 只是 GUI 用来找它的元数据。
     // 两处不一致时 GUI 会一直等错端口（表现为"启动失败"并把刚起的进程杀掉），
     // 所以在这里提前拦下，把要改的两个地方直接写进报错（用户 m00798 那种改端口只改了一处）。
-    if let Some(script) = entry.run_script.as_ref() {
-        if let Some(script_port) = arg_flag_value(&args, "--port") {
-            if script_port != port {
-                anyhow::bail!(
-                    "config 里写的端口是 {port}，但 {} 里的 --port 是 {script_port}。\
-                     引擎实际绑定的是 run 脚本里的端口，请把两处改成一致（GUI 按 config 的端口去连它）。",
-                    script.display()
-                );
+    // 用 launch 配置启动时这条不成立（端口来自预设，脚本里的是安装器端口）。
+    if !has_launch {
+        if let Some(script) = entry.run_script.as_ref() {
+            if let Some(script_port) = arg_flag_value(&args, "--port") {
+                if script_port != port {
+                    anyhow::bail!(
+                        "config 里写的端口是 {port}，但 {} 里的 --port 是 {script_port}。\
+                         引擎实际绑定的是 run 脚本里的端口，请把两处改成一致（GUI 按 config 的端口去连它）。",
+                        script.display()
+                    );
+                }
             }
         }
     }
@@ -1677,11 +2257,11 @@ fn engine_edits(
 /// 选版本后也换成真实 exe 路径；组件引用只在扫描时被解析（并顺手改写成绝对路径），
 /// 不再是磁盘上的长期形态。
 pub fn set_engine(root: &Path, config_file: &str, exe: &str) -> std::result::Result<(), String> {
-    let path = root.join(config_file);
+    let path = configs_dir(root).join(config_file);
     if !path.is_file() {
         return Err(format!("config 不存在：{}", path.display()));
     }
-    // 「自动使用最新版本」那一项传进来的就是 `component:strata-engine`，不是文件路径。
+    // 传进来的可能是 `component:strata-engine` 引用，不是文件路径。
     let reference = exe.starts_with("component:");
     let target = PathBuf::from(exe);
     if !reference && !target.is_file() {
@@ -1700,9 +2280,9 @@ pub fn set_engine(root: &Path, config_file: &str, exe: &str) -> std::result::Res
     } else {
         target.to_string_lossy().to_string()
     };
-    // vision 永远是绝对路径：引用形态下按控制器组件目录解析出当前真实引擎再去同步。
+    // vision 永远是绝对路径：引用形态下按同一个 Strata 根目录解析出真实引擎再去同步。
     let vision_base = if reference {
-        resolve_component(root, ENGINE_COMPONENT_ID, &controller_component_dirs())
+        resolve_component(root, ENGINE_COMPONENT_ID)
             .map(|c| c.exe)
             .unwrap_or_else(|| target.clone())
     } else {
@@ -1721,13 +2301,14 @@ pub fn set_engine(root: &Path, config_file: &str, exe: &str) -> std::result::Res
 /// 返回被写过的文件名列表；任何一份失败就整批报错（已写成功的留在原地，不尝试回滚 ——
 /// 回滚要重写配置，失败概率只增不减，报错里已经点明哪些文件出问题）。
 pub fn apply_engine(root: &Path, exe: &str) -> std::result::Result<Vec<String>, String> {
-    // 「自动使用最新版本」那一项传进来的是 `component:strata-engine`，不是文件路径（用户 m04934）。
+    // 传进来的可能是 `component:strata-engine` 引用，不是文件路径（用户 m04934）。
     let reference = exe.starts_with("component:");
     let target = PathBuf::from(exe);
     if !reference && !target.is_file() {
         return Err(format!("引擎文件不存在：{}", target.display()));
     }
-    let read_dir = fs::read_dir(root).map_err(|e| format!("读不到目录 {}：{e}", root.display()))?;
+    let read_dir =
+        fs::read_dir(configs_dir(root)).map_err(|e| format!("读不到目录 {}：{e}", root.display()))?;
     let mut changed = Vec::new();
     let mut failed = Vec::new();
     for item in read_dir.flatten() {
@@ -1793,6 +2374,351 @@ pub fn write_config_raw(path: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// 顶层 JSON 键 → (值起点, 值终点) 的字节范围。
+///
+/// 为什么不用 `serde_json` 读改写：`serde_json` 没开 `preserve_order`，`Value` 的对象是
+/// `BTreeMap`，序列化回写会把键按字母序打乱、把 `\/` 变 `/`，等于每次改一个字段就重写整份
+/// 文件。config 的键序与缩进是上游 `setup.py` 写的（用户在左栏直接看原文），不能动。
+/// 所以只在**原文的字节区间**上做替换，思路同 [`rewrite_config_strings`]。
+///
+/// 只认顶层（深度 1）的键：`args` 里的字符串、嵌套对象里的同名键都不碰。
+fn top_level_values(text: &str) -> Vec<(String, usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut out: Vec<(String, usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let Some(end) = scan_json_string(bytes, i) else { break };
+                if depth == 1 {
+                    let key = String::from_utf8_lossy(&bytes[i + 1..end - 1]).to_string();
+                    let colon = skip_json_ws(bytes, end);
+                    if bytes.get(colon) == Some(&b':') {
+                        let start = skip_json_ws(bytes, colon + 1);
+                        if let Some(stop) = scan_json_value(bytes, start) {
+                            out.push((key, start, stop));
+                        }
+                    }
+                }
+                i = end;
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+fn skip_json_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// `i` 指向开引号，返回闭引号之后的位置。
+fn scan_json_string(bytes: &[u8], mut i: usize) -> Option<usize> {
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// `i` 指向值的首字节，返回值结束后的位置（不含尾随空白与逗号）。
+fn scan_json_value(bytes: &[u8], i: usize) -> Option<usize> {
+    match *bytes.get(i)? {
+        b'"' => scan_json_string(bytes, i),
+        b'[' | b'{' => {
+            let mut depth = 0usize;
+            let mut j = i;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'"' => {
+                        j = scan_json_string(bytes, j)?;
+                        continue;
+                    }
+                    b'[' | b'{' => depth += 1,
+                    b']' | b'}' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            return Some(j + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            None
+        }
+        _ => {
+            let mut j = i;
+            while j < bytes.len() && !matches!(bytes[j], b',' | b'}' | b']' | b'\n' | b'\r') {
+                j += 1;
+            }
+            let mut end = j;
+            while end > i && bytes[end - 1].is_ascii_whitespace() {
+                end -= 1;
+            }
+            Some(end)
+        }
+    }
+}
+
+/// 把 config 顶层的 `api_key` 设成 `key`（`None` = 写 `null`，引擎就不再要求鉴权）。
+///
+/// 用户 m01543：设置页「服务」里的 API Key 必须落进每个引擎的 config ——
+/// llama.cpp 侧由 `configSetApiKey` 写各自 config，Strata 侧读顶层 `api_key`，就在这里写。
+/// 值写 `null` 而不是删键：删键要处理前后逗号（键序是上游写的，不能重排），
+/// 而 `null` 在上游等价于「没有 key」（`cfg.get("api_key")` 取不到字符串）。
+pub fn set_config_api_key(path: &Path, key: Option<&str>) -> Result<()> {
+    let text = fs::read_to_string(path).with_context(|| format!("读 config 失败: {}", path.display()))?;
+    let rendered = match key {
+        Some(value) => serde_json::to_string(value).context("编码 API Key 失败")?,
+        None => "null".to_string(),
+    };
+    let next = match top_level_values(&text).into_iter().find(|(name, ..)| name == "api_key") {
+        Some((_, start, end)) => format!("{}{}{}", &text[..start], rendered, &text[end..]),
+        None => {
+            // 没有这个键：插在开头的 `{` 之后，缩进对齐顶层其它键（1 空格）。
+            let brace = text.find('{').context("config 原文不是 JSON 对象")?;
+            format!("{}\n \"api_key\": {},{}", &text[..=brace], rendered, &text[brace + 1..])
+        }
+    };
+    write_config_raw(path, &next)
+}
+
+/// 把 API Key 写进全部 Strata config（`<根>\strata-*.json`），返回（已写, 失败）。
+///
+/// 用户在设置页点保存时调用（用户 m01543 第 1 条）：GUI 里的 Key 必须和 config 里的一致，
+/// 否则 GUI 以为要鉴权、引擎却不认。空字符串按「清掉」处理（写 `null`）。
+pub fn set_api_key_all(root: &Path, key: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let mut written = Vec::new();
+    let mut failed = Vec::new();
+    let dir = configs_dir(root);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return (written, failed);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !is_config_file(&name) {
+            continue;
+        }
+        match set_config_api_key(&path, key) {
+            Ok(()) => written.push(name),
+            Err(_) => failed.push(name),
+        }
+    }
+    (written, failed)
+}
+
+/// 把 config 顶层的 `args` 整体换成 `args`（调优结果落盘用，用户 m01544）。
+///
+/// 只换数组中括号那一段，其余字节原样保留（同 [`top_level_values`] 的理由）。
+pub fn write_config_args(path: &Path, args: &[String]) -> Result<()> {
+    let text = fs::read_to_string(path).with_context(|| format!("读 config 失败: {}", path.display()))?;
+    let (start, end) = top_level_values(&text)
+        .into_iter()
+        .find(|(name, ..)| name == "args")
+        .map(|(_, start, end)| (start, end))
+        .context("config 缺少顶层 args 数组，已取消写入")?;
+    let mut rendered = String::from("[");
+    if args.is_empty() {
+        rendered.push_str("\n ]");
+    } else {
+        for (index, item) in args.iter().enumerate() {
+            // 与上游 `json.dumps(cfg, indent=1)` 一致：数组元素缩进 2 空格、闭合括号 1 空格。
+            rendered.push_str(if index == 0 { "\n  " } else { ",\n  " });
+            rendered.push_str(&serde_json::to_string(item)?);
+        }
+        rendered.push_str("\n ]");
+    }
+    let next = format!("{}{}{}", &text[..start], rendered, &text[end..]);
+    write_config_raw(path, &next)
+}
+
+// ---------------------------------------------------------------------------
+// 控制器跟踪的引擎版本与回退（用户 m02756）
+// ---------------------------------------------------------------------------
+
+/// 引擎版本状态：**由 Strata 控制器决定，不让用户选**（用户 m02756 第 2 条）。
+///
+/// 数据源是控制端自己的判断（`strata components engine`），不是 GUI 扫目录猜的：
+/// 控制器知道 pin、上一版、能不能用，这几样目录里看不出来。
+#[derive(Debug, Clone, Serialize)]
+pub struct StrataEngineState {
+    /// 控制器当前会启动的引擎版本，如 `0.1.48`
+    pub version: Option<String>,
+    /// Strata 的发布版本，如 `0.2.7`（取自 `engine-component.json` 的 notes 开头）。
+    ///
+    /// 控制端目录名与引擎组件号都走 `0.1.x` 那条线，而 `catalog.ts` 的家族门禁（deepseek41
+    /// 要 `0.2.5`）用的是发布版本线 —— 两者不能直接比，否则 0.1.52 会被误判成「太旧」。
+    pub release: Option<String>,
+    /// 引擎目录名（`<版本>-<平台>-<后端>`），如 `0.1.48-windows-x86_64-cuda-cuda13`
+    pub folder: Option<String>,
+    /// 上一版（上次更新留下的那份）；为空 = 没有可回退的版本
+    pub previous: Option<String>,
+    /// 被 pin 住的版本（回退之后出现，下次更新成功才清掉）
+    pub pinned: Option<String>,
+    pub usable: bool,
+    pub update_notice: Option<String>,
+}
+
+/// 起一次控制端 python 跑 `strata.py components …`，返回解析后的 JSON。
+///
+/// `ok=false` 当成失败往上抛，错误消息原样带出控制端的说法（例如
+/// "there is no previous engine to return to …"），前端直接展示。
+fn run_components(args: &[&str]) -> Result<serde_json::Value> {
+    let root = crate::strata::root()
+        .filter(|root| root.is_dir())
+        .context("未找到 Strata 目录（设置 → 通用 → Strata 目录 可指定）")?;
+    let terminal = crate::strata_tune::terminal_dir(&root)
+        .context("未找到 Strata 控制端（<根>\\control\\<版本> 或 <根>\\terminal\\<版本>，缺 python\\python.exe）")?;
+    let python = terminal.join("python").join(crate::strata_tune::python_name());
+    let script = terminal.join("strata.py");
+    if !script.is_file() {
+        anyhow::bail!("控制端缺少 strata.py：{}", script.display());
+    }
+    // `components` 默认去 `%LOCALAPPDATA%\Strata\components` 找组件包，那跟「Strata 目录」是两回事
+    // （用户 m00194：设置页报「读取 Strata 引擎版本失败：控制端拒绝了这次操作」—— 控制端根本
+    // 没看 `<根>\engine`）。`engine` / `rollback` 都支持 `--components-dir`（`verify` / `plan` /
+    // `backends` 不支持，别乱加），显式指到根目录，与控制端 `update --components-dir` 的口径一致。
+    let root_text = root.to_string_lossy().to_string();
+    let wants_dir = matches!(args.first().copied(), Some("engine") | Some("rollback"));
+    let mut full: Vec<&str> = args.to_vec();
+    if wants_dir {
+        full.push("--components-dir");
+        full.push(root_text.as_str());
+    }
+    let mut cmd = Command::new(&python);
+    cmd.arg(&script)
+        .arg("components")
+        .args(&full)
+        .current_dir(&terminal)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    winfix::hide_console(&mut cmd);
+    let out = cmd
+        .output()
+        .with_context(|| format!("调用 {} 失败", python.display()))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // 控制端会先打几行人读日志；JSON 是最后一行以 `{` 开头的输出。
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .with_context(|| {
+            format!(
+                "strata components {} 没有输出 JSON（退出码 {:?}）：{}",
+                args.first().copied().unwrap_or(""),
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )
+        })?;
+    let value: serde_json::Value =
+        serde_json::from_str(line.trim()).context("解析 strata components 输出失败")?;
+    if value.get("ok").and_then(|item| item.as_bool()) == Some(false) {
+        // 旧版控制端把原因写在 `error.message`；新版（0.1.52 起）实测放在顶层 `notice`
+        // （"No engine for this PC was found in …"），只看 `error` 会退化成一句没头没尾的
+        // 「控制端拒绝了这次操作」（用户 m00194 就是这么撞上的）。
+        let message = value
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(|item| item.as_str())
+            .or_else(|| value.get("error").and_then(|item| item.as_str()))
+            .or_else(|| value.get("notice").and_then(|item| item.as_str()))
+            .unwrap_or("控制端拒绝了这次操作");
+        anyhow::bail!("{}", message);
+    }
+    Ok(value)
+}
+
+/// 读控制器眼里的引擎状态（`strata components engine --output json`）。
+pub fn engine_state() -> Result<StrataEngineState> {
+    let value = run_components(&["engine", "--output", "json"])?;
+    let text = |source: Option<&serde_json::Value>, key: &str| {
+        source
+            .and_then(|item| item.get(key))
+            .and_then(|item| item.as_str())
+            .map(|text| text.to_string())
+    };
+    let engine = value.get("engine");
+    let root = text(engine, "root");
+    let version = text(engine, "version");
+    let release = release_version(root.as_deref());
+    let folder = root
+        .as_deref()
+        .and_then(|root| Path::new(root).file_name().map(|name| name.to_string_lossy().to_string()));
+    Ok(StrataEngineState {
+        version,
+        release,
+        folder,
+        previous: text(Some(&value), "previous"),
+        pinned: text(Some(&value), "pinned"),
+        usable: value.get("usable").and_then(|item| item.as_bool()).unwrap_or(false),
+        update_notice: text(Some(&value), "update_notice"),
+    })
+}
+
+/// 从引擎目录的 `engine-component.json` 里读出 Strata 发布版本。
+///
+/// 这份元数据的 `version` 是组件号（`0.1.52`），发布版本写在 `notes` 开头：
+/// `"0.2.7 NVIDIA cuda13 engine with the CUDA picture reader (strata-vision)"`。
+/// 读不到（旧引擎没这份文件）就返回 None —— 界面据此放弃发布级门禁，
+/// 不再拿组件号硬比（用户 m01630：控制端 0.1.52 = Strata 0.2.7，不该被拦）。
+fn release_version(root: Option<&str>) -> Option<String> {
+    let root = root?;
+    let text = fs::read_to_string(Path::new(root).join("engine-component.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let notes = value.get("notes")?.as_str()?;
+    let head = notes.split_whitespace().next()?;
+    let mut parts = head.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    Some(match parts.next() {
+        Some(patch) => format!("{major}.{minor}.{}", patch.parse::<u32>().unwrap_or(0)),
+        None => format!("{major}.{minor}"),
+    })
+}
+
+/// 回退到上一版引擎（`strata components rollback --output json`），返回给用户看的一句结果。
+///
+/// 回退只是把上一版 pin 住、把「当前」挪过去，引擎文件不动；下次成功更新会清掉 pin。
+pub fn rollback_engine() -> Result<String> {
+    let value = run_components(&["rollback", "--output", "json"])?;
+    // 成功时 CLI 包成 `{ok: true, result: {...}}`（也有版本直接平铺），两种都认。
+    let result = value.get("result").unwrap_or(&value);
+    let to = result
+        .get("to")
+        .and_then(|item| item.as_str())
+        .unwrap_or("上一版");
+    let from = result.get("from").and_then(|item| item.as_str());
+    Ok(match from {
+        Some(from) if from != to => format!("已把引擎回退到 {to}（从 {from}）"),
+        _ => format!("引擎已回退到 {to}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1843,6 +2769,37 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// 官方布局里 config 与 `run-*.bat` 在 `<根>\install`；没建 install 时退回根本身
+    /// （手动解包安装、以及大量老测试都直接往根里放 config）。
+    #[test]
+    fn configs_live_in_the_install_subfolder_after_official_install() {
+        let root = std::env::temp_dir().join(format!("strata-configs-dir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(configs_dir(&root), root, "没有 install 子目录时根就是 config 目录");
+
+        let install = root.join("install");
+        fs::create_dir_all(&install).unwrap();
+        assert_eq!(configs_dir(&root), install, "官方安装后 config 在 install 下");
+
+        // 扫描、写端口、找 run 脚本三条路径都要落在 install 里
+        let body = serde_json::json!({"exe": "strata-engine", "args": [], "model_name": "a", "port": 9091});
+        fs::write(install.join("strata-a.json"), body.to_string()).unwrap();
+        fs::write(
+            install.join("run-a.bat"),
+            "@echo off\r\n\"python.exe\" \"server.py\" \"--engine\" \"strata\" \"--port\" \"9091\"\r\n",
+        )
+        .unwrap();
+        let entries = scan_configs(&root, None);
+        assert_eq!(entries.len(), 1, "config 在 install 下也要被扫到");
+        assert_eq!(entries[0].model_name, "a");
+        assert!(
+            find_run_script(&root, "a").is_some(),
+            "run 脚本也要在 install 下找"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// 诊断：对真实安装目录跑一遍（`cargo test --lib probe_ensure_ports -- --ignored --nocapture`）。
     ///
     /// 注意：`cargo test` 进程在本机被沙箱限制成只能写工作区，所以这里的 `ensure_ports`
@@ -1850,11 +2807,18 @@ mod tests {
     #[test]
     #[ignore]
     fn probe_ensure_ports() {
-        let root = Path::new("E:/AI/Strata");
-        for e in scan_configs(root, None) {
+        let Some(root) = std::env::var_os("STRATA_PROBE_ROOT")
+            .map(PathBuf::from)
+            .or_else(|| crate::strata::root())
+        else {
+            println!("未指定 Strata 目录（没有兜底默认值，先用 STRATA_PROBE_ROOT 或设置里指定），跳过");
+            return;
+        };
+        configure_root(Some(root.clone()));
+        for e in scan_configs(&root, None) {
             println!("entry {} port={}", e.model_name, e.port);
         }
-        println!("allocate={}", allocate_port(root, "strata-zz-autoport-test.json"));
+        println!("allocate={}", allocate_port(&root, "strata-zz-autoport-test.json"));
     }
 
     #[test]
@@ -1990,9 +2954,29 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// 用户显式指定 Strata 目录（手动解压布局）时，bat / config 就在那个目录本身，
+    /// **不再去探测 `<根>\install`**（用户 m00717）。
+    #[test]
+    fn configs_dir_uses_the_chosen_root_even_when_it_has_an_install_subdir() {
+        let dir = std::env::temp_dir().join(format!("dsh-strata-root-{}", now_ms()));
+        fs::create_dir_all(dir.join("install")).unwrap();
+        assert_eq!(configs_dir_with(&dir, true), dir, "指定了目录就该用目录本身");
+        assert_eq!(configs_dir_with(&dir, false), dir.join("install"), "默认官方布局仍看 install");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 没有 `install` 子目录时（官方布局也一样）落到根目录本身。
+    #[test]
+    fn configs_dir_falls_back_to_the_root_without_install() {
+        let dir = std::env::temp_dir().join(format!("dsh-strata-noinstall-{}", now_ms()));
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(configs_dir_with(&dir, false), dir);
+        assert_eq!(configs_dir_with(&dir, true), dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// 造一个 `engine-component.json` + entrypoint 文件的组件目录（0.2.x 布局）。
-    fn put_component(dir: &Path, version: &str, platform: &str, exe: &str) {
-        let folder = dir.join(format!("{version}-{platform}-cuda"));
+    fn put_component(dir: &Path, version: &str, platform: &str, exe: &str) {        let folder = dir.join(format!("{version}-{platform}-cuda"));
         fs::create_dir_all(&folder).unwrap();
         let manifest = format!(
             r#"{{"schema_version":2,"id":"strata-engine","version":"{version}","platform":"{platform}","entrypoint":"{exe}"}}"#
@@ -2010,7 +2994,7 @@ mod tests {
         put_component(&bundle, "0.1.40", "windows-x86_64", exe);
         put_component(&bundle, "0.1.46", "windows-x86_64", exe);
 
-        let list = list_engines_with(&root, &[]);
+        let list = list_engines_with(&root);
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].version.as_deref(), Some("0.1.46"));
         assert_eq!(list[1].version.as_deref(), Some("0.1.40"));
@@ -2027,11 +3011,11 @@ mod tests {
         let exe = if cfg!(windows) { "strata.exe" } else { "strata" };
         put_component(&root.join("engine"), "0.1.47", &host_platform(), exe);
 
-        let list = list_engines_with(&root, &[]);
+        let list = list_engines_with(&root);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].version.as_deref(), Some("0.1.47"));
         // 解析链路也要走同一个候选集合，否则列出了却选不中
-        let found = resolve_component(&root, ENGINE_COMPONENT_ID, &[]).unwrap();
+        let found = resolve_component(&root, ENGINE_COMPONENT_ID).unwrap();
         assert_eq!(found.exe, list[0].exe);
         let _ = fs::remove_dir_all(&root);
     }
@@ -2044,7 +3028,7 @@ mod tests {
         let exe = if cfg!(windows) { "strata.exe" } else { "strata" };
         put_component(&root, "0.1.47", &host_platform(), exe);
 
-        let list = list_engines_with(&root, &[]);
+        let list = list_engines_with(&root);
         assert_eq!(list.len(), 1);
         assert!(list[0].exe.is_file());
         let _ = fs::remove_dir_all(&root);
@@ -2059,7 +3043,7 @@ mod tests {
         put_component(&root.join("whatever"), "0.1.47", &host_platform(), exe);
         put_component(&root, "0.1.48", &host_platform(), exe);
 
-        let list = list_engines_with(&root, &[]);
+        let list = list_engines_with(&root);
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].version.as_deref(), Some("0.1.48"));
         assert_eq!(list[1].version.as_deref(), Some("0.1.47"));
@@ -2074,7 +3058,7 @@ mod tests {
         let bundle = root.join("engine-bundle");
         put_component(&bundle, "0.1.40", "windows-x86_64", exe);
         put_component(&bundle, "0.1.46", "windows-x86_64", exe);
-        let list = list_engines_with(&root, &[]);
+        let list = list_engines_with(&root);
         let old = list[1].exe.to_string_lossy().to_string();
         let new = list[0].exe.to_string_lossy().to_string();
         let path = root.join("strata-demo.json");
@@ -2111,7 +3095,7 @@ mod tests {
         .unwrap();
         fs::write(other.join("v.exe"), b"").unwrap();
 
-        let found = resolve_component(&dir, "strata-engine", &[]).unwrap();
+        let found = resolve_component(&dir, "strata-engine").unwrap();
         assert_eq!(component_version_at(&found.exe).as_deref(), Some("0.1.46"));
         assert_eq!(
             found.exe.parent().unwrap().file_name().unwrap().to_string_lossy(),
@@ -2236,12 +3220,12 @@ mod tests {
         fs::write(&config, &text).unwrap();
 
         // 设置里没选过：尊重 config 的声明
-        let entry = parse_config(&config, None, &[]).unwrap();
+        let entry = parse_config(&config, None).unwrap();
         assert_eq!(entry.engine, older);
         assert!(!entry.engine_stale);
 
         // 设置页选了 0.1.47：它才是权威，config 跟着改回来（用户 m04069）
-        let entry = parse_config(&config, Some(&chosen), &[]).unwrap();
+        let entry = parse_config(&config, Some(&chosen)).unwrap();
         assert_eq!(entry.engine, chosen);
         assert_eq!(entry.engine_version.as_deref(), Some("0.1.47"));
         assert!(entry.engine_stale);
@@ -2253,26 +3237,126 @@ mod tests {
 
 
     #[test]
-    #[ignore = "读本机真实安装目录（E:\\AI\\Strata），只在诊断引擎解析时手动跑"]
+    #[ignore = "读本机真实的 Strata 目录（需先在设置里指定，或给 STRATA_PROBE_ROOT），只在诊断引擎状态时手动跑"]
+    fn probe_engine_state() {
+        // 设置页的「Strata 引擎版本」卡走这里（用户 m02756）。
+        // 没有兜底目录（用户 m00308）：`STRATA_PROBE_ROOT=E:\AI\Strata cargo test --lib probe_engine_state -- --ignored --nocapture`
+        let Some(root) = std::env::var_os("STRATA_PROBE_ROOT")
+            .map(PathBuf::from)
+            .or_else(|| crate::strata::root())
+        else {
+            println!("未指定 Strata 目录，跳过");
+            return;
+        };
+        configure_root(Some(root));
+        let state = engine_state().expect("读控制器的引擎状态");
+        println!("引擎状态 = {state:?}");
+        // 回退要写 `<根>\components\.updates\update.lock`；DSH 沙箱里的 cargo test 以 Low
+        // 完整性运行，写 Medium 文件必被拒（Errno 13），所以这里只打印结果，真正的回退
+        // 验证走命令行 `strata components rollback`。
+        match rollback_engine() {
+            Ok(text) => println!("回退成功 = {text}"),
+            Err(err) => println!("回退被拒绝 = {err:#}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "读本机真实 Strata 目录（没有兜底默认值，必须用 STRATA_PROBE_ROOT 或先在设置里指定），只在诊断引擎解析时手动跑"]
     fn probe_real_install() {
-        let root = std::path::Path::new("E:\\AI\\Strata");
-        let list = list_engines(root);
-        println!("engines = {list:?}");
-        for entry in scan_configs(root, None) {
+        // 诊断手动解压的目录：`STRATA_PROBE_ROOT=E:\AI\strata cargo test --lib probe_real_install -- --ignored --nocapture`
+        let root = std::env::var_os("STRATA_PROBE_ROOT")
+            .map(PathBuf::from)
+            .or_else(|| crate::strata::root());
+        let Some(root) = root else {
+            println!("未指定根目录，跳过");
+            return;
+        };
+        println!("root = {}", root.display());
+        println!("configs_dir = {}", configs_dir(&root).display());
+        for controller in list_controllers(&root) {
             println!(
-                "{} → exe={} exists={} version={:?} stale={}",
+                "controller {:<10} active={} python={} server={} usable={} {}",
+                controller.version,
+                controller.active,
+                controller.python,
+                controller.server,
+                controller.usable,
+                controller.folder.display()
+            );
+        }
+        let list = list_engines(&root);
+        println!("engines = {list:?}");
+        for entry in scan_configs(&root, None) {
+            println!(
+                "{} → exe={} exists={} version={:?} stale={} cwd={:?}",
                 entry.config_path.display(),
                 entry.engine.display(),
                 entry.engine_exists,
                 entry.engine_version,
-                entry.engine_stale
+                entry.engine_stale,
+                entry.cwd
             );
+        }
+        for name in run_script_names(&configs_dir(&root)) {
+            match parse_run_script(&configs_dir(&root).join(&name)) {
+                Some((exe, args, cwd)) => {
+                    println!("{name}: exe={} cwd={:?} args={args:?}", exe.display(), cwd)
+                }
+                None => println!("{name}: 解析失败"),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "会改写目录里的 run-*.bat 与 config，只在显式给 STRATA_PROBE_ROOT（建议指副本）时手动跑"]
+    fn probe_apply_controller() {
+        // `STRATA_PROBE_ROOT=E:\Code\llama.cpp-GUI\tmp\strata-copy STRATA_APPLY_VERSION=0.1.50 cargo test --lib probe_apply_controller -- --ignored --nocapture`
+        let Some(root) = std::env::var_os("STRATA_PROBE_ROOT").map(PathBuf::from) else {
+            println!("未指定 STRATA_PROBE_ROOT，跳过");
+            return;
+        };
+        let version = std::env::var("STRATA_APPLY_VERSION").unwrap_or_else(|_| "0.1.50".to_string());
+        let dir = configs_dir(&root);
+        let before: Vec<(String, String)> = run_script_names(&dir)
+            .iter()
+            .map(|name| (name.clone(), fs::read_to_string(dir.join(name)).unwrap_or_default()))
+            .collect();
+        let result = apply_controller(&root, &version).unwrap();
+        println!(
+            "切到控制器 {}（{}）：脚本 {:?} / config {:?}",
+            result.version,
+            result.folder.display(),
+            result.scripts,
+            result.configs
+        );
+        for (name, old) in before {
+            let new = fs::read_to_string(dir.join(&name)).unwrap_or_default();
+            if old != new {
+                println!("--- {name} ---\n{new}");
+            }
+        }
+        for entry in scan_configs(&root, None) {
+            println!(
+                "{} cwd={:?} exe={} exists={}",
+                entry.config_path.display(),
+                entry.cwd,
+                entry.engine.display(),
+                entry.engine_exists
+            );
+        }
+        for name in run_script_names(&dir) {
+            match parse_run_script(&dir.join(&name)) {
+                Some((exe, args, cwd)) => {
+                    println!("{name}: exe={} cwd={:?} args={args:?}", exe.display(), cwd)
+                }
+                None => println!("{name}: 解析失败"),
+            }
         }
     }
 
     #[test]
     fn component_reference_is_resolved_but_left_untouched() {
-        // 用户 m04934：`component:strata-engine` 是「自动使用最新版本」那一项，是合法形态。
+        // 用户 m04934：`component:strata-engine` 引用是合法形态（设置页已不再提供版本选择）。
         // 扫描只把它解析成真实 exe 给界面/启动用，不把 config 改写成绝对路径。
         let dir = std::env::temp_dir().join(format!("llamacpp-gui-component-ref-{}", now_ms()));
         let _ = fs::remove_dir_all(&dir);
@@ -2282,7 +3366,7 @@ mod tests {
         let config = dir.join("strata-x.json");
         fs::write(&config, text).unwrap();
 
-        let entry = parse_config(&config, None, &[]).unwrap();
+        let entry = parse_config(&config, None).unwrap();
         assert!(entry.engine_exists);
         assert!(!entry.engine_stale, "引用不触发改写");
         assert_eq!(entry.engine_version.as_deref(), Some("0.1.47"));
@@ -2316,7 +3400,7 @@ mod tests {
 
     #[test]
     fn set_engine_can_write_the_auto_reference() {
-        // 设置页「自动使用最新版本」那一项传的就是 `component:strata-engine`（用户 m04934）。
+        // 传入的就是 `component:strata-engine` 引用（用户 m04934 的「自动」那一项，现在唯一形态）。
         let dir = std::env::temp_dir().join(format!("llamacpp-gui-set-auto-{}", now_ms()));
         let _ = fs::remove_dir_all(&dir);
         let exe = if cfg!(windows) { "strata.exe" } else { "strata" };
@@ -2338,10 +3422,10 @@ mod tests {
         assert_eq!(
             saved["exe"].as_str(),
             Some("component:strata-engine"),
-            "选「自动使用最新版本」时写回组件引用"
+            "写回组件引用时只解析成真实引擎、不改写文件"
         );
         // 引用也要能解析出真实引擎，否则设置页会显示成不存在
-        let entry = parse_config(&dir.join("strata-x.json"), None, &[]).unwrap();
+        let entry = parse_config(&dir.join("strata-x.json"), None).unwrap();
         assert!(entry.engine_exists);
         assert_eq!(entry.engine_version.as_deref(), Some("0.1.47"));
         let _ = fs::remove_dir_all(&dir);
@@ -2459,7 +3543,7 @@ mod tests {
         // 升级把旧版本目录删掉了 —— 这时才跟到现有版本
         fs::remove_dir_all(&old_folder).unwrap();
 
-        let entry = parse_config(&config, None, &[]).unwrap();
+        let entry = parse_config(&config, None).unwrap();
         assert!(entry.engine_stale);
         assert_eq!(
             entry
@@ -2494,7 +3578,7 @@ mod tests {
         let text = serde_json::json!({ "exe": current.to_string_lossy(), "args": [] }).to_string();
         fs::write(&config, &text).unwrap();
 
-        let entry = parse_config(&config, None, &[]).unwrap();
+        let entry = parse_config(&config, None).unwrap();
         assert!(!entry.engine_stale);
         assert!(entry.engine_exists);
         // 已经是当前组件：一个字节都不改（也不产生备份文件）
@@ -2527,8 +3611,11 @@ fn service_target(root: &Path, config_file: &str) -> Result<(String, u16, Option
 /// 引擎进程与 WebUI 保持运行，只释放显存 —— 显存互斥用这个，不再停整个进程。
 /// 上游回 409 表示模型正忙；`http::request` 会把非 2xx 和原因一起变成 Err。
 #[tauri::command]
-pub async fn strata_unload_model(root: String, config_file: String) -> Result<String, String> {
-    let (host, port, api_key) = service_target(Path::new(&root), &config_file)?;
+pub async fn strata_unload_model(config_file: String) -> Result<String, String> {
+    let root = crate::strata::root()
+        .filter(|root| root.is_dir())
+        .ok_or_else(|| "未找到 Strata 目录（设置 → 通用 → Strata 目录 可指定）".to_string())?;
+    let (host, port, api_key) = service_target(&root, &config_file)?;
     tauri::async_runtime::spawn_blocking(move || {
         crate::http::request(
             &host,
@@ -2548,8 +3635,11 @@ pub async fn strata_unload_model(root: String, config_file: String) -> Result<St
 /// 上游会先跑 `before_load` 命令，再按 `min_free_vram_mib` 检查空闲显存，
 /// 不够就回 503（上游 GpuBusy），模型保持卸载。大模型加载慢，超时给到 300 秒。
 #[tauri::command]
-pub async fn strata_load_model(root: String, config_file: String) -> Result<String, String> {
-    let (host, port, api_key) = service_target(Path::new(&root), &config_file)?;
+pub async fn strata_load_model(config_file: String) -> Result<String, String> {
+    let root = crate::strata::root()
+        .filter(|root| root.is_dir())
+        .ok_or_else(|| "未找到 Strata 目录（设置 → 通用 → Strata 目录 可指定）".to_string())?;
+    let (host, port, api_key) = service_target(&root, &config_file)?;
     tauri::async_runtime::spawn_blocking(move || {
         crate::http::request(
             &host,
@@ -2564,4 +3654,5 @@ pub async fn strata_load_model(root: String, config_file: String) -> Result<Stri
     .await
     .map_err(|e| format!("加载任务失败：{e}"))?
 }
+
 

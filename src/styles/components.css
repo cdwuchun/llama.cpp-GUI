@@ -333,6 +333,50 @@
     margin: 0;
 }
 
+/* 卡片标题栏里的紧凑开关（Strata 版本卡的「自动跟随最新」） */
+.st-card__head .st-head-switch {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--st-s-2);
+    font-size: var(--st-fs-sm);
+    color: var(--st-ink-muted);
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.st-card__head .st-head-switch .switch-input {
+    margin: 0;
+}
+
+/* 一键升级的进度行（卡片顶部）：一行状态 + 下载进度条 + 取消按钮 */
+.st-upgrade {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--st-s-2);
+    padding-bottom: var(--st-s-3);
+}
+
+.st-upgrade .st-progress {
+    margin: 0;
+}
+
+/* 「Strata 版本」卡里控制器 / 引擎两张表的分区标题行 */
+.st-subhead {
+    display: flex;
+    align-items: center;
+    gap: var(--st-s-2);
+    margin: var(--st-s-4) 0 var(--st-s-2);
+}
+
+.st-subhead:first-child {
+    margin-top: 0;
+}
+
+.st-subhead .st-card__title {
+    font-size: var(--st-fs-sm);
+}
+
 /* --------------------------------------------------------------------------
  * 按钮
  * ----------------------------------------------------------------------- */
@@ -683,9 +727,64 @@
     margin-left: auto;
 }
 
-/* 「清空」是删记录，和它左边的两个下拉隔开点，防误点（用户 m14323） */
-.bench-clear {
-    margin-left: var(--st-s-4);
+/* 压测记录管理弹窗（用户 m03137 / m03319 / m03514）：默认 600px 装不下「模型/时间/内容/操作」，
+   加宽到 ~880px（窄屏仍留 92vw 余量）；勾选列压窄，工具条两端对齐 */
+.modal-content.bench-history {
+    width: min(880px, 92vw);
+    max-width: 880px;
+}
+
+.bench-history .bench-head {
+    justify-content: space-between;
+}
+
+.bench-history__pick {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--st-s-2);
+    font-size: var(--st-fs-sm);
+    color: var(--st-text-dim);
+}
+
+.bench-history__col-pick {
+    width: 3.5rem;
+    text-align: center;
+}
+
+/* 同一个模型的记录收成一组，组头可点开（用户 m03660 第 2 点，默认折叠） */
+.bench-group + .bench-group {
+    margin-top: var(--st-s-3);
+}
+
+.bench-group__head {
+    display: flex;
+    align-items: center;
+    gap: var(--st-s-2);
+    padding: var(--st-s-2) var(--st-s-3);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-sm);
+    cursor: pointer;
+    user-select: none;
+}
+
+.bench-group__head:hover {
+    background: var(--st-surface-2);
+}
+
+.bench-group__chev {
+    width: 0.9rem;
+    color: var(--st-text-dim);
+}
+
+.bench-group__name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* 「内容」列不换行（用户 m03660 第 1 点）：摘要本来就短，一行放得下 */
+.bench-history__summary {
+    white-space: nowrap;
 }
 
 /* 压测进行中：转圈 + 已用时 + 停止按钮，替掉「开始测试」（上游同此，用户 m01745 第 2 点） */
@@ -2557,6 +2656,54 @@ rect.scenario-column.is-failed {
     text-align: left;
 }
 
+/* 参数弹窗右栏的「调优结果」折叠卡片（用户 m02450：成绩放右栏、可折叠）。
+   结构复用 .st-collapse（原生 details），这里只补卡片自身的间距与成绩网格。 */
+.strata-tune-card {
+    margin-bottom: var(--st-s-3);
+}
+
+.strata-tune-card__tag {
+    margin-left: var(--st-s-2);
+    font-size: var(--st-fs-xs);
+    color: var(--st-ink-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.strata-tune-card__body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--st-s-2);
+    font-size: var(--st-fs-sm);
+}
+
+.strata-tune-card__body p {
+    margin: 0;
+}
+
+.strata-tune-metrics {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+    gap: var(--st-s-2) var(--st-s-4);
+}
+
+.strata-tune-metrics > div {
+    display: flex;
+    flex-direction: column;
+    gap: var(--st-s-1);
+}
+
+.strata-tune-metrics span {
+    font-size: var(--st-fs-xs);
+    color: var(--st-ink-muted);
+}
+
+.strata-tune-metrics strong {
+    font-size: var(--st-fs-sm);
+    font-weight: 600;
+}
+
 /* 联网搜索设置（WEB_SEARCH_PLAN.md 的配置块，挂在上游抽屉里） */
 .search-settings__fold {
     border: 1px solid var(--st-line);
@@ -3160,7 +3307,7 @@ rect.scenario-column.is-failed {
    照搬上游 `E:\Code\strata-manager-main\apps\desktop\src\official\app.css:81-120` 与
    `slot-monitor.css`（用户 m05241：监控 UI 原封原样照搬上游）。
    字面 font-size / border-radius 一律换 token；断点按规范用 900。 */
-.monitor { display: flex; flex-direction: column; gap: var(--st-s-5); padding: var(--st-s-6); }
+.monitor { display: flex; flex-direction: column; gap: var(--st-s-5); padding: 0; }
 .state-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
 .state-card__head { display: flex; align-items: center; gap: var(--st-s-4); flex-wrap: wrap; }
 .badges { display: flex; gap: var(--st-s-2); flex-wrap: wrap; }
@@ -3316,5 +3463,1546 @@ rect.scenario-column.is-failed {
 
     .facts dd {
         margin-bottom: var(--st-s-2);
+    }
+}
+
+/* ===== 模型下载页（导航栏「模型下载」，照搬上游 strata-manager 的下载页） ===== */
+
+.model-download-page {
+    color: var(--st-ink);
+    min-width: 0;
+}
+
+.model-download-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--st-s-6);
+    flex-wrap: wrap;
+}
+
+.model-download-headline h2 {
+    margin: 0;
+    font-size: var(--st-fs-xl);
+    line-height: var(--st-lh-tight);
+    letter-spacing: -0.5px;
+}
+
+.model-download-headline p {
+    margin: var(--st-s-3) 0 0;
+    max-width: 62ch;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-md);
+}
+
+.model-download-headline code {
+    font-family: var(--st-font-mono);
+    font-size: var(--st-fs-xs);
+    color: var(--st-accent-text);
+}
+
+.model-download-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--st-s-2);
+}
+
+.model-download-actions .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--st-s-2);
+    min-height: 40px;
+    padding: var(--st-s-2) var(--st-s-4);
+    font-size: var(--st-fs-md);
+}
+
+.model-download-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 var(--st-s-1);
+    border-radius: var(--st-r-pill);
+    background: var(--st-accent);
+    color: var(--st-accent-ink);
+    font-size: var(--st-fs-xs);
+    font-weight: var(--st-fw-bold);
+}
+
+.model-download-common {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--st-s-3);
+    margin-top: var(--st-s-5);
+    padding: var(--st-s-3) var(--st-s-5);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-md);
+    background: var(--st-surface);
+}
+
+.model-download-common label {
+    display: flex;
+    flex-direction: column;
+    gap: var(--st-s-1);
+    font-size: var(--st-fs-xs);
+    color: var(--st-ink-muted);
+}
+
+.model-download-common .form-control {
+    min-width: 160px;
+}
+
+.model-download-common small {
+    margin-left: auto;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-location {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--st-s-3);
+    margin-top: var(--st-s-4);
+    padding: var(--st-s-3) var(--st-s-5);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-md);
+    background: var(--st-surface-2);
+    font-size: var(--st-fs-xs);
+    color: var(--st-ink-muted);
+}
+
+.model-download-location code {
+    font-family: var(--st-font-mono);
+    font-size: var(--st-fs-xs);
+    color: var(--st-ink);
+    max-width: min(40vw, 520px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.model-download-location-tag {
+    padding: 2px var(--st-s-2);
+    border-radius: var(--st-r-pill);
+    background: var(--st-accent-tint);
+    color: var(--st-accent-text);
+}
+
+.model-download-runtime-needed {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--st-s-4);
+    margin-top: var(--st-s-4);
+    padding: var(--st-s-4) var(--st-s-5);
+    border: 1px solid var(--st-warn);
+    border-radius: var(--st-r-md);
+    background: var(--st-warn-tint);
+    color: var(--st-warn-text);
+    font-size: var(--st-fs-md);
+}
+
+.model-download-runtime-needed p {
+    margin: 0;
+}
+
+.model-download-browser {
+    display: grid;
+    /* 右栏放量化表（5 列）与预设/评估卡，比上游的 1.15fr 再宽一档（用户 m02606） */
+    grid-template-columns: minmax(260px, 0.66fr) minmax(460px, 1.34fr);
+    margin-top: var(--st-s-5);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-lg);
+    background: var(--st-surface);
+    overflow: clip;
+}
+
+.model-download-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--st-s-3);
+    padding: var(--st-s-4);
+    min-width: 0;
+}
+
+.model-download-search {
+    display: flex;
+    align-items: center;
+    gap: var(--st-s-2);
+    height: 40px;
+    padding: 0 var(--st-s-3);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-field);
+    background: var(--st-bg);
+    color: var(--st-ink-muted);
+}
+
+.model-download-search input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    background: transparent;
+    color: var(--st-ink);
+    font-size: var(--st-fs-md);
+    outline: none;
+}
+
+.model-download-search > span {
+    font-size: var(--st-fs-xs);
+    white-space: nowrap;
+}
+
+.model-download-search-clear {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--st-ink-muted);
+    line-height: 1;
+    cursor: pointer;
+}
+
+.model-download-search-clear:hover {
+    color: var(--st-ink);
+}
+
+.model-download-models {
+    display: flex;
+    flex-direction: column;
+    gap: var(--st-s-1);
+}
+
+.model-download-model {
+    display: flex;
+    align-items: center;
+    gap: var(--st-s-3);
+    min-height: 72px;
+    padding: var(--st-s-3);
+    border: 0;
+    border-radius: var(--st-r-md);
+    background: transparent;
+    color: var(--st-ink);
+    text-align: left;
+    cursor: pointer;
+}
+
+.model-download-model:hover {
+    background: var(--st-surface-2);
+}
+
+.model-download-model.is-selected {
+    background: var(--st-accent-tint);
+    box-shadow: inset 3px 0 0 var(--st-accent);
+}
+
+.model-download-model.is-disabled {
+    opacity: 0.55;
+}
+
+.model-download-model-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    width: 40px;
+    height: 40px;
+    border-radius: var(--st-r-md);
+    background: var(--st-surface-2);
+    color: var(--st-accent-text);
+    font-size: var(--st-fs-base);
+}
+
+.model-download-model-copy {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.model-download-model-copy strong {
+    font-size: var(--st-fs-md);
+    font-weight: var(--st-fw-bold);
+}
+
+.model-download-model-copy span,
+.model-download-model-copy small {
+    overflow: hidden;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.model-download-model-tag {
+    flex: none;
+    padding: 2px var(--st-s-2);
+    border-radius: var(--st-r-pill);
+    background: var(--st-warn-tint);
+    color: var(--st-warn-text);
+    font-size: var(--st-fs-xs);
+    white-space: nowrap;
+}
+
+.model-download-empty,
+.model-download-catalog-note {
+    margin: 0;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-catalog-note {
+    padding-top: var(--st-s-2);
+    border-top: 1px solid var(--st-line-soft);
+}
+
+.model-download-detail {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    border-left: 1px solid var(--st-line);
+}
+
+.model-download-back {
+    display: none;
+    align-items: center;
+    gap: var(--st-s-2);
+    margin: var(--st-s-3) var(--st-s-4) 0;
+    padding: var(--st-s-2) 0;
+    border: 0;
+    background: transparent;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-sm);
+    text-align: left;
+    cursor: pointer;
+}
+
+.model-download-detail-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--st-s-4);
+    padding: var(--st-s-5);
+}
+
+.model-download-detail-heading {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--st-s-2) var(--st-s-3);
+}
+
+.model-download-family {
+    width: 100%;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+}
+
+.model-download-detail-heading h3 {
+    margin: 0;
+    font-size: var(--st-fs-lg);
+    font-weight: var(--st-fw-bold);
+}
+
+.model-download-detail-heading a {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--st-s-1);
+    padding: 2px var(--st-s-2);
+    border-radius: var(--st-r-sm);
+    background: var(--st-accent-tint);
+    color: var(--st-accent-text);
+    font-size: var(--st-fs-xs);
+    text-decoration: none;
+}
+
+.model-download-desc {
+    margin: 0;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-sm);
+}
+
+.model-download-blocked {
+    margin: 0;
+    padding: var(--st-s-3) var(--st-s-4);
+    border: 1px solid var(--st-warn);
+    border-radius: var(--st-r-sm);
+    background: var(--st-warn-tint);
+    color: var(--st-warn-text);
+    font-size: var(--st-fs-sm);
+}
+
+.model-download-variants {
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+    border: 0;
+}
+
+.model-download-variants legend {
+    padding: 0 0 var(--st-s-2);
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-sm);
+    font-weight: var(--st-fw-medium);
+}
+
+.model-download-variant-head,
+.model-download-variant {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 96px 96px minmax(150px, 1.1fr) minmax(170px, 1.2fr);
+    align-items: center;
+    gap: var(--st-s-2);
+    padding: var(--st-s-2) var(--st-s-3);
+    font-variant-numeric: tabular-nums;
+}
+
+.model-download-variant-head {
+    border-radius: var(--st-r-sm) var(--st-r-sm) 0 0;
+    background: var(--st-surface-2);
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-variant {
+    min-height: 38px;
+    border: 1px solid var(--st-line);
+    border-top: 0;
+    font-size: var(--st-fs-sm);
+    cursor: pointer;
+}
+
+.model-download-variant:last-of-type {
+    border-radius: 0 0 var(--st-r-sm) var(--st-r-sm);
+}
+
+.model-download-variant:hover {
+    background: var(--st-surface-2);
+}
+
+.model-download-variant.is-blocked {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+
+.model-download-variant-name {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--st-s-2);
+    min-width: 0;
+}
+
+.model-download-badge {
+    padding: 1px var(--st-s-1);
+    border-radius: var(--st-r-sm);
+    background: var(--st-accent-tint);
+    color: var(--st-accent-text);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-fit {
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-fit.is-fits {
+    color: var(--st-accent-text);
+}
+
+.model-download-fit.is-tight {
+    color: var(--st-warn-text);
+}
+
+.model-download-fit.is-over {
+    color: var(--st-danger-text);
+}
+
+.model-download-fit.is-unknown,
+.model-download-est {
+    color: var(--st-ink-muted);
+}
+
+.model-download-variant-warning {
+    margin: 0;
+    color: var(--st-warn-text);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-dsv41 {
+    padding: var(--st-s-3) var(--st-s-4);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-md);
+    background: var(--st-surface-2);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-dsv41 b {
+    display: block;
+    margin-bottom: var(--st-s-1);
+    color: var(--st-ink);
+}
+
+.model-download-dsv41 p {
+    margin: 0;
+    color: var(--st-ink-muted);
+}
+
+.model-download-preset {
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-md);
+}
+
+.model-download-preset summary {
+    padding: var(--st-s-3) var(--st-s-4);
+    font-size: var(--st-fs-sm);
+    cursor: pointer;
+}
+
+.model-download-preset-body {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--st-s-3);
+    padding: 0 var(--st-s-4) var(--st-s-4);
+}
+
+.model-download-preset-locked {
+    grid-column: 1 / -1;
+    margin: 0;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-context-presets {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--st-s-1);
+}
+
+.model-download-context-presets button {
+    min-height: 28px;
+    padding: var(--st-s-1) var(--st-s-3);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-sm);
+    background: var(--st-surface);
+    color: var(--st-ink-soft);
+    font-size: var(--st-fs-xs);
+    cursor: pointer;
+}
+
+.model-download-context-presets button.is-active {
+    border-color: var(--st-accent);
+    color: var(--st-accent-text);
+}
+
+.model-download-context-field,
+/* 与左侧「上下文长度」输入框同高、垂直居中 */
+.model-download-image-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--st-s-2);
+    min-height: 38px;
+    color: var(--st-ink);
+    font-size: var(--st-fs-sm);
+}
+
+.model-download-context-field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--st-s-1);
+    align-items: stretch;
+}
+
+.model-download-assessment {
+    padding: var(--st-s-3) var(--st-s-4);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-md);
+    background: var(--st-surface-2);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-assessment ul {
+    margin: var(--st-s-2) 0 0;
+    padding-left: var(--st-s-5);
+    color: var(--st-ink-muted);
+}
+
+.model-download-submit {
+    display: flex;
+    flex-direction: column;
+    gap: var(--st-s-3);
+    margin-top: auto;
+    padding: var(--st-s-4) var(--st-s-5);
+    border-top: 1px solid var(--st-line);
+    background: var(--st-surface);
+}
+
+.model-download-submit > small {
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-submit-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--st-s-4);
+}
+
+.model-download-submit-row > span {
+    min-width: 0;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-sm);
+}
+
+.model-download-submit-row .btn {
+    min-height: 40px;
+    padding: var(--st-s-2) var(--st-s-5);
+    font-size: var(--st-fs-md);
+    font-weight: var(--st-fw-medium);
+}
+
+.model-download-error {
+    margin: 0;
+    color: var(--st-danger-text);
+    font-size: var(--st-fs-sm);
+}
+
+.model-download-task {
+    display: flex;
+    flex-direction: column;
+    gap: var(--st-s-2);
+    padding: var(--st-s-3) var(--st-s-4);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-md);
+    background: var(--st-surface-2);
+}
+
+.model-download-task-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--st-s-3);
+    font-size: var(--st-fs-sm);
+}
+
+.model-download-task-head span {
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-task-message {
+    margin: 0;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-progress {
+    width: 100%;
+    height: 6px;
+    overflow: hidden;
+    border: 0;
+    border-radius: var(--st-r-pill);
+    background: var(--st-line);
+    appearance: none;
+}
+
+.model-download-progress::-webkit-progress-bar {
+    background: var(--st-line);
+}
+
+.model-download-progress::-webkit-progress-value {
+    background: var(--st-accent);
+    transition: width var(--st-dur) var(--st-ease);
+}
+
+.model-download-progress::-moz-progress-bar {
+    background: var(--st-accent);
+}
+
+.model-download-task .btn {
+    align-self: flex-start;
+}
+
+.model-download-task details summary {
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+    cursor: pointer;
+}
+
+.model-download-log {
+    max-height: 200px;
+    overflow: auto;
+    margin: var(--st-s-2) 0 0;
+    padding: var(--st-s-2) var(--st-s-3);
+    border-radius: var(--st-r-sm);
+    background: var(--st-code-bg);
+    color: var(--st-code-ink);
+    font-family: var(--st-font-mono);
+    font-size: var(--st-fs-xs);
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+.model-download-local,
+.model-download-existing {
+    margin-top: var(--st-s-4);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-md);
+    background: var(--st-surface);
+}
+
+.model-download-local > summary,
+.model-download-existing > summary {
+    padding: var(--st-s-3) var(--st-s-5);
+    font-size: var(--st-fs-sm);
+    cursor: pointer;
+}
+
+.model-download-local-body,
+.model-download-existing-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--st-s-3);
+    padding: 0 var(--st-s-5) var(--st-s-5);
+}
+
+.model-download-local-pick {
+    display: flex;
+    gap: var(--st-s-2);
+}
+
+.model-download-local-pick .form-control {
+    flex: 1;
+    min-width: 0;
+}
+
+.model-download-local-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--st-s-1);
+    max-height: 240px;
+    overflow: auto;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.model-download-local-list li {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: var(--st-s-2);
+    padding: var(--st-s-2) var(--st-s-3);
+    border-radius: var(--st-r-sm);
+    background: var(--st-surface-2);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-local-list code {
+    color: var(--st-ink-muted);
+    font-family: var(--st-font-mono);
+    word-break: break-all;
+}
+
+.model-download-local-body > small,
+.model-download-existing-body p {
+    margin: 0;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-existing-body .btn,
+.model-download-local-body > .btn {
+    align-self: flex-start;
+}
+
+@media (max-width: 900px) {
+    .model-download-browser {
+        grid-template-columns: 1fr;
+    }
+
+    .model-download-detail {
+        display: none;
+        border-left: 0;
+    }
+
+    .model-download-browser.is-detail .model-download-list {
+        display: none;
+    }
+
+    .model-download-browser.is-detail .model-download-detail {
+        display: flex;
+    }
+
+    .model-download-back {
+        display: inline-flex;
+    }
+
+    .model-download-preset-body {
+        grid-template-columns: 1fr;
+    }
+}
+
+@media (max-width: 640px) {
+    .model-download-variant-head,
+    .model-download-variant {
+        grid-template-columns: minmax(0, 1.6fr) 0.8fr 0.8fr;
+    }
+
+    .model-download-variant-head > :nth-child(4),
+    .model-download-variant-head > :nth-child(5),
+    .model-download-variant > :nth-child(4),
+    .model-download-variant > :nth-child(5) {
+        display: none;
+    }
+
+    .model-download-header {
+        flex-direction: column;
+    }
+}
+/* ---- 模型下载页：社区档（官方/社区切换、风险标签） ---- */
+.model-download-scope {
+    display: flex;
+    align-items: center;
+    gap: var(--st-s-1);
+    margin-top: var(--st-s-3);
+}
+
+.model-download-scope-tab {
+    min-height: 30px;
+    padding: var(--st-s-1) var(--st-s-3);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-pill);
+    background: var(--st-surface);
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-sm);
+    cursor: pointer;
+    transition: border-color var(--st-dur) var(--st-ease), color var(--st-dur) var(--st-ease);
+}
+
+.model-download-scope-tab:hover {
+    border-color: var(--st-accent);
+    color: var(--st-ink);
+}
+
+.model-download-scope-tab.is-active {
+    border-color: var(--st-accent);
+    background: var(--st-accent-tint);
+    color: var(--st-accent-text);
+    font-weight: var(--st-fw-medium);
+}
+
+.model-download-scope-refresh {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    margin-left: auto;
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-pill);
+    background: var(--st-surface);
+    color: var(--st-ink-muted);
+    cursor: pointer;
+}
+
+.model-download-scope-refresh:hover:not(:disabled) {
+    border-color: var(--st-accent);
+    color: var(--st-accent-text);
+}
+
+.model-download-scope-refresh:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
+.model-download-risks {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--st-s-1);
+    margin: 0 0 var(--st-s-3);
+}
+
+.model-download-risk {
+    padding: 2px var(--st-s-2);
+    border-radius: var(--st-r-sm);
+    background: var(--st-warn-tint);
+    color: var(--st-warn-text);
+    font-size: var(--st-fs-xs);
+}
+
+/* ---- 模型下载页（照上游 ModelDownloadPage 的视觉）---- */
+
+/* 下载配置弹窗：表单两列，路径行占整行 */
+.model-download-form {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--st-s-4);
+}
+
+.model-download-form label {
+    display: flex;
+    flex-direction: column;
+    gap: var(--st-s-1);
+    min-width: 0;
+}
+
+.model-download-form label > span,
+.model-download-field-label {
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-form-wide {
+    grid-column: 1 / -1;
+}
+
+/* 路径框 + 旁边的按钮（下载目录 / 本地 GGUF） */
+.model-download-pick {
+    display: flex;
+    align-items: center;
+    gap: var(--st-s-2);
+    flex-wrap: wrap;
+}
+
+.model-download-pick-path {
+    flex: 1 1 220px;
+    min-width: 0;
+    /* 与右侧 st-btn 的 40px 同高（MTP 那行与模型文件那行必须一致） */
+    display: inline-flex;
+    align-items: center;
+    gap: var(--st-s-2);
+    min-height: 40px;
+    box-sizing: border-box;
+    padding: var(--st-s-2) var(--st-s-3);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-field);
+    background: var(--st-surface-2);
+    color: var(--st-ink-soft);
+    font-family: var(--st-font-mono);
+    font-size: var(--st-fs-xs);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.model-download-pick-path.is-empty {
+    border-style: dashed;
+    color: var(--st-ink-muted);
+}
+
+.model-download-link {
+    align-self: flex-start;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--st-accent-text);
+    font-size: var(--st-fs-sm);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    cursor: pointer;
+}
+
+.model-download-link:hover {
+    color: var(--st-accent);
+}
+
+.model-download-sheet-line {
+    margin: var(--st-s-4) 0;
+    border-top: 1px solid var(--st-line-soft);
+}
+
+.model-download-local-submit {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--st-s-3);
+    flex-wrap: wrap;
+}
+
+/* 「使用已有模型」下方的中性提示（不再是「文件名不同」警告） */
+.model-download-local-hint {
+    margin: var(--st-s-2) 0 0;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-sm);
+    line-height: var(--st-lh-body);
+}
+
+.model-download-local-hint code {
+    padding: 0 var(--st-s-1);
+    border-radius: var(--st-r-sm);
+    background: var(--st-surface-2);
+    color: var(--st-ink-soft);
+    font-family: var(--st-font-mono);
+    font-size: var(--st-fs-xs);
+}
+
+/* 「检查 → 打包 → 生成配置…」按说明文字的字体与格式 */
+.model-download-local-submit .model-download-local-note {
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-sm);
+    line-height: var(--st-lh-body);
+}
+
+.model-download-local-fold summary span.is-bad {
+    color: var(--st-warn-text);
+}
+
+.model-download-local-submit small {
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+}
+
+/* 列表行的元信息（`社区 · 无审查` 徽章 + owner + 自动发现） */
+.model-download-model-meta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--st-s-1) var(--st-s-2);
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-badge.is-community {
+    background: var(--st-warn-tint);
+    color: var(--st-warn-text);
+}
+
+.model-download-badge.is-start {
+    background: var(--st-accent-tint);
+    color: var(--st-accent-text);
+}
+
+/* 「本机 N GB」那条刻度尺 */
+.model-download-axis {
+    display: flex;
+    align-items: center;
+    gap: var(--st-s-1);
+    min-width: 0;
+}
+
+.model-download-axis progress {
+    flex: 1;
+    height: 4px;
+    border: 0;
+    border-radius: var(--st-r-pill);
+    background: var(--st-line-soft);
+    appearance: none;
+}
+
+.model-download-axis progress::-webkit-progress-bar {
+    border-radius: var(--st-r-pill);
+    background: var(--st-line-soft);
+}
+
+.model-download-axis progress::-webkit-progress-value {
+    border-radius: var(--st-r-pill);
+    background: var(--st-accent);
+}
+
+.model-download-axis progress::-moz-progress-bar {
+    border-radius: var(--st-r-pill);
+    background: var(--st-accent);
+}
+
+/* 速度估算列 */
+.model-download-est {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 2px;
+    white-space: nowrap;
+    font-size: var(--st-fs-sm);
+    text-align: right;
+}
+
+.model-download-est b {
+    font-size: var(--st-fs-base);
+    font-variant-numeric: tabular-nums;
+}
+
+.model-download-est small {
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-est-badge {
+    padding: 1px var(--st-s-1);
+    border-radius: var(--st-r-sm);
+    background: var(--st-accent-tint);
+    color: var(--st-accent-text);
+    font-size: var(--st-fs-xs);
+    font-style: normal;
+}
+
+.model-download-basis {
+    margin: var(--st-s-2) 0 0;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+    line-height: var(--st-lh-body);
+}
+
+/* 启动预设卡（上游是 details，这里是常开卡片 + 折叠） */
+.model-download-preset-card {
+    margin-top: var(--st-s-4);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-md);
+    background: var(--st-surface);
+}
+
+.model-download-preset-head {
+    display: flex;
+    align-items: center;
+    gap: var(--st-s-2);
+    padding: var(--st-s-3) var(--st-s-4);
+    font-size: var(--st-fs-sm);
+    font-weight: var(--st-fw-medium);
+}
+
+.model-download-preset-summary {
+    margin-left: auto;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+    font-weight: var(--st-fw-regular);
+}
+
+.model-download-preset-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: 0;
+    border-radius: var(--st-r-sm);
+    background: none;
+    color: var(--st-ink-muted);
+    cursor: pointer;
+}
+
+.model-download-preset-toggle:hover {
+    background: var(--st-surface-2);
+    color: var(--st-ink);
+}
+
+.model-download-preset-card .model-download-preset-body {
+    padding: 0 var(--st-s-4) var(--st-s-4);
+}
+
+.model-download-preset-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    align-items: end;
+    gap: var(--st-s-3);
+    margin-top: var(--st-s-3);
+}
+
+.model-download-preset-note {
+    margin: var(--st-s-3) 0 0;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-preset-locked .model-download-preset-body {
+    opacity: 0.6;
+}
+
+/* 资源评估卡 */
+.model-download-assess-card {
+    margin-top: var(--st-s-4);
+    padding: var(--st-s-3) var(--st-s-4) var(--st-s-4);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-md);
+    background: var(--st-surface);
+}
+
+.model-download-assess-head {
+    display: flex;
+    align-items: center;
+    gap: var(--st-s-2);
+    flex-wrap: wrap;
+}
+
+.model-download-assess-head strong {
+    font-size: var(--st-fs-md);
+}
+
+.model-download-assess-help {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--st-s-1);
+    margin-left: auto;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+    cursor: pointer;
+}
+
+.model-download-assess-help:hover {
+    color: var(--st-accent-text);
+}
+
+.model-download-assess-refresh {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-sm);
+    background: var(--st-surface-2);
+    color: var(--st-ink-muted);
+    cursor: pointer;
+}
+
+.model-download-assess-refresh:hover {
+    color: var(--st-ink);
+}
+
+.model-download-assess-cols {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--st-s-3);
+    margin-top: var(--st-s-3);
+}
+
+.model-download-assess-cols > div {
+    display: flex;
+    flex-direction: column;
+    gap: var(--st-s-1);
+    min-width: 0;
+}
+
+.model-download-assess-cols span {
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+    line-height: var(--st-lh-body);
+}
+
+.model-download-assess-cols b {
+    font-size: var(--st-fs-lg);
+    font-variant-numeric: tabular-nums;
+}
+
+.model-download-assess-note {
+    margin: var(--st-s-3) 0 0;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+}
+
+/* ORCA 面板 */
+.model-download-orca {
+    display: flex;
+    flex-direction: column;
+    gap: var(--st-s-2);
+}
+
+.model-download-orca code {
+    font-family: var(--st-font-mono);
+    font-size: var(--st-fs-xs);
+}
+
+@media (max-width: 900px) {
+    .model-download-form {
+        grid-template-columns: 1fr;
+    }
+
+    .model-download-assess-cols {
+        grid-template-columns: 1fr;
+    }
+
+    .model-download-preset-row {
+        grid-template-columns: 1fr;
+        align-items: stretch;
+    }
+}
+/* ---------------------------------------------------------------- 模型下载：使用已有模型弹窗
+   照搬上游 `使用已有模型（本地 GGUF 文件）`：模型文件 → 选择模型与量化版本 → 上下文 → 使用前检查。 */
+.modal-content.model-download-sheet {
+    width: min(1040px, 94vw);
+    max-width: 1040px;
+}
+
+.model-download-sheet-title {
+    margin: var(--st-s-4) 0 var(--st-s-2);
+    color: var(--st-ink);
+    font-size: var(--st-fs-md);
+    font-weight: var(--st-fw-bold);
+}
+
+.model-download-sheet-title:first-child {
+    margin-top: 0;
+}
+
+.model-download-pick-refresh {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: 0;
+    border-radius: var(--st-r-sm);
+    background: transparent;
+    color: var(--st-ink-muted);
+    cursor: pointer;
+}
+
+.model-download-pick-refresh:hover:not(:disabled) {
+    background: var(--st-surface-2);
+    color: var(--st-ink);
+}
+
+.model-download-pick-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.model-download-local-card {
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-md);
+    overflow: hidden;
+}
+
+.model-download-local-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--st-s-3);
+    padding: var(--st-s-3) var(--st-s-4);
+    background: var(--st-surface-2);
+    font-size: var(--st-fs-md);
+}
+
+.model-download-local-card-head b {
+    font-weight: var(--st-fw-bold);
+}
+
+.model-download-local-card-head span {
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-sm);
+}
+
+.model-download-local-row {
+    display: flex;
+    align-items: center;
+    gap: var(--st-s-3);
+    padding: var(--st-s-2) var(--st-s-4);
+    border-top: 1px solid var(--st-line-soft);
+    font-size: var(--st-fs-sm);
+    cursor: pointer;
+}
+
+.model-download-local-row.is-active {
+    background: var(--st-accent-tint);
+}
+
+.model-download-local-row input {
+    margin: 0;
+    accent-color: var(--st-accent);
+}
+
+.model-download-local-row b {
+    font-weight: var(--st-fw-bold);
+    font-variant-numeric: tabular-nums;
+}
+
+.model-download-local-row small {
+    color: var(--st-ink-muted);
+}
+
+.model-download-local-state {
+    margin-left: auto;
+    color: var(--st-warn-text);
+    font-size: var(--st-fs-xs);
+    font-style: normal;
+    white-space: nowrap;
+}
+
+.model-download-local-warn {
+    margin: var(--st-s-3) 0 0;
+    padding: var(--st-s-2) var(--st-s-3);
+    border-radius: var(--st-r-sm);
+    background: var(--st-warn-tint);
+    color: var(--st-warn-text);
+    font-size: var(--st-fs-sm);
+    line-height: var(--st-lh-body);
+}
+
+.model-download-local-warn code {
+    padding: 0 4px;
+    border-radius: var(--st-r-sm);
+    background: var(--st-surface);
+    font-family: var(--st-font-mono);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-local-context {
+    max-width: 200px;
+}
+
+.model-download-local-hint {
+    margin: var(--st-s-2) 0 0;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-sm);
+}
+
+.model-download-local-fold {
+    margin-top: var(--st-s-4);
+    padding-top: var(--st-s-3);
+    border-top: 1px solid var(--st-line-soft);
+    font-size: var(--st-fs-sm);
+}
+
+.model-download-local-fold summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--st-s-3);
+    font-weight: var(--st-fw-medium);
+    cursor: pointer;
+}
+
+.model-download-local-fold summary span {
+    color: var(--st-ink-muted);
+    font-weight: var(--st-fw-regular);
+}
+
+.model-download-local-fold p {
+    margin: var(--st-s-2) 0 0;
+    color: var(--st-ink-muted);
+}
+
+.model-download-local-checks {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--st-s-2);
+    margin-top: var(--st-s-4);
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-sm);
+}
+
+.model-download-local-checks i {
+    color: var(--st-accent);
+}
+
+.model-download-local-checks code {
+    color: var(--st-ink);
+    font-family: var(--st-font-mono);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-local-cmd {
+    margin: var(--st-s-2) 0 0;
+    padding: var(--st-s-3);
+    border-radius: var(--st-r-sm);
+    background: var(--st-code-bg);
+    color: var(--st-code-ink);
+    font-family: var(--st-font-mono);
+    font-size: var(--st-fs-xs);
+    overflow-x: auto;
+    white-space: pre;
+}
+
+.model-download-image-toggle .switch-input {
+    margin-left: auto;
+}
+
+.model-download-assess-cols b small {
+    margin-left: 4px;
+    color: var(--st-warn-text);
+    font-size: var(--st-fs-xs);
+    font-weight: var(--st-fw-regular);
+}
+
+@media (max-width: 900px) {
+    .modal-content.model-download-sheet {
+        width: 94vw;
+        max-width: none;
+    }
+
+    .model-download-local-row {
+        flex-wrap: wrap;
+    }
+
+    .model-download-local-state {
+        margin-left: 0;
+    }
+}
+.model-download-est-main {
+    display: flex;
+    align-items: baseline;
+    gap: 2px;
+}
+
+/* 资源预估三列：标签一行不换行、整体居中（用户要求与上游一致） */
+.model-download-assess-cols {
+    text-align: center;
+}
+
+.model-download-assess-cols > div {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+}
+
+.model-download-assess-cols > div > span {
+    white-space: nowrap;
+}
+
+/* 详情区内容较少时（社区条目），底部操作条要贴住卡片下边界，不留空档 */
+.model-download-detail-body {
+    flex: 1;
+}
+
+.model-download-detail > .model-download-submit {
+    margin-top: auto;
+}
+/* 「参考内存（含显存）」列：数值与说明同一行 */
+.model-download-mem {
+    white-space: nowrap;
+}
+
+.model-download-mem small {
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+}
+/* 使用已有模型的提交行放在 Modal footer（灰色区域）里，占满整行 */
+.modal-footer .model-download-local-submit {
+    width: 100%;
+}
+
+.model-download-local-checks li.is-muted {
+    color: var(--st-ink-muted);
+}
+/* 模型下载配置弹窗：比「使用已有模型」窄一档（用户反馈太宽） */
+.modal-content.model-download-prefs {
+    width: min(560px, 92vw);
+    max-width: 560px;
+}
+
+/* 「完成」按钮加宽 */
+.modal-content.model-download-prefs .model-download-prefs-done {
+    min-width: 132px;
+}
+
+@media (max-width: 900px) {
+    .modal-content.model-download-prefs {
+        width: 94vw;
+        max-width: 94vw;
     }
 }

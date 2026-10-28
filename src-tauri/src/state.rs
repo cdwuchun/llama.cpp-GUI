@@ -1,6 +1,6 @@
 //! 应用共享状态。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,6 +38,11 @@ pub struct AppState {
     /// 用户 m01266 第 2 点：DSH 请求触发引擎启动/加载时，卡片要显示「加载中」而不是
     /// 「已停止 → 直接跳到运行中」。前门自己在服务谁，它是唯一知情者，所以在这里登记。
     pub strata_proxy_serving: Arc<Mutex<Vec<String>>>,
+    /// 正在跑的 Strata 参数调优任务（键 = config 文件名）。
+    ///
+    /// 官方调优要独占显存（它自己起引擎、反复加载模型），所以同一时间只允许一个：
+    /// 启动调优前检查「Strata 未运行且没有别的调优在跑」，启动模型前反向检查这里。
+    pub strata_tune: Arc<Mutex<HashMap<String, crate::strata_tune::TuneJob>>>,
     /// 前门调度器：llama.cpp 通道子实例的状态与进程句柄。
     ///
     /// 挂在 `AppState` 上而不是前门自己拿着：前门路由、托盘退出清理、
@@ -82,6 +87,21 @@ pub struct AppState {
     /// 而 `strata_probe` 是前端每 5 秒一次的常驻轮询 —— 没有缓存时最重的那条路径
     /// （Strata 没运行，只能扫出全部 config 再逐端口探测）反而跑得最勤。
     pub strata_scan_cache: Mutex<Option<StrataScanCache>>,
+    /// 正在跑的 Strata 一键升级任务（引擎 / 控制器）。
+    ///
+    /// 同时只允许一个：升级会写 `<根>\engine`、`<根>\control` 并做试启动，
+    /// 两个并发下载会互相覆盖，也分不清进度归属谁。
+    pub strata_upgrade: Arc<Mutex<Option<crate::strata_upgrade::UpgradeJob>>>,
+    /// 正在跑的「模型下载」任务（导航栏 → 模型下载页 → 下载并准备）。
+    ///
+    /// 同样是单槽：`setup.py` 一次只该有一个实例，并发会抢同一个 `Strata-data`
+    /// 分片目录与打包缓存。
+    pub strata_download: Arc<Mutex<Option<crate::strata_download::DownloadJob>>>,
+    /// 正在跑的「ORCA 导入」（模型下载页 → 社区 → OrcaRouter）。
+    ///
+    /// 与 `strata_download` 分开一个槽：它下的是社区仓库分片、走 `iq_pack.py` 打包，
+    /// 两套子进程不该互相覆盖；但两者都写 `Strata-data`，前端同时只允许跑一个。
+    pub strata_orca: Arc<Mutex<Option<crate::strata_orca::OrcaJob>>>,
     /// 最近一次向上游报告过的辅助文件列表（mmproj / 草稿模型）。
     ///
     /// `scan_cache` 只存模型列表，而 `models://scanned` 的"变没变"要连辅助文件一起判，
@@ -104,6 +124,9 @@ pub struct AuxCache {
 #[derive(Debug, Clone)]
 pub struct StrataScanCache {
     pub root: PathBuf,
+    /// 扫描时选中的控制器版本（`settings.strata_controller`）。切控制器会重写各 config 的
+    /// `cwd`，用旧缓存会显示切换前的工作目录。
+    pub controller: Option<String>,
     /// 这次扫描时「设置页选定的引擎版本」（`None` = 没选）。换引擎必须让缓存失效：
     /// 卡片上显示的是引擎版本与真实路径，用旧缓存会显示切换前的版本。
     pub engine: Option<PathBuf>,
@@ -168,6 +191,7 @@ impl AppState {
             strata_proxy: Arc::new(Mutex::new(None)),
             strata_switch: Mutex::new(()),
             strata_proxy_serving: Arc::new(Mutex::new(Vec::new())),
+            strata_tune: Arc::new(Mutex::new(HashMap::new())),
             scheduler: Arc::new(Mutex::new(crate::scheduler::Scheduler::new())),
             config_dir,
             scan_cache: Mutex::new(None),
@@ -177,6 +201,9 @@ impl AppState {
             tray_available: AtomicBool::new(true),
             background_scan: Arc::new(AtomicBool::new(false)),
             strata_scan_cache: Mutex::new(None),
+            strata_upgrade: Arc::new(Mutex::new(None)),
+            strata_download: Arc::new(Mutex::new(None)),
+        strata_orca: Arc::new(Mutex::new(None)),
             aux_cache: Mutex::new(None),
         }
     }
@@ -278,16 +305,25 @@ impl AppState {
     /// 设置里记的那个值原样（可能还是 `component:strata-engine`）。
     ///
     /// 缓存键必须用它而不是 `preferred_strata_engine()`：后者只认存在的文件，
-    /// 「选了自动使用最新版本」与「没选」都会变成 `None`，切换后缓存分不出来（用户 m04934）。
+    /// 老版本设置页让用户选引擎时会写绝对路径，没选则是「自动」；两者对缓存而言都是 `None`，分不出来（用户 m04934）。现在设置页不再让用户选，这个字段只作历史兼容。
     pub fn strata_engine_key(&self) -> Option<PathBuf> {
         self.settings.get().strata_engine.map(PathBuf::from)
+    }
+
+    /// 设置里选中的控制器版本（缓存键的一部分）。
+    pub fn strata_controller_key(&self) -> Option<String> {
+        self.settings.get().strata_controller.clone()
     }
 
     pub fn cached_strata_scan(&self, root: &PathBuf) -> Option<Vec<StrataModelEntry>> {
         let guard = self.strata_scan_cache.lock().ok()?;
         let cache = guard.as_ref()?;
         let fresh = crate::logs::now_ms().saturating_sub(cache.at_ms) < 5_000;
-        if fresh && &cache.root == root && cache.engine == self.strata_engine_key() {
+        if fresh
+            && &cache.root == root
+            && cache.engine == self.strata_engine_key()
+            && cache.controller == self.strata_controller_key()
+        {
             Some(cache.entries.clone())
         } else {
             None
@@ -298,6 +334,7 @@ impl AppState {
         if let Ok(mut guard) = self.strata_scan_cache.lock() {
             *guard = Some(StrataScanCache {
                 root: root.clone(),
+                controller: self.strata_controller_key(),
                 engine: self.strata_engine_key(),
                 entries: entries.to_vec(),
                 at_ms: crate::logs::now_ms(),
@@ -319,11 +356,6 @@ impl AppState {
             crate::strata::scan_configs(root, self.preferred_strata_engine().as_deref());
         self.store_strata_scan(root, &entries);
         entries
-    }
-
-    /// 旧 `presets.ini` 路径（只剩迁移器读它；迁移完就改名成 `.bak-<时间戳>`）。
-    pub fn preset_path(&self) -> PathBuf {
-        self.config_dir.join("presets").join("presets.ini")
     }
 
     /// 模型配置目录：一个模型一份 `llamacpp-<id>.json`（规格见

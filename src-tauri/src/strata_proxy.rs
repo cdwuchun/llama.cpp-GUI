@@ -898,10 +898,8 @@ fn live_engine(state: &AppState) -> Option<(u16, PathBuf)> {
 }
 
 fn config_entries(state: &AppState) -> Vec<StrataModelEntry> {
-    state
-        .settings
-        .get()
-        .strata_root
+    strata::root()
+        .filter(|root| root.is_dir())
         .map(|root| state.strata_configs(&root))
         .unwrap_or_default()
 }

@@ -41,6 +41,10 @@ fn default_auto_start_router() -> bool {
     true
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// GPU / 多卡相关设置（见方案 §4.5）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -146,7 +150,7 @@ impl Default for VersionProbe {
 pub struct Settings {
     /// 用户指定的 llama.cpp 安装目录（其下可含多个版本子目录，也可本身就是一个版本目录）。
     pub llama_cpp_dir: Option<PathBuf>,
-    /// 模型根目录（可多个、任意层级；由应用递归扫描后生成 presets.ini）。
+    /// 模型根目录（可多个、任意层级；由应用递归扫描后生成模型配置）。
     pub model_roots: Vec<PathBuf>,
     /// 显式指定的共享 CUDA 运行时目录（必须【直接包含】cudart64_*/cublas64_*.dll）。
     pub shared_lib_dirs: Vec<PathBuf>,
@@ -181,9 +185,30 @@ pub struct Settings {
     pub window: WindowSize,
     /// 版本 → 能力探测结果缓存。
     pub version_cache: HashMap<String, VersionProbe>,
-    /// Strata 安装根目录（**R2：GUI 只存这一个路径**，其余路径全部从 config 与
-    /// `run-<model>.bat` 读，升级换了目录也不用改 GUI 设置）。
+    /// Strata 根目录（控制器与引擎的位置）。
+    ///
+    /// **必须由用户指定，没有默认值**（用户 m00308）：官方安装器装在 `%LOCALAPPDATA%\Strata`，
+    /// 用户也可能把安装包手动解压到别处（例如 `E:\AI\strata`：`control\<版本>` 放控制端、
+    /// `engine\<版本>` 放引擎、`run-*.bat` / `strata-*.json` 直接放根下）。设置页
+    /// 「通用 → Strata 目录」填的路径就是唯一来源，每次保存后由 `lib.rs` 同步给
+    /// [`strata::configure_root`]；`None` = 还没指定（此时 Strata 相关界面按未配置处理）。
+    #[serde(default)]
     pub strata_root: Option<PathBuf>,
+    /// 设置页选中的 Strata 控制器版本目录名（`0.1.51`）。`None` = 跟着 `active.json` 走。
+    ///
+    /// 真值是各 `run-*.bat` 与 config 的 `cwd`；这里只记「用户选的是哪个」，供设置页
+    /// 勾选、以及 run 脚本缺失时回退启动用。
+    #[serde(default)]
+    pub strata_controller: Option<String>,
+    /// 「Strata 控制器版本」卡的**自动跟随最新版本**开关（用户 m00875 / m00920）。
+    ///
+    /// 开启时：没选过、或选中的版本已经不在 `<根>\control` 下，就自动落到版本最高的可用版本，
+    /// 并顺手改写 `run-*.bat` / config。关闭后完全按 `strata_controller` 手动选择走，
+    /// 旧版本被删也不改脚本 —— 由用户自己重新选。
+    ///
+    /// 默认开启：手动解压的安装里版本目录常有多个，不自动选一台等于「一个都没勾」。
+    #[serde(default = "default_true")]
+    pub strata_auto_controller: bool,
     /// 上次选中的 Strata config 文件名（如 `strata-swift-iq3_xxs.json`）。
     pub strata_selected_config: Option<String>,
     /// 应用启动后自动拉起 Strata（与 router 互斥，二者抢同一块显存）。
@@ -222,13 +247,19 @@ pub struct Settings {
     /// `shell=True`、120 秒超时、失败只打印不阻断。可用来在 Strata 抢显存前先卸掉 router 的模型。
     #[serde(default)]
     pub strata_before_load: Option<String>,
-    /// 全局选定的 Strata 引擎可执行文件（`engine-bundle\<版本>-…\strata.exe` 的绝对路径）。
+    /// 全局选定的 Strata 引擎可执行文件（`components\engine\<版本>-…\strata.exe` 的绝对路径）。
     ///
-    /// `engine-bundle` 下可能多版本并存，设置页「通用 → Strata 引擎」列出来让用户选；
+    /// 引擎组件目录下可能多版本并存，设置页「通用 → Strata 引擎」列出来让用户选；
     /// 选中后由 `strata_apply_engine` 批量写进全部 `strata-*.json` 的 `exe`。
     /// 这里只是「用户选的是哪个」，各 config 自己的 `exe` 才是运行时的真值。
     #[serde(default)]
     pub strata_engine: Option<String>,
+    /// 「Strata 引擎版本」卡的**自动跟随最新版本**开关（与控制器那个同一套语义）。
+    ///
+    /// 开启时：没选过、或选中的 exe 已经不存在，就落到版本最高的那台引擎，并把各
+    /// `strata-*.json` 的 `exe` 一起对齐。关闭后完全按 `strata_engine` 走。
+    #[serde(default = "default_true")]
+    pub strata_auto_engine: bool,
     /// `settings.json` 里**本版本不认识的字段**，原样留着。
     ///
     /// 之前没有任何兜底：反序列化时 serde 默认把未知键**丢弃**，于是应用每次改设置都会
@@ -265,6 +296,8 @@ impl Default for Settings {
             window: WindowSize::default(),
             version_cache: HashMap::new(),
             strata_root: None,
+            strata_controller: None,
+            strata_auto_controller: true,
             strata_selected_config: None,
             auto_start_strata: false,
             strata_router_mutex: false,
@@ -272,6 +305,7 @@ impl Default for Settings {
             strata_min_free_vram_mib: None,
             strata_before_load: None,
             strata_engine: None,
+            strata_auto_engine: true,
             strata_host: None,
             strata_port: None,
             strata_api_key: None,
@@ -299,7 +333,6 @@ pub struct SettingsPatch {
     pub favourites: Option<Vec<String>>,
     pub aliases: Option<HashMap<String, String>>,
     pub view: Option<ViewSettings>,
-    pub strata_root: Option<PathBuf>,
     pub strata_selected_config: Option<String>,
     pub auto_start_strata: Option<bool>,
     pub strata_router_mutex: Option<bool>,
@@ -308,6 +341,13 @@ pub struct SettingsPatch {
     pub strata_before_load: Option<Option<String>>,
     /// 全局选定的 Strata 引擎 exe（`None` 的那层 = 清空 = 不指定）。
     pub strata_engine: Option<Option<String>>,
+    /// Strata 根目录（控制器与引擎的位置）。`Some(None)` = 清空 = 回官方默认位置。
+    pub strata_root: Option<Option<PathBuf>>,
+    /// 设置页选中的 Strata 控制器版本目录名。`Some(None)` = 清空 = 跟着 `active.json`。
+    pub strata_controller: Option<Option<String>>,
+    /// 「自动跟随最新版本」开关（控制器 / 引擎各一），见 [`Settings`] 同名文档。
+    pub strata_auto_controller: Option<bool>,
+    pub strata_auto_engine: Option<bool>,
     pub strata_host: Option<String>,
     pub strata_port: Option<u16>,
     pub strata_api_key: Option<String>,
@@ -517,9 +557,6 @@ impl SettingsStore {
             if let Some(v) = patch.view {
                 s.view = v;
             }
-            if let Some(v) = patch.strata_root {
-                s.strata_root = (!v.as_os_str().is_empty()).then_some(v);
-            }
             if let Some(v) = patch.strata_selected_config {
                 let v = v.trim().to_string();
                 s.strata_selected_config = (!v.is_empty()).then_some(v);
@@ -541,6 +578,19 @@ impl SettingsStore {
             }
             if let Some(v) = patch.strata_engine {
                 s.strata_engine = v.filter(|t| !t.trim().is_empty()).map(|t| t.trim().to_string());
+            }
+            if let Some(v) = patch.strata_root {
+                // 空路径 = 清空（没有兜底目录，清空后 Strata 相关界面按未配置处理）
+                s.strata_root = v.filter(|dir| !dir.as_os_str().is_empty());
+            }
+            if let Some(v) = patch.strata_controller {
+                s.strata_controller = v.filter(|t| !t.trim().is_empty()).map(|t| t.trim().to_string());
+            }
+            if let Some(v) = patch.strata_auto_controller {
+                s.strata_auto_controller = v;
+            }
+            if let Some(v) = patch.strata_auto_engine {
+                s.strata_auto_engine = v;
             }
             if let Some(v) = patch.strata_host {
                 let v = v.trim().to_string();

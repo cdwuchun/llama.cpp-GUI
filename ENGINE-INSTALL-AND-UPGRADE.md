@@ -140,22 +140,20 @@ llama.cpp 扫描不适用——两边名字容易混，别把 llama.cpp 版本�
 
 | 维度 | Strata 引擎 | llama.cpp 引擎 |
 |------|-------------|-----------------|
-| 根目录 | `%LOCALAPPDATA%\Strata\components`（`STRATA_COMPONENTS_DIR` 可覆盖） | 设置页 `llama_cpp_dir` |
+| 根目录 | 设置页 `strata_root`（空 = `%LOCALAPPDATA%\Strata`） | 设置页 `llama_cpp_dir` |
 | 版本目录命名 | `<版本>-<平台>-<后端>-<变体>` | `llama-b<构建号>-bin-win-<后端>-<CUDA标签>-x64` |
-| 版本指针 | `components\control\active.json` | 无指针，扫描目录 + 设置选择 |
+| 版本指针 | 手动布局看 `control\active.json`，选中的版本记在 `settings.strata_controller` / `strata_engine` | 无指针，扫描目录 + 设置选择 |
 | 完整性校验 | manifest SHA-256 + ed25519 签名 | 无（zip 解压，运行时 DLL 靠 PATH） |
-| 升级入口 | `strata update`（staging → 测试启动 → 切换） | 手动下载解压新版本目录 |
-| 回滚 | `strata components rollback` | 选回旧版本目录 |
+| 升级入口 | `strata update`（staging → 测试启动 → 切换），设置页两张版本卡的「升级」按钮就是它 | 手动下载解压新版本目录 |
+| 回滚 | `strata components rollback`（设置页「通用 → Strata 引擎版本」的「回退」按钮调它），或直接把版本表勾回旧版 | 选回旧版本目录 |
 | 运行时依赖 | 引擎包自带 DLL（cublas64_13.dll 等） | 需单独 `cudart-*` 共享目录并注入 PATH |
 | 控制端交接 | `handover.py` 自动切到新 control | 无 |
 
 ## 4. 本机现状速查
 
-- Strata：`E:\AI\Strata\engine`、`E:\AI\Strata\control\0.1.47`（+ `active.json`），数据 `E:\AI\Strata-data`；
-  组件联结在 `%LOCALAPPDATA%\Strata\components\{engine,control}`。
-- Strata 换版本：`strata update` 即可，运行配置里的 `component:strata-engine` 不用改；写死绝对路径的配置要手动改。
-- Strata 联结坏了：跑本目录的 `repair-engine-link.ps1`（幂等，会同时维护 engine、control 两个联结并登记
-  `%APPDATA%\Strata\settings.json` 的 `data_dir` / `installs`）。
+- Strata（本机手动解压，根目录 `E:\AI\strata`，设置页「通用 → Strata 目录」指定）：引擎在 `<根>\engine\0.1.50-windows-x86_64-cuda-cuda13`，控制器在 `<根>\control\0.1.51`（+ `active.json`），config 与 `run-*.bat` 直接在根目录。
+- Strata 换版本：设置页两张「Strata 控制器版本 / Strata 引擎版本」表里点选即改写 `run-*.bat` / config 的 `cwd`、`--expert-profile`、`exe`、`vision.exe`；「自动跟随最新」开着时刷新即对齐最高版本；「升级」按钮走控制端官方 `strata.py update`。
+- Strata 联结坏了（仅官方布局）：跑本目录的 `repair-engine-link.ps1`（幂等）或 `strata repair-access`。
 - llama.cpp 换版本：解压新目录 → 设置页选新版本。
 - 两套引擎互不干扰：Strata 的升级不碰 `llama_cpp_dir`，llama.cpp 的版本目录也不会被 `strata update` 读取。
 

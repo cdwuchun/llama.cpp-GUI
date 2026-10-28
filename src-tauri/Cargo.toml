@@ -1,6 +1,6 @@
 [package]
 name = "llamacpp-gui"
-version = "0.2.2"
+version = "0.3.0"
 description = "llama.cpp GUI - Tauri 2 外壳，管理 llama-server router mode"
 authors = ["llamacpp-gui"]
 edition = "2021"
@@ -47,6 +47,8 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_LibraryLoader",
     # PDH 性能计数器：磁盘吞吐（PhysicalDisk(_Total)）要它
     "Win32_System_Performance",
+    # 模型下载页的磁盘预检（src/strata_download.rs）：GetDiskFreeSpaceExW
+    "Win32_Storage_FileSystem",
 ] }
 
 # ---------- 构建体积控制 ----------

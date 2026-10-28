@@ -29,7 +29,24 @@ import type {
   SettingsPatch,
   StrataModelEntry,
   StrataEngine,
+  StrataController,
+  ApplyControllerResult,
+  StrataEngineState,
+  StrataUpgradeSnapshot,
+  StrataUpgradeStart,
+  StrataDownloadRequest,
+  StrataDownloadSnapshot,
+  StrataDownloadDisk,
+  StrataHostInfo,
+  StrataLocalGguf,
+  StrataMtpCheck,
+  StrataCommunityDiscovery,
+  StrataOrcaProbe,
+  StrataOrcaSnapshot,
+  StrataLaunchPreset,
   StrataStatus,
+  StrataTuneSnapshot,
+  StrataTuneApplyRecord,
 } from "./types";
 
 export const ipc = {
@@ -62,26 +79,97 @@ export const ipc = {
   strataProxyStart: () => invoke<StrataStatus>("strata_proxy_start"),
   /** 停止前门代理（引擎进程不动） */
   strataProxyStop: () => invoke<StrataStatus>("strata_proxy_stop"),
-  strataSetRoot: (path: string) => invoke<Settings>("strata_set_root", { path }),
   strataPick: (configFile: string) => invoke<Settings>("strata_pick", { configFile }),
+  /** 列出 Strata 根目录下并存的控制器版本（`control\<版本>` 或 `terminal\<版本>`） */
+  strataControllers: () => invoke<StrataController[]>("strata_controllers"),
+  /** 切换控制器版本：重写全部 `run-*.bat` 与 `strata-*.json` 的控制器相关参数 */
+  strataApplyController: (version: string) =>
+    invoke<ApplyControllerResult>("strata_apply_controller", { version }),
+  /** 打开官方安装向导（`setup.py --setup`）：加模型走它，返回控制器目录 */
+  strataOpenSetup: () => invoke<string>("strata_open_setup"),
   /** 参数编辑 L2：读 config 原文 */
   strataConfigRead: (configFile: string) => invoke<string>("strata_config_read", { configFile }),
   /** 参数编辑 L2：写 config（后端负责备份 + 校验 + 原子写），返回刷新后的条目 */
   strataConfigWrite: (configFile: string, text: string) =>
     invoke<StrataModelEntry>("strata_config_write", { configFile, text }),
+  /** 参数调优：对这份 config 跑官方 `strata tune auto`（quick / thorough） */
+  strataTuneStart: (configFile: string, mode: string) =>
+    invoke<void>("strata_tune_start", { configFile, mode }),
+  /** 参数调优：读进度（前端每 1.5 秒轮询，直到 `running` 为 false） */
+  strataTuneStatus: (configFile: string) =>
+    invoke<StrataTuneSnapshot>("strata_tune_status", { configFile }),
+  /** 参数调优：停止（模型与配置都不会被改动） */
+  strataTuneStop: (configFile: string) => invoke<void>("strata_tune_stop", { configFile }),
+  /** 把这次调优生效的参数写进 config，返回这次的记录（用户 m01543） */
+  strataTuneApply: (configFile: string) =>
+    invoke<StrataTuneApplyRecord>("strata_tune_apply", { configFile }),
+  /** 上一次调优写进 config 的记录（没有就是 null） */
+  strataTuneHistory: (configFile: string) =>
+    invoke<StrataTuneApplyRecord | null>("strata_tune_history", { configFile }),
+  /** 把设置页「服务」里的 API Key 写进全部 Strata config；空串 = 清掉（用户 m01543） */
+  strataSetApiKey: (apiKey: string) =>
+    invoke<{ written: string[]; failed: string[] }>("strata_set_api_key", { apiKey }),
+  /** 列 Strata 的 launch 预设（只读 `%APPDATA%\Strata\launch-presets`，不起进程） */
+  strataLaunchPresets: () => invoke<StrataLaunchPreset[]>("strata_launch_presets"),
+  /** 把设置页的 API Key 写进全部 launch 预设；返回改动的预设份数（用户 m02313） */
+  strataSyncLaunchKeys: (apiKey: string) => invoke<number>("strata_sync_launch_keys", { apiKey }),
   /** 卸载运行中 Strata 的模型（POST /unload）：进程留着、显存释放 */
-  strataUnloadModel: (root: string, configFile: string) =>
-    invoke<string>("strata_unload_model", { root, configFile }),
+  strataUnloadModel: (configFile: string) => invoke<string>("strata_unload_model", { configFile }),
   /** 加载运行中 Strata 的模型（POST /load）：上游会跑 before_load 并检查显存门槛 */
-  strataLoadModel: (root: string, configFile: string) =>
-    invoke<string>("strata_load_model", { root, configFile }),
-  /** 列出 `engine-bundle` 下所有可用的引擎版本（可能多份并存） */
-  strataEngines: (root: string) => invoke<StrataEngine[]>("strata_engines", { root }),
+  strataLoadModel: (configFile: string) => invoke<string>("strata_load_model", { configFile }),
+  /** 列出官方安装目录下所有可用的引擎版本（可能多份并存） */
+  strataEngines: () => invoke<StrataEngine[]>("strata_engines"),
   /** 把某份 config 的 exe 换成选定的引擎可执行文件 */
-  strataSetEngine: (root: string, configFile: string, exe: string) =>
-    invoke<void>("strata_set_engine", { root, configFile, exe }),
+  strataSetEngine: (configFile: string, exe: string) =>
+    invoke<void>("strata_set_engine", { configFile, exe }),
   /** 把选定的引擎批量写进全部 config，返回被改过的文件名 */
   strataApplyEngine: (exe: string) => invoke<string[]>("strata_apply_engine", { exe }),
+  /** 控制器跟踪的引擎版本（`strata components engine`）：设置页只读显示 + 回退按钮 */
+  strataEngineState: () => invoke<StrataEngineState>("strata_engine_state"),
+  /** 回退到上一版引擎（`strata components rollback`），返回给用户看的一句结果 */
+  strataEngineRollback: () => invoke<string>("strata_engine_rollback"),
+  /** 检查官网 feed 有没有新版本（只读，不下载），返回控制端的原始报告 */
+  strataUpgradeCheck: () => invoke<unknown>("strata_upgrade_check"),
+  /** 起一次升级：`scope` = all / engine / control；`started=false` 表示已是最新 */
+  strataUpgradeStart: (scope: "all" | "engine" | "control") =>
+    invoke<StrataUpgradeStart>("strata_upgrade_start", { scope }),
+  /** 升级进度（每秒轮询） */
+  strataUpgradeStatus: () => invoke<StrataUpgradeSnapshot>("strata_upgrade_status"),
+  /** 取消升级（连同解压 / 校验的子进程一起杀） */
+  strataUpgradeStop: () => invoke<void>("strata_upgrade_stop"),
+
+  /** 模型下载页：起一次非交互安装（官方 `setup.py --yes --no-start`） */
+  strataDownloadStart: (request: StrataDownloadRequest) =>
+    invoke<StrataUpgradeStart>("strata_download_start", { request }),
+  /** 下载进度（每秒轮询） */
+  strataDownloadStatus: () => invoke<StrataDownloadSnapshot>("strata_download_status"),
+  /** 取消下载（整棵进程树一起杀） */
+  strataDownloadStop: () => invoke<void>("strata_download_stop"),
+  /** 磁盘预检：模型目录所在卷够不够这次下载 */
+  strataDownloadPreflight: (needBytes: number, dataDir?: string | null) =>
+    invoke<StrataDownloadDisk>("strata_download_preflight", { needBytes, dataDir: dataDir ?? null }),
+  /** 本机内存 / 显卡（「适合这台电脑」与内存档位） */
+  strataDownloadHost: () => invoke<StrataHostInfo>("strata_download_host"),
+  /** 扫一个目录里的本地 GGUF（「使用已有模型」区块） */
+  strataDownloadScanGguf: (dir: string) =>
+    invoke<StrataLocalGguf[]>("strata_download_scan_gguf", { dir }),
+  /** 认「MTP 草稿层」目录（`<x>`、`<x>\rt`、`<x>\mtp\rt` 都接受） */
+  strataDownloadCheckMtp: (dir: string) =>
+    invoke<StrataMtpCheck>("strata_download_check_mtp", { dir }),
+  /** 社区目录发现（Hugging Face 镜像 API，缓存 24 小时） */
+  strataCommunityDiscover: (force: boolean, endpoint?: string | null) =>
+    invoke<StrataCommunityDiscovery>("strata_community_discover", {
+      force,
+      endpoint: endpoint ?? null,
+    }),
+  /** ORCA 导入前置探测（解释器 / iq_pack.py / 引擎 是否齐） */
+  strataOrcaProbe: () => invoke<StrataOrcaProbe>("strata_orca_probe"),
+  /** 开始 ORCA 导入（下载分片 → iq_pack 打包 → 写配置） */
+  strataOrcaStart: () => invoke<StrataUpgradeStart>("strata_orca_start"),
+  /** ORCA 导入进度（每秒轮询） */
+  strataOrcaStatus: () => invoke<StrataOrcaSnapshot>("strata_orca_status"),
+  /** 取消 ORCA 导入 */
+  strataOrcaStop: () => invoke<void>("strata_orca_stop"),
 
   logsSnapshot: (limit?: number) => invoke<LogLine[]>("logs_snapshot", { limit: limit ?? null }),
   logsClear: () => invoke<void>("logs_clear"),
