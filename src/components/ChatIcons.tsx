@@ -17,7 +17,14 @@ type ChatIconName =
   | "chevron"
   | "think"
   | "tool"
-  | "check";
+  | "check"
+  // 编辑回退那几个（用户 m00232 的 A1，样式与上面同一套线性图标）
+  | "rewind"
+  | "branch"
+  | "refresh"
+  | "edit"
+  | "undo"
+  | "preview";
 
 const STROKE = {
   stroke: "currentColor",
@@ -105,6 +112,51 @@ const SHAPES: Record<ChatIconName, ReactNode> = {
     </>
   ),
   check: <path d="M5 12.5L10 17.5L19 7" {...STROKE} />,
+  // 回到这里：向左的弯箭头
+  rewind: (
+    <>
+      <path d="M9 7L4 12L9 17" {...STROKE} />
+      <path d="M4 12H14C17.314 12 20 14.686 20 18" {...STROKE} />
+    </>
+  ),
+  // 分支：往上分叉的节点
+  branch: (
+    <>
+      <path d="M7 4V14.5" {...STROKE} />
+      <path d="M7 14.5C7 17 9 18.5 12 18.5H15.5" {...STROKE} />
+      <circle cx="7" cy="4" r="2" {...STROKE} />
+      <circle cx="17.5" cy="18.5" r="2" {...STROKE} />
+    </>
+  ),
+  // 重新生成：环形箭头
+  refresh: (
+    <>
+      <path d="M20 12C20 16.418 16.418 20 12 20C7.582 20 4 16.418 4 12C4 7.582 7.582 4 12 4C15.2 4 17.97 5.88 19.3 8.6" {...STROKE} />
+      <path d="M20 4V9H15" {...STROKE} />
+    </>
+  ),
+  // 改写回答：铅笔
+  edit: (
+    <>
+      <path d="M4 20H8L19 9C19.552 8.448 19.552 7.552 19 7L17 5C16.448 4.448 15.552 4.448 15 5L4 16V20Z" {...STROKE} />
+      <path d="M13.5 6.5L17.5 10.5" {...STROKE} />
+    </>
+  ),
+  // 撤销：向左回转的箭头
+  undo: (
+    <>
+      <path d="M9 7L4 12L9 17" {...STROKE} />
+      <path d="M4 12H15C17.761 12 20 14.239 20 17V19" {...STROKE} />
+    </>
+  ),
+  // 预览：方框里一只眼睛
+  preview: (
+    <>
+      <path d="M4 6.5C4 5.67 4.67 5 5.5 5H18.5C19.33 5 20 5.67 20 6.5V17.5C20 18.33 19.33 19 18.5 19H5.5C4.67 19 4 18.33 4 17.5V6.5Z" {...STROKE} />
+      <path d="M8 12C8 12 9.6 9.5 12 9.5C14.4 9.5 16 12 16 12C16 12 14.4 14.5 12 14.5C9.6 14.5 8 12 8 12Z" {...STROKE} />
+      <circle cx="12" cy="12" r="1.2" fill="currentColor" />
+    </>
+  ),
 };
 
 export function ChatIcon({

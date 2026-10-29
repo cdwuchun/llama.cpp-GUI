@@ -2139,6 +2139,139 @@ rect.scenario-column.is-failed {
     height: 28px;
 }
 
+/* 消息操作按钮组（编辑 / 重新生成 / 回退 / 分支，用户 m00232 的 A1） */
+.msg-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    margin-inline-start: auto;
+}
+
+.msg-actions .st-btn--icon {
+    width: 28px;
+    height: 28px;
+}
+
+/* 改写回答时的编辑框（占住气泡的位置） */
+.msg-edit textarea {
+    display: block;
+    width: 100%;
+    padding: var(--st-s-3);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-field);
+    background: var(--st-surface);
+    color: var(--st-ink);
+    font: 400 var(--st-fs-md)/1.6 var(--st-font);
+    resize: vertical;
+}
+
+.msg-edit__bar {
+    display: flex;
+    align-items: center;
+    gap: var(--st-s-2);
+    margin-top: var(--st-s-2);
+    flex-wrap: wrap;
+}
+
+/* 工具栏下的撤销条（上游的 Undo 行） */
+.chat-undo {
+    display: flex;
+    align-items: center;
+    gap: var(--st-s-2);
+    padding: var(--st-s-2) var(--st-s-4);
+    border-bottom: 1px solid var(--st-line-soft);
+    background: var(--st-surface-2);
+    color: var(--st-ink-soft);
+    font-size: var(--st-fs-xs);
+}
+
+.chat-undo > span {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* 分支会话的「打开原会话」入口 */
+.chat-toolbar__parent {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--st-s-1);
+    max-width: 34%;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.chat-toolbar__parent:hover {
+    color: var(--st-ink);
+}
+
+/* composer 上方的排队提示（生成中发送 = 排队 / 打断，用户 m00232 的 A2） */
+.chat-pending {
+    display: flex;
+    align-items: center;
+    gap: var(--st-s-2);
+    width: min(var(--chat-width, 860px), calc(100% - 2 * var(--st-s-10)));
+    margin: 0 auto var(--st-s-2);
+    padding: var(--st-s-2) var(--st-s-3);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-field);
+    background: var(--st-surface-2);
+    color: var(--st-ink-soft);
+    font-size: var(--st-fs-xs);
+}
+
+.chat-pending__text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* 代码块右侧的动作按钮组（预览 + 复制） */
+.st-code__actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+}
+
+/* html / svg 围栏的沙箱预览（脚本一律不放开） */
+.st-preview {
+    display: block;
+    width: 100%;
+    height: 320px;
+    border: 0;
+    border-bottom: 1px solid var(--st-line-soft);
+    background: var(--st-surface);
+}
+
+/* KaTeX 公式（离线渲染，字体随 vendor/katex/katex.min.css 一起加载） */
+.chat-math .katex {
+    font-size: 1.05em;
+}
+
+.chat-math--display {
+    display: block;
+    margin: var(--st-s-3) 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+}
+
+/* KaTeX 还没加载好 / 渲染失败：退回原文，用等宽字体区分开 */
+.chat-math--raw {
+    font-family: var(--st-font-mono);
+    color: var(--st-ink-soft);
+}
+
 .msg-error {
     margin-bottom: var(--st-s-2);
     color: var(--st-danger-text);

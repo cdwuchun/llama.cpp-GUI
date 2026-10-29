@@ -46,7 +46,15 @@ import {
   type Conversation,
   type ToolCall,
 } from "./utils/chat";
-import { buildToolSpecs, isMcpTool, mergeToolCallFragments, parseToolArguments } from "./utils/tools";
+import { buildToolSpecs, isMcpTool, mergeToolCallFragments, parseToolArguments, searchQueriesFromArgs } from "./utils/tools";
+import {
+  branchConversation,
+  draftOfTurn,
+  editAnswerPlan,
+  regeneratePlan,
+  rewindPlan,
+  type ChatUndo,
+} from "./utils/chatHistory";
 import { mergeModels } from "./utils/models";
 import {
   DEFAULT_SCENARIO_BENCH_OPTIONS,
@@ -381,6 +389,10 @@ export interface ChatState {
   streaming: boolean;
   options: ChatOptions;
   error: string | null;
+  /** 上一次「编辑回退」的撤销快照（有值时界面显示撤销条） */
+  undo: ChatUndo | null;
+  /** 生成中排队的下一问（busyMode = "queue"/"interrupt" 时挂在这里） */
+  pending: { text: string; attachments: ChatAttachment[] } | null;
 }
 
 /** 上下文档位压测的界面状态（放 store：切页面不丢，见 HANDOVER §8 第 1 项） */
@@ -612,6 +624,18 @@ interface AppStore {
   setChatOptions: (patch: Partial<ChatOptions>) => void;
   /** 清掉聊天页的错误条 */
   dismissChatError: () => void;
+  /** 重新生成第 index 条消息所在的那一轮回答（上游 regenerate） */
+  regenerateReply: (index: number) => void;
+  /** 改写第 index 条助手回答的正文，后面的消息隐藏（上游 editAnswer） */
+  editAnswerText: (index: number, text: string) => void;
+  /** 回到第 index 条消息：用户消息回填输入框 / 助手消息保留，后面的隐藏；branch = 从这里开分支 */
+  rewindChat: (index: number, branch: boolean) => void;
+  /** 撤销上一次编辑回退（撤销条上的按钮） */
+  undoChatHistory: () => void;
+  /** 只关掉撤销条、不撤销（用户自己点掉的提示） */
+  dismissChatUndo: () => void;
+  /** 取消生成中排队的那一问 */
+  clearPendingChat: () => void;
   /** 监控采集层的最新快照（底部状态栏 / 弹层用） */
   monitor: MonitorSnapshot | null;
   /** 快照时刻（Unix 毫秒） */
@@ -869,6 +893,8 @@ export const useApp = create<AppStore>((set, get) => ({
     streaming: false,
     options: loadChatOptions(),
     error: null,
+    undo: null,
+    pending: null,
   },
   monitor: null,
   monitorAt: 0,
@@ -2385,7 +2411,24 @@ export const useApp = create<AppStore>((set, get) => ({
 
   async sendChat() {
     const state = get().chat;
-    if (state.streaming) return;
+    // 生成中又点发送（用户 m00232 的 A2）：等待 = 忽略；排队 = 挂到 pending，这一轮收尾后自动发；
+    // 打断 = 先停掉当前这轮，收尾后把新问题发出去（上游 `s-busy` 三态，Wait / Send after / Interrupt）
+    if (state.streaming) {
+      const queued = state.draft.trim();
+      if (!queued && state.attachments.length === 0) return;
+      if (state.options.busyMode === "queue" || state.options.busyMode === "interrupt") {
+        set({
+          chat: {
+            ...state,
+            pending: { text: state.draft, attachments: [...state.attachments] },
+            draft: "",
+            attachments: [],
+          },
+        });
+        if (state.options.busyMode === "interrupt") chatAbort?.abort();
+      }
+      return;
+    }
     const draft = state.draft.trim();
     if (!draft && state.attachments.length === 0) return;
 
@@ -2502,24 +2545,40 @@ export const useApp = create<AppStore>((set, get) => ({
     ): Promise<{ text: string; ok: boolean; note?: string }> => {
       const args = parseToolArguments(call.arguments);
       if (call.name === "web_search") {
-        const query = typeof args.query === "string" ? args.query.trim() : "";
-        if (!query) return { text: "搜索词是空的", ok: false };
+        // 参数形态照 DSH 核心（dsh-tool-web）：queries 1–4 条，去重、并发、合并
+        const queries = searchQueriesFromArgs(args);
+        if (queries.length === 0) return { text: "搜索词是空的", ok: false };
         const limit = typeof args.limit === "number" ? args.limit : undefined;
         try {
-          // 走后端的多引擎搜索（`src-tauri/src/search.rs`）：前端不再自己拼结果，
-          // 拿回来的是已经包好「不可信网页内容」边界的整段文本
-          const result = await ipc.searchQuery(query, limit);
+          // 每条查询并发打后端（`search_query` 是异步命令，后端互不排队），
+          // 任一查询失败整批中止 —— 与 DSH web_search 的融合信号语义一致
+          // （Promise.all 的第一个 reject 就是我们要回传的失败）。
+          // 走后端的多引擎搜索（`src-tauri/src/search.rs`）：拿回来的是已经包好
+          // 「不可信网页内容」边界的整段文本
+          const results = await Promise.all(queries.map((query) => ipc.searchQuery(query, limit)));
           // 卡片上写清实际用的引擎、以及哪些引擎被跳过（失败原因），
           // 否则用户只看到「用了 Tavily」，没法知道排前面的 AnySearch 为什么没上
-          const skipped = result.attempts
-            .filter((item) => item.engine !== result.engine)
-            .map((item) => `${item.engine}（${item.error ?? "跳过"}）`)
-            .join("、");
-          const note = skipped
-            ? `${result.engine} · 跳过 ${skipped}`
-            : `${result.engine}${result.cached ? " · 缓存" : ""}`;
-          if (result.hits.length === 0) return { text: "没有搜到结果", ok: false, note };
-          return { text: result.block, ok: true, note };
+          const note =
+            results
+              .map((result) => {
+                const skipped = result.attempts
+                  .filter((item) => item.engine !== result.engine)
+                  .map((item) => `${item.engine}（${item.error ?? "跳过"}）`)
+                  .join("、");
+                return skipped
+                  ? `${result.engine} · 跳过 ${skipped}`
+                  : `${result.engine}${result.cached ? " · 缓存" : ""}`;
+              })
+              .join("；");
+          const usable = results.filter((result) => result.hits.length > 0);
+          if (usable.length === 0) return { text: "没有搜到结果", ok: false, note };
+          const text =
+            queries.length === 1
+              ? usable[0].block
+              : results
+                  .map((result, index) => `### ${queries[index]}\n${result.hits.length > 0 ? result.block : "没有搜到结果"}`)
+                  .join("\n\n");
+          return { text, ok: true, note };
         } catch (error) {
           return { text: errText(error), ok: false };
         }
@@ -2670,25 +2729,34 @@ export const useApp = create<AppStore>((set, get) => ({
 
         const results: ChatTurn[] = [];
         for (const call of calls) {
-          // 同一个搜索词第二次直接挡掉：模型会反复搜同一句，五轮全耗在这上面，
-          // 结果一样还占满上下文（用户 m07347 截图里 5 张卡片同一个 query）
+          // 按查询去重（照 DSH 的口径：完全相同的查询只执行一次）。
+          // 模型换词重搜要放行；已搜过的词只跑新词，全搜过就整张卡跳过
+          // （用户 m07347 截图里 5 张卡片同一个 query）
           const callArgs = parseToolArguments(call.arguments);
-          const asked = typeof callArgs.query === "string" ? callArgs.query.trim() : "";
+          const asked = call.name === "web_search" ? searchQueriesFromArgs(callArgs) : [];
+          const fresh = asked.filter((item) => !searched.has(item));
           const target = typeof callArgs.url === "string" ? callArgs.url.trim() : "";
           const repeated =
-            (call.name === "web_search" && asked !== "" && searched.has(asked)) ||
+            (call.name === "web_search" && asked.length > 0 && fresh.length === 0) ||
             (call.name === "web_fetch" && target !== "" && fetched.has(target));
           const outcome = repeated
             ? {
                 text:
                   call.name === "web_fetch"
                     ? `已经读过 ${target}，正文就在上面的工具结果里。请直接基于已有资料回答，不要再重复抓取。`
-                    : `已经搜过「${asked}」，结果就在上面的工具结果里。请直接基于已有资料回答，不要再重复搜索。`,
+                    : `已经搜过「${asked.join("，")}」，结果就在上面的工具结果里。请直接基于已有资料回答，不要再重复搜索。`,
                 ok: true,
                 note: "重复调用已跳过",
               }
-            : await runTool(call);
-          if (call.name === "web_search" && asked !== "" && !repeated) searched.add(asked);
+            : await runTool(
+                // 部分查询搜过、部分是新的：参数里摘掉旧词，只跑新词
+                call.name === "web_search" && fresh.length > 0 && fresh.length < asked.length
+                  ? { ...call, arguments: JSON.stringify({ ...callArgs, queries: fresh }) }
+                  : call,
+              );
+          if (call.name === "web_search" && !repeated) {
+            for (const item of fresh) searched.add(item);
+          }
           if (call.name === "web_fetch" && target !== "" && !repeated) fetched.add(target);
           patchAssistant((message) => ({
             ...message,
@@ -2797,6 +2865,16 @@ export const useApp = create<AppStore>((set, get) => ({
         },
         recentTurns: [row, ...get().recentTurns].slice(0, RECENT_TURN_LIMIT),
       });
+
+      // 排队的那一问：这一轮收尾后接着发（上游「Send after」）。失败 / 被打断也照发，
+      // 用户点的是「之后发送」，不是「成功才发送」。
+      const queued = get().chat.pending;
+      if (queued) {
+        set({
+          chat: { ...get().chat, pending: null, draft: queued.text, attachments: queued.attachments },
+        });
+        void get().sendChat();
+      }
     }
   },
 
@@ -2904,6 +2982,183 @@ export const useApp = create<AppStore>((set, get) => ({
 
   dismissChatError() {
     set({ chat: { ...get().chat, error: null } });
+  },
+
+  /**
+   * 重新生成（用户 m00232 的 A1，照上游 `regenerate`）：从 index 往前找到那条用户消息，
+   * 把它的正文与附件回填输入框、消息列表退回到它之前，然后按正常发送流程重跑一轮。
+   * 原来的消息整份塞进撤销条，点「撤销」就放回去。
+   */
+  regenerateReply(index) {
+    const state = get().chat;
+    if (state.streaming) return;
+    const conversation = state.conversations.find((item) => item.id === state.activeId);
+    if (!conversation) return;
+    const plan = regeneratePlan(conversation.messages, index);
+    if (!plan) return;
+    const user = plan.keep.at(-1);
+    if (!user || user.role !== "user") return;
+    // 历史会话的附件只留了名字（落盘时清空 content）——重新发会丢掉图片/文本，直接拦下来
+    const draft = draftOfTurn(user);
+    if (draft.lost > 0) {
+      set({
+        chat: {
+          ...state,
+          error: `这条消息还有 ${draft.lost} 个附件只保留了文件名（历史会话不保存附件内容）。请新建会话重新添加附件后再试。`,
+        },
+      });
+      return;
+    }
+    if (!draft.text && draft.attachments.length === 0) return;
+    // 模型沿用这份会话绑定的那个（不用当前下拉里的，否则会把旧会话接到别的模型上）
+    const trimmed: Conversation = {
+      ...conversation,
+      messages: plan.keep.slice(0, -1),
+      updatedAt: Date.now(),
+    };
+    set({
+      chat: {
+        ...state,
+        conversations: saveConversations([
+          trimmed,
+          ...state.conversations.filter((item) => item.id !== trimmed.id),
+        ]),
+        options: { ...state.options, model: conversation.model },
+        draft: draft.text,
+        attachments: draft.attachments,
+        undo: { messages: conversation.messages, text: "已重新生成本轮回答" },
+        error: null,
+      },
+    });
+    void get().sendChat();
+  },
+
+  /** 改写回答（照上游 `editAnswer`）：只替换正文并打「已编辑」，思考/工具/用量丢弃，后面消息隐藏 */
+  editAnswerText(index, text) {
+    const state = get().chat;
+    if (state.streaming) return;
+    const conversation = state.conversations.find((item) => item.id === state.activeId);
+    if (!conversation) return;
+    const clean = text.trim();
+    if (!clean) {
+      set({ chat: { ...state, error: "回答内容不能为空" } });
+      return;
+    }
+    const plan = editAnswerPlan(conversation.messages, index, clean);
+    if (!plan) return;
+    const changed: Conversation = { ...conversation, messages: plan.keep, updatedAt: Date.now() };
+    set({
+      chat: {
+        ...state,
+        conversations: saveConversations([
+          changed,
+          ...state.conversations.filter((item) => item.id !== changed.id),
+        ]),
+        undo: {
+          messages: conversation.messages,
+          text: plan.hidden > 0 ? `已改写这条回答，后面 ${plan.hidden} 条消息已隐藏` : "已改写这条回答",
+        },
+        error: null,
+      },
+    });
+  },
+
+  /**
+   * 回到某条消息（照上游 `rewind`）：用户消息 → 回填输入框并从列表里拿掉；助手消息 → 保留，后面的拿掉。
+   * `branch` = 从这里开分支：新会话带一份副本，原会话原样不动。
+   */
+  rewindChat(index, branch) {
+    const state = get().chat;
+    if (state.streaming) return;
+    const conversation = state.conversations.find((item) => item.id === state.activeId);
+    if (!conversation) return;
+    const plan = rewindPlan(conversation.messages, index);
+    if (!plan) return;
+    const lost = plan.draft && plan.draft.lost > 0
+      ? `（有 ${plan.draft.lost} 个附件只保留了文件名，回填时已略过，需要重新添加）`
+      : "";
+    if (branch) {
+      const next = branchConversation(conversation, plan.keep, conversationTitle(`${conversation.title} 的分支`));
+      set({
+        chat: {
+          ...state,
+          conversations: saveConversations([
+            next,
+            ...state.conversations.filter((item) => item.id !== next.id),
+          ]),
+          activeId: next.id,
+          draft: plan.draft?.text ?? "",
+          attachments: plan.draft?.attachments ?? [],
+          undo: null,
+          error: lost || null,
+        },
+      });
+      return;
+    }
+    const changed: Conversation = { ...conversation, messages: plan.keep, updatedAt: Date.now() };
+    const keepComposer = plan.draft === null;
+    set({
+      chat: {
+        ...state,
+        conversations: saveConversations([
+          changed,
+          ...state.conversations.filter((item) => item.id !== changed.id),
+        ]),
+        draft: keepComposer ? state.draft : plan.draft!.text,
+        attachments: keepComposer ? state.attachments : plan.draft!.attachments,
+        undo: {
+          messages: conversation.messages,
+          text: plan.hidden > 0 ? `已回到这条消息，后面 ${plan.hidden} 条消息已隐藏` : "已回到这条消息",
+          ...(keepComposer
+            ? {}
+            : {
+                inserted: plan.draft!.text,
+                draftBefore: { text: state.draft, attachments: state.attachments },
+              }),
+        },
+        error: lost || null,
+      },
+    });
+  },
+
+  /** 撤销条上的按钮：把动作之前的整份消息列表放回去，并还原被动作换掉的草稿 */
+  undoChatHistory() {
+    const state = get().chat;
+    const undo = state.undo;
+    if (!undo || state.streaming) return;
+    const conversation = state.conversations.find((item) => item.id === state.activeId);
+    if (!conversation) return;
+    const restored: Conversation = { ...conversation, messages: undo.messages, updatedAt: Date.now() };
+    let draft = state.draft;
+    let attachments = state.attachments;
+    // 只在草稿仍是动作放进去的那段、且没动过时才还原（用户改过就别覆盖他的输入）
+    if (undo.draftBefore && undo.inserted !== undefined && draft.trim() === undo.inserted.trim()) {
+      draft = undo.draftBefore.text;
+      attachments = undo.draftBefore.attachments;
+    }
+    set({
+      chat: {
+        ...state,
+        conversations: saveConversations([
+          restored,
+          ...state.conversations.filter((item) => item.id !== restored.id),
+        ]),
+        draft,
+        attachments,
+        undo: null,
+        error: null,
+      },
+    });
+  },
+
+  clearPendingChat() {
+    const state = get().chat;
+    if (!state.pending) return;
+    set({ chat: { ...state, pending: null } });
+  },
+
+  dismissChatUndo() {
+    set({ chat: { ...get().chat, undo: null } });
   },
 
   /** 抓一次采集快照；状态栏 1 秒调一次，失败就把 metric 置空（界面显示「监控不可用」）。 */

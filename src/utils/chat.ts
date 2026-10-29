@@ -157,6 +157,8 @@ export interface ChatTurn {
   elapsedMs?: number;
   firstTokenMs?: number;
   reasoningMs?: number;
+  /** 界面小标记：改写过的回答带「已编辑」（上游 `m.meta`） */
+  meta?: string;
 }
 
 export interface Conversation {
@@ -167,6 +169,8 @@ export interface Conversation {
   messages: ChatTurn[];
   createdAt: number;
   updatedAt: number;
+  /** 分支会话记着从哪来（上游 `chat.parent`），界面上给一条「打开原会话」的提示 */
+  parent?: { id: string; title: string };
 }
 
 export type ReasoningEffort = "off" | "low" | "medium" | "high";
@@ -187,6 +191,14 @@ export interface ChatOptions {
   mcpTools: boolean;
   /** Enter 直接发送（否则 Enter 换行、Ctrl+Enter 发送）；用户 m07816 第 3 点 */
   enterSends: boolean;
+  /** 允许「回到历史点 / 改写回答 / 重新生成」（上游 `edit-and-rewind` 开关） */
+  chatEdit: boolean;
+  /** 聊天页左侧的会话列表是否显示（上游 `saved chats list` 开关） */
+  chatList: boolean;
+  /** 生成中又点发送时怎么办：等待（忽略）/ 排队 / 打断当前这轮 */
+  busyMode: "wait" | "queue" | "interrupt";
+  /** 渲染 KaTeX 数学公式（离线，字体随包里带） */
+  showMath: boolean;
 }
 
 /** 上游 `DEFAULT_COMMON_CHAT_DEFAULTS` 的同一组值（mcp 字段本工程没有） */
@@ -203,6 +215,10 @@ export const DEFAULT_CHAT_OPTIONS: Readonly<ChatOptions> = Object.freeze({
   webSearch: false,
   mcpTools: false,
   enterSends: true,
+  chatEdit: true,
+  chatList: true,
+  busyMode: "wait",
+  showMath: true,
 });
 
 export function normalizeChatOptions(value: unknown): ChatOptions {
@@ -247,6 +263,13 @@ export function normalizeChatOptions(value: unknown): ChatOptions {
     webSearch: typeof stored.webSearch === "boolean" ? stored.webSearch : DEFAULT_CHAT_OPTIONS.webSearch,
     mcpTools: typeof stored.mcpTools === "boolean" ? stored.mcpTools : DEFAULT_CHAT_OPTIONS.mcpTools,
     enterSends: typeof stored.enterSends === "boolean" ? stored.enterSends : DEFAULT_CHAT_OPTIONS.enterSends,
+    chatEdit: typeof stored.chatEdit === "boolean" ? stored.chatEdit : DEFAULT_CHAT_OPTIONS.chatEdit,
+    chatList: typeof stored.chatList === "boolean" ? stored.chatList : DEFAULT_CHAT_OPTIONS.chatList,
+    busyMode:
+      typeof stored.busyMode === "string" && ["wait", "queue", "interrupt"].includes(stored.busyMode)
+        ? (stored.busyMode as ChatOptions["busyMode"])
+        : DEFAULT_CHAT_OPTIONS.busyMode,
+    showMath: typeof stored.showMath === "boolean" ? stored.showMath : DEFAULT_CHAT_OPTIONS.showMath,
   };
 }
 

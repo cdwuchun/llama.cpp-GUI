@@ -22,24 +22,58 @@ export function isMcpTool(name: string): boolean {
   return name.startsWith(MCP_PREFIX);
 }
 
-/** 内置联网搜索：后端 `search_query` 命令（多引擎 fallback，见 `search.rs`） */
+/** 一次 web_search 最多几条查询（照 dsh-tool-web 的 searchMaxQueries=4） */
+export const MAX_SEARCH_QUERIES = 4;
+
+/**
+ * 内置联网搜索：后端 `search_query` 命令（多引擎 fallback，见 `search.rs`）。
+ * 查询形态照 DSH 核心（dsh-tool-web）：`queries` 1–4 条并发搜、合并返回。
+ */
 export const WEB_SEARCH_TOOL: ToolSpec = {
   type: "function",
   function: {
     name: "web_search",
     description:
-      "联网搜索。当问题涉及最新消息、你不确定的事实、或用户明确要求查资料时调用。返回若干条标题、链接与正文节选。" +
+      "联网搜索。一次给 1–4 条查询（queries 数组），并行搜索后合并返回。当问题涉及最新消息、你不确定的事实、或用户明确要求查资料时调用；" +
+      "需要多角度覆盖时把每个角度写成一条查询，完全相同的查询只执行一次。返回若干条标题、链接与正文节选，按查询分节。" +
       "如果某条结果最相关但内容被截断，再用 web_fetch 读它的完整正文。",
     parameters: {
       type: "object",
       properties: {
-        query: { type: "string", description: "搜索词，尽量简短并包含关键实体" },
-        limit: { type: "integer", description: "返回条数，1–50，默认 6；问题复杂时给 15–30" },
+        queries: {
+          type: "array",
+          items: { type: "string" },
+          description: "1–4 条搜索词，每条尽量简短并包含关键实体；完全相同的查询只执行一次",
+        },
+        limit: { type: "integer", description: "每条查询的返回条数，1–50，默认 6；问题复杂时给 15–30" },
       },
-      required: ["query"],
+      required: ["queries"],
     },
   },
 };
+
+/**
+ * 从 web_search 参数里取查询：去空、去完全重复、最多 4 条（DSH 的 searchMaxQueries 口径）。
+ * 兼容旧版单串 `query` 形态 —— 模型按旧 schema 写出的调用也要接得住。
+ */
+export function searchQueriesFromArgs(args: Record<string, unknown>): string[] {
+  const raw = Array.isArray(args.queries)
+    ? (args.queries as unknown[]).filter((item): item is string => typeof item === "string")
+    : [];
+  const list =
+    raw.length > 0
+      ? raw
+      : typeof args.query === "string"
+        ? [args.query]
+        : [];
+  const picked: string[] = [];
+  for (const item of list) {
+    const value = item.trim();
+    if (!value || picked.includes(value)) continue;
+    picked.push(value);
+  }
+  return picked.slice(0, MAX_SEARCH_QUERIES);
+}
 
 /** 内置网页正文抓取：后端 `web_fetch` 命令（curl 抓 HTML → 抽正文） */
 export const WEB_FETCH_TOOL: ToolSpec = {
@@ -145,9 +179,9 @@ export function toolTitle(name: string): string {
 /** 一次调用的参数摘要，给工具卡片当副标题 */
 export function describeToolCall(name: string, args: Record<string, unknown>): string {
   if (name === "web_search") {
-    const query = typeof args.query === "string" ? args.query : "";
+    const queries = searchQueriesFromArgs(args);
     const limit = typeof args.limit === "number" ? args.limit : undefined;
-    return limit ? `${query}（${limit} 条）` : query;
+    return limit ? `${queries.join("，")}（每条 ${limit} 条）` : queries.join("，");
   }
   if (name === "web_fetch") {
     return typeof args.url === "string" ? args.url : "";

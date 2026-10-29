@@ -1,12 +1,27 @@
-import { Children, isValidElement, memo, useEffect, useRef, type ReactNode } from "react";
+import { Children, isValidElement, memo, useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import type { ChatToolEvent, ChatTurn } from "../utils/chat";
 import { ipc } from "../ipc";
 import { describeToolCall, toolTitle } from "../utils/tools";
+import { canPreview, previewFrameDoc, type PreviewKind } from "../utils/chatPreview";
+import { MATH_TOKEN, protectMath } from "../utils/chatMath";
 import { ChatIcon } from "./ChatIcons";
 import { ChatExecutionStatus } from "./ChatExecutionStatus";
+import { MathTex } from "./ChatMath";
+
+/** 一条消息上的操作（用户 m00232 的 A1）：回到这里 / 从这里分支 / 重新生成 / 改写回答 */
+export interface ChatMessageActions {
+  /** 允许编辑回退（聊天设置里的开关，关掉就整排不显示） */
+  editable: boolean;
+  /** 正在生成：所有操作锁住（上游 `stillWriting`） */
+  busy: boolean;
+  onRewind: (index: number) => void;
+  onBranch: (index: number) => void;
+  onRegenerate: (index: number) => void;
+  onEditAnswer: (index: number, text: string) => void;
+}
 
 /** 代码块：右上角带语言名与复制按钮（照上游 `CodeBlock`） */
 function CodeBlock({ children, onCopy }: { children?: ReactNode; onCopy: (value: string) => void }) {
@@ -14,36 +29,77 @@ function CodeBlock({ children, onCopy }: { children?: ReactNode; onCopy: (value:
   const props = isValidElement<{ children?: ReactNode; className?: string }>(child) ? child.props : {};
   const text = String(props.children ?? "").replace(/\n$/, "");
   const language = props.className?.replace(/^language-/, "") ?? "";
+  // html / svg 围栏给一个「预览」开关（用户 m00232 的 A4）：默认收起，点了才起 iframe
+  const kind: PreviewKind | null = canPreview(language, text);
+  const [preview, setPreview] = useState(false);
   return (
     <div className="st-code">
       <div className="st-code__head">
         <span>{language}</span>
-        <button
-          type="button"
-          className="st-btn st-btn--icon"
-          title="复制代码"
-          aria-label="复制代码"
-          onClick={() => onCopy(text)}
-        >
-          <ChatIcon name="copy" size={16} />
-        </button>
+        <div className="st-code__actions">
+          {kind && (
+            <button
+              type="button"
+              className={`st-btn st-btn--icon ${preview ? "is-on" : ""}`}
+              title={preview ? "收起预览（脚本禁用）" : "预览（沙箱、脚本禁用）"}
+              aria-label="预览"
+              onClick={() => setPreview((value) => !value)}
+            >
+              <ChatIcon name="preview" size={16} />
+            </button>
+          )}
+          <button
+            type="button"
+            className="st-btn st-btn--icon"
+            title="复制代码"
+            aria-label="复制代码"
+            onClick={() => onCopy(text)}
+          >
+            <ChatIcon name="copy" size={16} />
+          </button>
+        </div>
       </div>
+      {preview && kind && (
+        <iframe
+          className="st-preview"
+          title={`${kind} 预览`}
+          sandbox=""
+          srcDoc={previewFrameDoc(kind, text)}
+        />
+      )}
       <pre>{children}</pre>
     </div>
   );
 }
 
-const Markdown = memo(function Markdown({ text, onCopy }: { text: string; onCopy: (value: string) => void }) {
+const Markdown = memo(function Markdown({
+  text,
+  onCopy,
+  showMath,
+}: {
+  text: string;
+  onCopy: (value: string) => void;
+  showMath: boolean;
+}) {
+  // 公式按需保护：来源列表与 `code` 渲染器里的下标一一对应
+  const { prepared, sources } = protectMath(text, showMath);
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       components={{
         pre: ({ children }) => <CodeBlock onCopy={onCopy}>{children}</CodeBlock>,
-        code: ({ className, children, ...props }) => (
-          <code className={className ?? "inline"} {...props}>
-            {children}
-          </code>
-        ),
+        code: ({ className, children, ...props }) => {
+          const token = MATH_TOKEN.exec(String(children));
+          if (!className && token) {
+            const source = sources[Number(token[1])];
+            if (source) return <MathTex source={source.source} display={source.display} />;
+          }
+          return (
+            <code className={className ?? "inline"} {...props}>
+              {children}
+            </code>
+          );
+        },
         // 网页链接交给系统浏览器打开（用户 m07200 第 2 点）。
         // WebView2 里直接跳转会把整个界面替换成网页，且没有后退入口。
         a: ({ href, children }) => (
@@ -59,7 +115,7 @@ const Markdown = memo(function Markdown({ text, onCopy }: { text: string; onCopy
         ),
       }}
     >
-      {text}
+      {prepared}
     </ReactMarkdown>
   );
 });
@@ -129,18 +185,34 @@ function ToolCall({ tool }: { tool: ChatToolEvent }) {
  */
 export const ChatMessageView = memo(function ChatMessageView({
   message,
+  index,
   showReasoning,
+  showMath,
   streaming,
+  actions,
   onCopy,
 }: {
   message: ChatTurn;
+  /** 在会话消息列表里的下标（编辑回退的各个动作都按它定位） */
+  index: number;
   showReasoning: boolean;
+  /** 渲染 KaTeX 公式（聊天设置里的「显示数学」） */
+  showMath: boolean;
   streaming: boolean;
+  /** null = 不显示操作按钮（比如导出、只读场景） */
+  actions: ChatMessageActions | null;
   onCopy: (value: string) => void;
 }) {
   const reasoning = useRef<HTMLDetailsElement>(null);
   const touched = useRef(false);
   const thinkingNow = streaming && !message.content;
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(message.content);
+  const locked = !actions || actions.busy || streaming;
+
+  useEffect(() => {
+    if (!editing) setDraft(message.content);
+  }, [message.content, editing]);
 
   // 思考块自动开合：用户手动点过之后就不再托管（上游同）
   useEffect(() => {
@@ -169,8 +241,34 @@ export const ChatMessageView = memo(function ChatMessageView({
         )}
         <div className="st-bubble">{message.content}</div>
         <div className="st-msg__meta">
-          你 ·{" "}
-          {new Date(message.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}
+          <span className="meta-text">
+            你 ·{" "}
+            {new Date(message.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}
+          </span>
+          {actions?.editable && (
+            <span className="msg-actions">
+              <button
+                type="button"
+                className="st-btn st-btn--icon"
+                title="回到这条消息（把它放回输入框，后面的消息隐藏）"
+                aria-label="回到这条消息"
+                disabled={locked}
+                onClick={() => actions.onRewind(index)}
+              >
+                <ChatIcon name="rewind" size={16} />
+              </button>
+              <button
+                type="button"
+                className="st-btn st-btn--icon"
+                title="从这里开一个分支会话"
+                aria-label="从这里开分支"
+                disabled={locked}
+                onClick={() => actions.onBranch(index)}
+              >
+                <ChatIcon name="branch" size={16} />
+              </button>
+            </span>
+          )}
         </div>
       </div>
     );
@@ -203,16 +301,23 @@ export const ChatMessageView = memo(function ChatMessageView({
   // 正文按工具调用位置切开：文字 → 工具 → 文字 → …
   const answer: ReactNode[] = [];
   let position = 0;
-  for (const [index, tool] of (message.tools ?? []).entries()) {
+  for (const [order, tool] of (message.tools ?? []).entries()) {
     const at = Math.min(Math.max(tool.at ?? 0, position), message.content.length);
     if (at > position) {
-      answer.push(<Markdown key={`text-${index}`} text={message.content.slice(position, at)} onCopy={onCopy} />);
+      answer.push(
+        <Markdown
+          key={`text-${order}`}
+          text={message.content.slice(position, at)}
+          onCopy={onCopy}
+          showMath={showMath}
+        />,
+      );
     }
-    answer.push(<ToolCall key={tool.id ?? index} tool={tool} />);
+    answer.push(<ToolCall key={tool.id ?? order} tool={tool} />);
     position = at;
   }
   if (position < message.content.length) {
-    answer.push(<Markdown key="tail" text={message.content.slice(position)} onCopy={onCopy} />);
+    answer.push(<Markdown key="tail" text={message.content.slice(position)} onCopy={onCopy} showMath={showMath} />);
   }
 
   return (
@@ -236,34 +341,114 @@ export const ChatMessageView = memo(function ChatMessageView({
         </summary>
         <div className="st-collapse__body thinking">{message.reasoning}</div>
       </details>
-      <div className={`st-bubble ${streaming && message.content ? "cursor" : ""}`}>
-        {message.error && (
-          <div className="msg-error" role="alert">
-            {message.error}
+      {editing ? (
+        <div className="st-bubble msg-edit">
+          <textarea
+            value={draft}
+            rows={Math.min(18, Math.max(4, draft.split("\n").length + 1))}
+            onChange={(event) => setDraft(event.target.value)}
+          />
+          <div className="msg-edit__bar">
+            <button
+              type="button"
+              className="st-btn st-btn--primary"
+              onClick={() => {
+                actions?.onEditAnswer(index, draft);
+                setEditing(false);
+              }}
+            >
+              保存
+            </button>
+            <button
+              type="button"
+              className="st-btn"
+              onClick={() => {
+                setDraft(message.content);
+                setEditing(false);
+              }}
+            >
+              取消
+            </button>
+            <span className="muted small">保存后这条回答按新文字算，后面的消息隐藏（可撤销）</span>
           </div>
-        )}
-        {!message.content && streaming && !message.tools?.length ? (
-          message.reasoning ? (
-            <span className="muted cursor">正在写答案…</span>
+        </div>
+      ) : (
+        <div className={`st-bubble ${streaming && message.content ? "cursor" : ""}`}>
+          {message.error && (
+            <div className="msg-error" role="alert">
+              {message.error}
+            </div>
+          )}
+          {!message.content && streaming && !message.tools?.length ? (
+            message.reasoning ? (
+              <span className="muted cursor">正在写答案…</span>
+            ) : (
+              <span className="cursor" />
+            )
           ) : (
-            <span className="cursor" />
-          )
-        ) : (
-          <>{answer}</>
-        )}
-      </div>
+            <>{answer}</>
+          )}
+        </div>
+      )}
       <div className="st-msg__meta">
+        {message.meta && <span className="st-badge st-badge--queued">{message.meta}</span>}
         <span className="meta-text">{meta}</span>
         {!streaming && message.content && (
-          <button
-            type="button"
-            className="st-btn st-btn--icon"
-            title="复制回答"
-            aria-label="复制回答"
-            onClick={() => onCopy(message.content)}
-          >
-            <ChatIcon name="copy" size={16} />
-          </button>
+          <span className="msg-actions">
+            {actions?.editable && (
+              <>
+                <button
+                  type="button"
+                  className="st-btn st-btn--icon"
+                  title="重新生成这轮回答"
+                  aria-label="重新生成"
+                  disabled={locked}
+                  onClick={() => actions.onRegenerate(index)}
+                >
+                  <ChatIcon name="refresh" size={16} />
+                </button>
+                <button
+                  type="button"
+                  className="st-btn st-btn--icon"
+                  title="改写这条回答"
+                  aria-label="改写回答"
+                  disabled={locked}
+                  onClick={() => setEditing(true)}
+                >
+                  <ChatIcon name="edit" size={16} />
+                </button>
+                <button
+                  type="button"
+                  className="st-btn st-btn--icon"
+                  title="回到这里（保留这条回答，后面的消息隐藏）"
+                  aria-label="回到这里"
+                  disabled={locked}
+                  onClick={() => actions.onRewind(index)}
+                >
+                  <ChatIcon name="rewind" size={16} />
+                </button>
+                <button
+                  type="button"
+                  className="st-btn st-btn--icon"
+                  title="从这里开一个分支会话"
+                  aria-label="从这里开分支"
+                  disabled={locked}
+                  onClick={() => actions.onBranch(index)}
+                >
+                  <ChatIcon name="branch" size={16} />
+                </button>
+              </>
+            )}
+            <button
+              type="button"
+              className="st-btn st-btn--icon"
+              title="复制回答"
+              aria-label="复制回答"
+              onClick={() => onCopy(message.content)}
+            >
+              <ChatIcon name="copy" size={16} />
+            </button>
+          </span>
         )}
       </div>
     </div>

@@ -76,6 +76,13 @@ export function ChatPanel() {
   const removeChatAttachment = useApp((s) => s.removeChatAttachment);
   const setChatOptions = useApp((s) => s.setChatOptions);
   const dismissChatError = useApp((s) => s.dismissChatError);
+  // 编辑回退（用户 m00232 的 A1）
+  const regenerateReply = useApp((s) => s.regenerateReply);
+  const editAnswerText = useApp((s) => s.editAnswerText);
+  const rewindChat = useApp((s) => s.rewindChat);
+  const undoChatHistory = useApp((s) => s.undoChatHistory);
+  const dismissChatUndo = useApp((s) => s.dismissChatUndo);
+  const clearPendingChat = useApp((s) => s.clearPendingChat);
 
   const [search, setSearch] = useState("");
   /** 聊天历史默认收起（用户 m00547），工具栏的「展开聊天历史」按钮可展开 */
@@ -221,8 +228,25 @@ export function ChatPanel() {
   }, []);
 
   const submit = () => {
-    if (streaming || (!chat.draft.trim() && !chat.attachments.length)) return;
+    if (!chat.draft.trim() && !chat.attachments.length) return;
+    // 生成中：只有「等待」模式不发（那一轮结束后再发是排队 / 打断的活，sendChat 里处理）
+    if (streaming && chat.options.busyMode === "wait") return;
     void sendChat();
+  };
+
+  /** 生成中：忙时锁住输入框与附件按钮的模式只有「等待」（排队 / 打断要能继续打字） */
+  const composerLocked = streaming && chat.options.busyMode === "wait";
+
+  /** 分支会话的「打开原会话」：原会话还在就切过去，被删了就给个提示 */
+  const openParent = () => {
+    const parent = conversation?.parent;
+    if (!parent) return;
+    if (chat.conversations.some((item) => item.id === parent.id)) {
+      selectConversation(parent.id);
+      return;
+    }
+    setNotice(`原会话「${parent.title}」已被删除`);
+    setTimeout(() => setNotice(null), 2200);
   };
 
   return (
@@ -230,8 +254,8 @@ export function ChatPanel() {
       <div className="top-bar">
         <h1 className="page-title">聊天</h1>
       </div>
-    <section className={`chat-workspace${historyOpen ? "" : " chat-workspace--collapsed"}`}>
-      {historyOpen && <aside className="chat-history" aria-label="聊天历史">
+    <section className={`chat-workspace${historyOpen && chat.options.chatList ? "" : " chat-workspace--collapsed"}`}>
+      {historyOpen && chat.options.chatList && <aside className="chat-history" aria-label="聊天历史">
         <div className="chat-history-heading">
           <strong>聊天历史</strong>
           <button
@@ -289,7 +313,7 @@ export function ChatPanel() {
 
       <div className="chat-main" ref={mainRef}>
         <div className="chat-toolbar">
-          {!historyOpen && (
+          {!historyOpen && chat.options.chatList && (
             <button
               type="button"
               className="st-btn st-btn--icon"
@@ -301,6 +325,12 @@ export function ChatPanel() {
             </button>
           )}
           <span className="chat-toolbar__title">{conversation?.title ?? "新聊天"}</span>
+          {conversation?.parent && (
+            <button type="button" className="chat-toolbar__parent" onClick={openParent} title="打开这条分支的原始会话">
+              <ChatIcon name="branch" size={14} />
+              分支自「{conversation.parent.title}」
+            </button>
+          )}
           {chat.error && (
             <button type="button" className="chat-toolbar__error" onClick={dismissChatError}>
               {chat.error}
@@ -309,6 +339,31 @@ export function ChatPanel() {
           )}
           {notice && <span className="chat-toolbar__notice">{notice}</span>}
         </div>
+
+        {/* 撤销条（上游的 Undo 行）：编辑回退之后显示，撤销 / 关掉 */}
+        {chat.undo && (
+          <div className="chat-undo" role="status">
+            <ChatIcon name="undo" size={14} />
+            <span>{chat.undo.text}</span>
+            <button
+              type="button"
+              className="st-btn st-btn--ghost"
+              onClick={undoChatHistory}
+              disabled={streaming}
+            >
+              撤销
+            </button>
+            <button
+              type="button"
+              className="st-btn st-btn--icon"
+              title="关掉这条提示（不撤销）"
+              aria-label="关掉撤销提示"
+              onClick={dismissChatUndo}
+            >
+              <i className="fas fa-xmark" />
+            </button>
+          </div>
+        )}
 
         <div
           className="chat-scroll"
@@ -331,8 +386,22 @@ export function ChatPanel() {
                 <ChatMessageView
                   key={message.id}
                   message={message}
+                  index={index}
                   showReasoning={chat.options.showReasoning}
+                  showMath={chat.options.showMath}
                   streaming={streaming && index === conversation.messages.length - 1}
+                  actions={
+                    chat.options.chatEdit
+                      ? {
+                          editable: true,
+                          busy: streaming,
+                          onRewind: (at) => rewindChat(at, false),
+                          onBranch: (at) => rewindChat(at, true),
+                          onRegenerate: (at) => regenerateReply(at),
+                          onEditAnswer: (at, text) => editAnswerText(at, text),
+                        }
+                      : null
+                  }
                   onCopy={(value) => void copy(value)}
                 />
               ))
@@ -352,6 +421,18 @@ export function ChatPanel() {
         />
 
         <div className="composer-wrap">
+          {chat.pending && (
+            <div className="chat-pending" role="status">
+              <i className="fas fa-hourglass-half" />
+              <span className="chat-pending__text">
+                {chat.options.busyMode === "interrupt" ? "打断后发送：" : "排队中："}
+                {chat.pending.text.split("\n")[0].slice(0, 80) || `${chat.pending.attachments.length} 个附件`}
+              </span>
+              <button type="button" className="st-btn st-btn--ghost" onClick={clearPendingChat}>
+                取消
+              </button>
+            </div>
+          )}
           <form
             className={`st-composer${dragging ? " dragging" : ""}`}
             onSubmit={(event) => {
@@ -366,7 +447,7 @@ export function ChatPanel() {
             onDrop={(event) => {
               event.preventDefault();
               setDragging(false);
-              if (!streaming) void addChatAttachments([...event.dataTransfer.files]);
+              if (!composerLocked) void addChatAttachments([...event.dataTransfer.files]);
             }}
           >
             {chat.attachments.length > 0 && (
@@ -393,12 +474,16 @@ export function ChatPanel() {
               rows={2}
               aria-label="消息"
               placeholder={
-                chat.options.enterSends
-                  ? "问点什么吧 · Enter 发送，Shift+Enter 换行"
-                  : "问点什么吧 · Ctrl+Enter 发送，Enter 换行"
+                streaming && chat.options.busyMode !== "wait"
+                  ? chat.options.busyMode === "queue"
+                    ? "继续打字 · 这段会在当前回答结束后自动发送"
+                    : "继续打字 · 发送会打断当前这轮回答"
+                  : chat.options.enterSends
+                    ? "问点什么吧 · Enter 发送，Shift+Enter 换行"
+                    : "问点什么吧 · Ctrl+Enter 发送，Enter 换行"
               }
               value={chat.draft}
-              disabled={streaming}
+              disabled={composerLocked}
               onChange={(event) => {
                 setChatDraft(event.target.value);
                 event.target.style.height = "";
@@ -430,7 +515,7 @@ export function ChatPanel() {
                 className="st-btn st-btn--icon"
                 title="添加附件"
                 aria-label="添加附件"
-                disabled={streaming}
+                disabled={composerLocked}
                 onClick={() => files.current?.click()}
               >
                 <ChatIcon name="attach" />
@@ -533,7 +618,19 @@ export function ChatPanel() {
                 type="submit"
                 className="st-btn st-btn--primary st-btn--send"
                 aria-label="发送"
-                disabled={streaming || (!chat.draft.trim() && !chat.attachments.length)}
+                title={
+                  streaming
+                    ? chat.options.busyMode === "queue"
+                      ? "排队：当前回答结束后自动发送"
+                      : chat.options.busyMode === "interrupt"
+                        ? "打断当前回答并发送"
+                        : "正在生成（设置里可改成排队 / 打断）"
+                    : "发送"
+                }
+                disabled={
+                  (streaming && chat.options.busyMode === "wait") ||
+                  (!chat.draft.trim() && !chat.attachments.length)
+                }
               >
                 <ChatIcon name="send" />
               </button>

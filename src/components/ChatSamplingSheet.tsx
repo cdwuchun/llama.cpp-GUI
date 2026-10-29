@@ -302,6 +302,69 @@ export function ChatSamplingSheet({
           </span>
         </label>
 
+        <label className="bench-switch chat-sampling__switch">
+          <input
+            type="checkbox"
+            className="switch-input"
+            checked={draft.showMath}
+            onChange={(event) => update("showMath", event.target.checked)}
+          />
+          <span>
+            渲染数学公式
+            <br />
+            <span className="muted small">
+              $…$ / $$…$$ / \( \) / \[ \] 用内置 KaTeX 排成公式，关掉就显示源码
+            </span>
+          </span>
+        </label>
+
+        <div className="st-field">
+          <label className="st-label" htmlFor="chat-s-busy">
+            生成中发送
+          </label>
+          <select
+            id="chat-s-busy"
+            className="st-input"
+            value={draft.busyMode}
+            onChange={(event) => update("busyMode", event.target.value as ChatOptions["busyMode"])}
+          >
+            <option value="wait">等待（这一轮结束后自己点发送）</option>
+            <option value="queue">排队（这段在当前回答结束后自动发送）</option>
+            <option value="interrupt">打断（立刻中止当前回答，再发这段）</option>
+          </select>
+          <p className="st-hint">模型正在回答时你在输入框里按下发送键会发生什么</p>
+        </div>
+
+        <label className="bench-switch chat-sampling__switch">
+          <input
+            type="checkbox"
+            className="switch-input"
+            checked={draft.chatList}
+            onChange={(event) => update("chatList", event.target.checked)}
+          />
+          <span>
+            显示会话列表
+            <br />
+            <span className="muted small">关掉后左侧历史栏整块收起，只留当前会话</span>
+          </span>
+        </label>
+
+        <label className="bench-switch chat-sampling__switch">
+          <input
+            type="checkbox"
+            className="switch-input"
+            checked={draft.chatEdit}
+            onChange={(event) => update("chatEdit", event.target.checked)}
+          />
+          <span>
+            允许编辑与回退
+            <br />
+            <span className="muted small">
+              打开后每条消息下面有「回到这里 / 开分支 / 重新生成 / 改写」，改错了可以撤销
+            </span>
+          </span>
+        </label>
+
         <div className="st-field">
           <label className="st-label" htmlFor="chat-s-system">
             系统提示
