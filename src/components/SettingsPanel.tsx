@@ -71,6 +71,20 @@ export function SettingsPanel() {
   }
   /** 当前生效的控制器版本：就是设置里记的那个（「自动跟随最新版本」开着时由后端写进去） */
   const chosenController = settings.strata_controller ?? "";
+  /** 兼容 API 的 base URL：跟「前门与服务」里那条配置一致（留空 = 127.0.0.1:9090） */
+  const frontHost = strataHost.trim() || "127.0.0.1";
+  const frontPort = strataPort.trim() || String(strataStatus.proxy_port ?? 9090);
+  const openAiBase = `http://${frontHost}:${frontPort}/v1`;
+  const anthropicBase = `http://${frontHost}:${frontPort}`;
+  const copyEndpoint = async (value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setNotice("已复制");
+    } catch {
+      setNotice("复制失败：浏览器拒绝了剪贴板权限");
+    }
+    setTimeout(() => setNotice(null), 1600);
+  };
   /** 当前生效的引擎 exe：同上，由 `strata_engines` 在自动模式下写入 */
   const chosenEngine = settings.strata_engine ?? "";
   /** 「自动跟随最新」只有一个开关（用户 m03170）：两个字段都开才算开，免得历史数据不一致时显示错 */
@@ -471,6 +485,40 @@ export function SettingsPanel() {
                         保存
                       </button>
                     </div>
+                  </div>
+                </section>
+                <section className="st-card st-card--wide">
+                  <div className="st-card__head">
+                    <i className="fas fa-plug" />
+                    <h2 className="st-card__title">接口地址（兼容 API）</h2>
+                    <span className="st-spacer" />
+                    <span className="st-sub">
+                      {strataStatus.proxy ? `运行中 · :${strataStatus.proxy_port ?? 9090}` : "前门未运行"}
+                    </span>
+                  </div>
+                  <div className="st-card__body">
+                    <p className="st-hint">
+                      其它客户端（OpenAI / Anthropic SDK、omp 等）把 base URL 指向这里即可；支持
+                      `/v1/chat/completions` 与 `/v1/responses` 两套 OpenAI 接口。
+                    </p>
+                    <dl className="facts">
+                      <dt>OpenAI base URL</dt>
+                      <dd>
+                        <code>{openAiBase}</code>{" "}
+                        <button type="button" className="st-btn st-btn--icon" title="复制" onClick={() => void copyEndpoint(openAiBase)}>
+                          <i className="fas fa-copy" />
+                        </button>
+                      </dd>
+                      <dt>Anthropic base URL</dt>
+                      <dd>
+                        <code>{anthropicBase}</code>{" "}
+                        <button type="button" className="st-btn st-btn--icon" title="复制" onClick={() => void copyEndpoint(anthropicBase)}>
+                          <i className="fas fa-copy" />
+                        </button>
+                      </dd>
+                      <dt>鉴权</dt>
+                      <dd>{apiKey.trim() ? "Bearer / x-api-key（用上面设置的 API Key）" : "未设 API Key，前门不校验"}</dd>
+                    </dl>
                   </div>
                 </section>
                 <section className="st-card st-card--wide">
@@ -911,3 +959,4 @@ function dirOf(path: string): string {
   const cut = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
   return cut > 0 ? path.slice(0, cut) : path;
 }
+
