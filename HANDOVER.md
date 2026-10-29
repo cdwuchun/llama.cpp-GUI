@@ -3,7 +3,7 @@
 > 面向**接手这个仓库的新会话 / 新维护者**。`README.md` 讲能力与用法，本文讲**怎么接手**：架构与代码地图（§1）、
 > llama.cpp 行为约束（§2）、前端约定（§3）、后端要点（§4）、构建与验证（§5）、运行时数据文件（§6）、未决项（§7）。
 >
-> **现行版本 0.3.1（2026-10-29）**。逐轮实现日志与历史决策不写在这里，去 `docs/archive/`：
+> **现行版本 0.3.2（2026-10-29）**。逐轮实现日志与历史决策不写在这里，去 `docs/archive/`：
 > `ITERATION_LOG.md`（0.1.x → 0.2.0 的起因、实测证据与坑）、`DECISIONS-2026-10.md`（2026-10 关键决策）；
 > 已落地的设计文档：`PROXY_SCHEDULER_PLAN.md`（前门与配置层规格）、`STRATA_INTEGRATION_PLAN.md`（Strata 通道）、
 > `STRATA_MANAGER_PORT_ASSESSMENT.md`（聊天/监控/压测移植）、`WEB_SEARCH_PLAN.md`（五引擎搜索）、
@@ -263,7 +263,7 @@ Strata 的二进制不同名、没有 router mode，config 是 `strata-*.json`�
 npm install                        # 受限沙箱里需要 --ignore-scripts
 npm run cargo:proxy                # 另开终端保持运行：本机 crates 代理 http://127.0.0.1:8787
 npx tsc --noEmit                   # 前端类型检查（仓库根）
-cd src-tauri; cargo test --lib      # 后端单测（0.3.1 基线 173 passed / 18 ignored）
+cd src-tauri; cargo test --lib      # 后端单测（0.3.2 基线 173 passed / 18 ignored）
 npm test                           # test:web + test:rs
 npm run tauri build                # 打包（exe + NSIS 安装包）
 node scripts/make-icons.mjs        # 重新生成全部图标资产
