@@ -2323,6 +2323,11 @@ rect.scenario-column.is-failed {
     margin-top: var(--st-s-3);
 }
 
+/* 「生成」是这一页唯一的主动作，按用户 m01584 要求比默认按钮宽一些 */
+.images-submit {
+    min-width: 168px;
+}
+
 .images-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
@@ -5236,3 +5241,4 @@ rect.scenario-column.is-failed {
         max-width: 94vw;
     }
 }
+
