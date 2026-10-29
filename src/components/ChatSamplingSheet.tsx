@@ -1,7 +1,8 @@
 import { useState } from "react";
 
-import { DEFAULT_CHAT_OPTIONS, normalizeChatOptions, type ChatOptions, type ReasoningEffort } from "../utils/chat";
+import { DEFAULT_CHAT_OPTIONS, normalizeChatOptions, type ChatOptions, type ChatTurn, type ReasoningEffort } from "../utils/chat";
 import { useApp } from "../store";
+import { ChatAdvancedOptions } from "./ChatAdvancedOptions";
 import { ChatMcpSettings } from "./ChatMcpSettings";
 import { ChatSearchSettings } from "./ChatSearchSettings";
 import { Drawer } from "./Drawer";
@@ -31,11 +32,17 @@ const EFFORT_HINT: Record<ReasoningEffort, string> = {
 export function ChatSamplingSheet({
   options,
   models,
+  messages,
+  strata,
   onApply,
   onClose,
 }: {
   options: ChatOptions;
   models: string[];
+  /** 当前会话的消息（「复用长文」要从里面挑一条用户消息当文档） */
+  messages: ChatTurn[];
+  /** 选中的模型是否走 Strata 通道（只有它认高级字段） */
+  strata: boolean;
   onApply: (next: ChatOptions) => void;
   onClose: () => void;
 }) {
@@ -377,6 +384,22 @@ export function ChatSamplingSheet({
             onChange={(event) => update("systemPrompt", event.target.value)}
           />
         </div>
+
+        <details className="st-collapse search-settings__fold chat-advanced">
+          <summary>
+            <i className="fas fa-microchip" />
+            <span>高级回答设置</span>
+            <i className="fas fa-chevron-down st-chev" />
+          </summary>
+          <div className="st-collapse__body">
+            <ChatAdvancedOptions
+              options={draft}
+              messages={messages}
+              strata={strata}
+              onChange={(next) => setDraft(next)}
+            />
+          </div>
+        </details>
       </div>
     </Drawer>
   );

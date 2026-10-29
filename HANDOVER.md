@@ -217,6 +217,14 @@ Strata 的二进制不同名、没有 router mode，config 是 `strata-*.json`�
 - **监控页「上下文占用」的分母是上下文窗口**，不是 `/status.max_tokens`（那是本次请求的输出上限）。分母取 `normalizeSlots(engine.slots)[0].context`（= `/slots[].n_ctx`），没有槽位时退回 config 的 `max_context`；分子按状态取 `live.prompt_read` / `live.prompt_total + generated` / 最近一次请求的 `promptTokens`。
 - **监控页「并行任务」卡只在真开了多槽位时出现**（`normalizeSlots(engine.slots).length > 1`）。
 - **聊天页输入框右侧的模型下拉**列出**全部**模型，已加载的用绿色文字（`.composer-model__item.is-loaded`）。当前模型取值顺序：记住的选择 → 已加载里 id 排序第一个 → 上次聊天的模型 → 空（显示「请选择模型」）；`sendChat` 用同一套顺序，未加载时发送前先自动拉起。聊天历史默认收起。
+- **编辑回退是纯前端改写历史**（照 Strata 0.1.52 `history.js`）：`utils/chatHistory.ts` 的 `rewindPlan` / `regeneratePlan` / `editAnswerPlan` / `branchConversation` 算「保留到哪条 + 回填什么草稿」，`store.rewindChat` / `regenerateReply` / `editAnswerText` 落盘，`undo` 存整份旧消息供撤销条还原。改完助手消息会打 `meta: "已编辑"` 并丢掉 `reasoning` / `tools` / `usage`。三个开关都在采样抽屉：`chatEdit`（整排操作按钮显隐）、`chatList`（左侧历史栏显隐）、`busyMode`。
+- **生成中的发送三态（`busyMode`）**：`wait` 直接忽略、`queue` 把草稿挂进 `chat.pending`、`interrupt` 先 `chatAbort?.abort()` 再挂。排队的那一问在 `sendChat` 的 `finally` 里（`streaming:false` 之后）自动续发；失败或被打断也照发。
+- **KaTeX 是自托管的懒加载脚本**：`public/vendor/katex/`（来自官方 0.1.52 的 `vendor/katex/dist`，含 20 个 woff2），由 `utils/katex.ts` 首次渲染公式时插 `<link>` + `<script>`。**不要改成 npm 包** —— katex 的 CSS 自带 `@font-face`，与样式规范冲突；渲染失败一律退回 `$…$` 原文，正文不能因此空掉。
+- **html / svg 围栏预览是空 sandbox 的 iframe**（`utils/chatPreview.ts`）：`sandbox=""` + 文档内 CSP `default-src 'none'`，脚本、外链一律不放开，官方那套「一次性允许脚本」没有沿用。
+- **高级回答字段只对 Strata 通道发**（`ChatAdvancedOptions.tsx` → `buildChatRequest` 的第 5 个参数 `strata`）：`response_format` / `logit_bias` / `stop` / `min_p` 一族 / `strata_prefix` / `experimental_speed_projection` / `strata_mcp` 都是 Strata 的扩展，llama.cpp 的 `/v1/chat/completions` 没有。开关在采样抽屉的「高级回答设置」折叠区，UI 照常显示但会按通道判断发不发。
+- **`strata_prefix` 是服务端索引**：`{messages: n}` = 前 n 条消息当固定前缀；`{message: i, chars}` = 第 i 条消息的前 chars 个字符。索引按**实际发出去的 messages** 算（系统提示占 0 号位、出错/停掉的消息不发送），且文档之后必须还有一条提问。
+- **共享采样走引擎自己的 `/settings`**（`api/strata.ts`）：`GET` 读 `shared`、`POST {defaults: {...}|null}` 写/取消。只有 Strata 通道且引擎在跑时可用（`strataStatus.port`）；老服务端没有这个端点就静默保持关着。
+- **`strata_mcp` 与本地工具互斥**：交给引擎执行 MCP 时不能再带 `tools`，否则 `buildChatRequest` 直接报错（引擎会按它自己的 MCP 配置调工具）。
 
 ### 3.2 通知与弹窗形态
 - 通知走 `store.notice`，`App.tsx` 渲染成 toast：`.toast-icon` + `.toast-content`(`.toast-title` + `.toast-message`) + `.toast-close`；图标 `fa-check-circle` / `fa-exclamation-circle`。多行文本时标题取第一行、正文取其余。

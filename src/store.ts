@@ -2703,7 +2703,12 @@ export const useApp = create<AppStore>((set, get) => ({
       for (let round = 0; round < 5; round += 1) {
         if (controller.signal.aborted) break;
         calls = [];
-        await streamChatTurn(port, buildChatRequest(history, { ...state.options, model }, false, tools), onDelta, controller.signal);
+        await streamChatTurn(
+          port,
+          buildChatRequest(history, { ...state.options, model }, false, tools, target.channel === "strata"),
+          onDelta,
+          controller.signal,
+        );
         // 没有工具调用就结束了
         if (calls.length === 0 || controller.signal.aborted) break;
 
@@ -2808,6 +2813,7 @@ export const useApp = create<AppStore>((set, get) => ({
             { ...state.options, model },
             false,
             [],
+            target.channel === "strata",
           ),
           onDelta,
           controller.signal,

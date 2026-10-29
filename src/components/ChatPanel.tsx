@@ -643,6 +643,8 @@ export function ChatPanel() {
         <ChatSamplingSheet
           options={chat.options}
           models={modelNames}
+          messages={conversation?.messages ?? []}
+          strata={allModels.find((m) => m.section === chat.options.model)?.channel === "strata"}
           onApply={(next) => setChatOptions(next)}
           onClose={() => setSamplingOpen(false)}
         />

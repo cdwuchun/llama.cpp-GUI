@@ -2272,6 +2272,31 @@ rect.scenario-column.is-failed {
     color: var(--st-ink-soft);
 }
 
+/* 采样抽屉里的「高级回答设置」（JSON Schema / logit_bias / 长文复用） */
+.chat-advanced__code {
+    font-family: var(--st-font-mono);
+    font-size: var(--st-fs-sm);
+    resize: vertical;
+}
+
+.chat-advanced__row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--st-s-2);
+    margin-top: var(--st-s-2);
+}
+
+.chat-advanced__chars {
+    width: 120px;
+}
+
+.chat-advanced__error {
+    margin-top: var(--st-s-1);
+    color: var(--st-danger-text);
+    font-size: var(--st-fs-sm);
+}
+
 .msg-error {
     margin-bottom: var(--st-s-2);
     color: var(--st-danger-text);

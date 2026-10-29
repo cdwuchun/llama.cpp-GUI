@@ -175,6 +175,36 @@ export interface Conversation {
 
 export type ReasoningEffort = "off" | "low" | "medium" | "high";
 
+export type ChatResponseFormat = "text" | "json_object" | "json_schema";
+
+/** 上游「回答设置」那一组高级字段（`ChatAdvancedOptions`）；只有 Strata 通道的模型才发送 */
+export interface ChatAdvanced {
+  responseFormat: ChatResponseFormat;
+  schemaName: string;
+  schemaText: string;
+  logitBiasText: string;
+  /** 停止串，最多 4 条非空 */
+  stop: string[];
+  minP: number | null;
+  repetitionPenalty: number | null;
+  presencePenalty: number | null;
+  frequencyPenalty: number | null;
+  penaltyLastN: number | null;
+}
+
+/** 已开启的固定前缀（上游 `options.fixedPrefix`） */
+export interface ChatFixedPrefix {
+  messageId: string;
+  chars?: number;
+}
+
+const DEFAULT_SCHEMA_TEXT = `{
+  "type": "object",
+  "properties": { "answer": { "type": "string" } },
+  "required": ["answer"],
+  "additionalProperties": false
+}`;
+
 export interface ChatOptions {
   model: string;
   reasoningEffort: ReasoningEffort;
@@ -199,6 +229,14 @@ export interface ChatOptions {
   busyMode: "wait" | "queue" | "interrupt";
   /** 渲染 KaTeX 数学公式（离线，字体随包里带） */
   showMath: boolean;
+  /** 高级回答设置（输出格式 / token 偏好 / 停止串 / 生成参数）；只对 Strata 通道发送 */
+  advanced: ChatAdvanced;
+  /** 固定的长文复用（上游 `strata_prefix`）；只对 Strata 通道发送 */
+  fixedPrefix: ChatFixedPrefix | null;
+  /** 速度预测（上游 `experimental_speed_projection`） */
+  esp: boolean;
+  /** MCP 工具交给 Strata 引擎执行（上游 `strata_mcp`）；只有 Strata 通道认 */
+  mcpServer: boolean;
 }
 
 /** 上游 `DEFAULT_COMMON_CHAT_DEFAULTS` 的同一组值（mcp 字段本工程没有） */
@@ -219,7 +257,69 @@ export const DEFAULT_CHAT_OPTIONS: Readonly<ChatOptions> = Object.freeze({
   chatList: true,
   busyMode: "wait",
   showMath: true,
+  advanced: {
+    responseFormat: "text" as ChatResponseFormat,
+    schemaName: "answer",
+    schemaText: DEFAULT_SCHEMA_TEXT,
+    logitBiasText: "",
+    stop: [],
+    minP: null,
+    repetitionPenalty: null,
+    presencePenalty: null,
+    frequencyPenalty: null,
+    penaltyLastN: null,
+  },
+  fixedPrefix: null,
+  esp: true,
+  mcpServer: false,
 });
+
+function finiteOrNull(value: unknown, min: number, max = Number.POSITIVE_INFINITY, openMin = false): number | null {
+  return typeof value === "number" &&
+    Number.isFinite(value) &&
+    (openMin ? value > min : value >= min) &&
+    value <= max
+    ? value
+    : null;
+}
+
+function normalizeAdvanced(value: unknown): ChatAdvanced {
+  const base = DEFAULT_CHAT_OPTIONS.advanced;
+  const stored = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+  const stop = Array.isArray(stored.stop)
+    ? stored.stop.filter((item): item is string => typeof item === "string" && item.length > 0).slice(0, 4)
+    : [];
+  return {
+    responseFormat:
+      typeof stored.responseFormat === "string" &&
+      ["text", "json_object", "json_schema"].includes(stored.responseFormat)
+        ? (stored.responseFormat as ChatResponseFormat)
+        : base.responseFormat,
+    schemaName: typeof stored.schemaName === "string" ? stored.schemaName : base.schemaName,
+    schemaText: typeof stored.schemaText === "string" ? stored.schemaText : base.schemaText,
+    logitBiasText: typeof stored.logitBiasText === "string" ? stored.logitBiasText : base.logitBiasText,
+    stop,
+    minP: finiteOrNull(stored.minP, 0, 1),
+    repetitionPenalty: finiteOrNull(stored.repetitionPenalty, 0, Number.POSITIVE_INFINITY, true),
+    presencePenalty: finiteOrNull(stored.presencePenalty, 0),
+    frequencyPenalty: finiteOrNull(stored.frequencyPenalty, 0),
+    penaltyLastN:
+      typeof stored.penaltyLastN === "number" && Number.isSafeInteger(stored.penaltyLastN) && stored.penaltyLastN >= 0
+        ? stored.penaltyLastN
+        : null,
+  };
+}
+
+function normalizeFixedPrefix(value: unknown): ChatFixedPrefix | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const stored = value as Record<string, unknown>;
+  if (typeof stored.messageId !== "string" || !stored.messageId) return null;
+  const chars =
+    typeof stored.chars === "number" && Number.isSafeInteger(stored.chars) && stored.chars > 0
+      ? stored.chars
+      : undefined;
+  return chars === undefined ? { messageId: stored.messageId } : { messageId: stored.messageId, chars };
+}
 
 export function normalizeChatOptions(value: unknown): ChatOptions {
   const stored =
@@ -270,10 +370,91 @@ export function normalizeChatOptions(value: unknown): ChatOptions {
         ? (stored.busyMode as ChatOptions["busyMode"])
         : DEFAULT_CHAT_OPTIONS.busyMode,
     showMath: typeof stored.showMath === "boolean" ? stored.showMath : DEFAULT_CHAT_OPTIONS.showMath,
+    advanced: normalizeAdvanced(stored.advanced),
+    fixedPrefix: normalizeFixedPrefix(stored.fixedPrefix),
+    esp: typeof stored.esp === "boolean" ? stored.esp : DEFAULT_CHAT_OPTIONS.esp,
+    mcpServer:
+      typeof stored.mcpServer === "boolean" ? stored.mcpServer : DEFAULT_CHAT_OPTIONS.mcpServer,
   };
 }
 
-/** 上游 `buildSharedDefaults`：只放跨模型安全的采样默认值 */
+/** 上游 `parseChatLogitBias`：接受 `{"<id>": bias}` 或 `[[id, bias]]` */
+export function parseChatLogitBias(text: string): Record<string, number> {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new Error("logit_bias 不是有效 JSON");
+  }
+  const entries: unknown[] = Array.isArray(value)
+    ? value
+    : value && typeof value === "object"
+      ? Object.entries(value as Record<string, unknown>)
+      : [];
+  if (!Array.isArray(value) && (!value || typeof value !== "object")) {
+    throw new Error("logit_bias 需为对象或 [token_id, bias] 列表");
+  }
+  const pairs = Array.isArray(value);
+  const out: Record<string, number> = {};
+  for (const entry of entries) {
+    if (!Array.isArray(entry) || entry.length !== 2) throw new Error("logit_bias 每项需包含 token ID 与偏置");
+    const [id, raw] = entry;
+    if ((typeof id !== "number" && typeof id !== "string") || !/^\d+$/.test(String(id))) {
+      throw new Error("logit_bias token ID 需为非负整数");
+    }
+    const token = Number(id);
+    if (!Number.isSafeInteger(token) || token > 2147483647) throw new Error("logit_bias token ID 超出词表范围");
+    if (Object.hasOwn(out, String(token))) throw new Error("logit_bias 包含重复 token ID");
+    const bias = pairs && raw === false ? -100 : raw;
+    if (typeof bias !== "number" || !Number.isFinite(bias) || bias < -100 || bias > 100) {
+      throw new Error("logit_bias 偏置需在 -100 到 100");
+    }
+    out[String(token)] = bias;
+  }
+  return out;
+}
+
+function parseChatSchema(text: string): Record<string, unknown> {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new Error("JSON Schema 不是有效 JSON");
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("JSON Schema 根节点需为对象");
+  if ((value as Record<string, unknown>).type !== "object") throw new Error("JSON Schema 根类型必须只接受对象");
+  return value as Record<string, unknown>;
+}
+
+/** 上游 `buildAdvancedChatFields`：生成参数 / 停止串 / token 偏好 / 输出格式 / 固定前缀 */
+export function buildAdvancedChatFields(options: ChatOptions): Record<string, unknown> {
+  const advanced = options.advanced;
+  const out: Record<string, unknown> = {};
+  if (advanced.minP !== null) out.min_p = advanced.minP;
+  if (advanced.repetitionPenalty !== null) out.repetition_penalty = advanced.repetitionPenalty;
+  if (advanced.presencePenalty !== null) out.presence_penalty = advanced.presencePenalty;
+  if (advanced.frequencyPenalty !== null) out.frequency_penalty = advanced.frequencyPenalty;
+  if (advanced.penaltyLastN !== null) out.penalty_last_n = advanced.penaltyLastN;
+  if (advanced.stop.length > 0) out.stop = advanced.stop;
+  if (advanced.logitBiasText.trim()) {
+    const bias = parseChatLogitBias(advanced.logitBiasText);
+    if (Object.keys(bias).length > 0) out.logit_bias = bias;
+  }
+  if (advanced.responseFormat === "json_object") out.response_format = { type: "json_object" };
+  if (advanced.responseFormat === "json_schema") {
+    const name = advanced.schemaName.trim();
+    if (!name || name.length > 64 || !/^[\w-]+$/.test(name)) {
+      throw new Error("格式名称需为 1–64 位英文字母、数字、下划线或连字符");
+    }
+    out.response_format = {
+      type: "json_schema",
+      json_schema: { name, strict: true, schema: parseChatSchema(advanced.schemaText) },
+    };
+  }
+  return out;
+}
+
+
 export function buildSharedDefaults(options: ChatOptions): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   if (options.reasoningEffort) {
@@ -347,14 +528,53 @@ export function buildChatRequest(
   options: ChatOptions,
   supportsImages = false,
   tools: ToolSpec[] = [],
+  /** 模型走 Strata 通道时才发高级字段（llama.cpp 没有这些端点） */
+  strata = false,
 ): Record<string, unknown> {
   if (!options.model.trim()) throw new Error("请先选择模型");
   const api: Record<string, unknown>[] = [];
   if (options.systemPrompt.trim()) api.push({ role: "system", content: options.systemPrompt.trim() });
+  const advanced: Record<string, unknown> = strata ? buildAdvancedChatFields(options) : {};
+  if (strata && options.advanced.responseFormat !== "text" && tools.length > 0) {
+    throw new Error("JSON 输出与工具调用互斥，请先关闭联网搜索 / MCP");
+  }
+  let prefixIndex = -1;
   for (const message of messages) {
     // 出错/被停掉的那条不参与下一轮上下文（上游同）
     if (message.error) continue;
+    if (options.fixedPrefix && message.id === options.fixedPrefix.messageId) {
+      if (prefixIndex !== -1) throw new Error("固定前缀消息 ID 重复");
+      if (message.role !== "user") throw new Error("固定前缀必须选择用户文档消息");
+      prefixIndex = api.length;
+    }
     api.push(apiMessage(message, supportsImages));
+  }
+  if (strata && options.fixedPrefix) {
+    if (prefixIndex < 0) throw new Error("固定前缀消息不在当前会话，请重新选择");
+    if (messages.some((message) => message.attachments?.some((file) => file.type === "image"))) {
+      throw new Error("固定前缀不支持包含图片的请求");
+    }
+    const text = api[prefixIndex]?.content;
+    if (typeof text !== "string" || !text.length) throw new Error("固定前缀需非空文本");
+    const chars = options.fixedPrefix.chars;
+    const length = Array.from(text).length;
+    if (
+      chars !== undefined &&
+      (chars > length || (prefixIndex === api.length - 1 && chars >= length))
+    ) {
+      throw new Error("固定前缀字符边界需在文档内，并给问题保留内容");
+    }
+    if (chars === undefined && prefixIndex === api.length - 1) {
+      throw new Error("固定文档之后需要一条提问；或设置文档内的字符边界");
+    }
+    const offset = advanced.response_format && api[0]?.role !== "system" ? 1 : 0;
+    advanced.strata_prefix =
+      chars === undefined ? { messages: prefixIndex + 1 + offset } : { message: prefixIndex + offset, chars };
+  }
+  if (strata && options.esp) advanced.experimental_speed_projection = true;
+  if (strata && options.mcpServer) {
+    if (tools.length > 0) throw new Error("MCP 交给引擎执行时不要同时带本地工具，请关掉「MCP 工具」");
+    advanced.strata_mcp = true;
   }
   return {
     model: options.model,
@@ -363,6 +583,7 @@ export function buildChatRequest(
     stream_options: { include_usage: true },
     ...(tools.length > 0 ? { tools, tool_choice: "auto" } : {}),
     ...buildSharedDefaults(options),
+    ...advanced,
   };
 }
 
