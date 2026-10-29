@@ -10,8 +10,9 @@
  * - PCIe 与磁盘两块 llama.cpp 不提供，卡片保留、值显示 `—`（不让版面缺一块）。
  * - 「近期请求」只留最近一次完成的请求（llama.cpp 没有逐请求接口）。
  */
-import { Fragment, useMemo } from "react";
+import { Fragment, useEffect, useMemo } from "react";
 import type { MonitorEngine, MonitorSnapshot } from "../types";
+import { useApp } from "../store";
 import type { RecentTurn } from "../utils/telemetry";
 import type { LiveMetric } from "../utils/telemetry";
 import { bytesfmt, ctxfmt, fixed1, kfmt, normalizeSlots, sparkPaths } from "../utils/monitor";
@@ -198,6 +199,24 @@ export function MonitoringPage({
   };
   const engineTokS = numSeries("tok_s");
   const enginePrefill = numSeries("prefill_tok_s_mean");
+  // MCP 汇总卡：清单来自 `mcp.json` 的已保存配置，工具数是上次「检测」的结果
+  const mcpServers = useApp((state) => state.mcpServers);
+  const mcpTools = useApp((state) => state.mcpTools);
+  const mcpError = useApp((state) => state.mcpError);
+  const refreshMcpTools = useApp((state) => state.refreshMcpTools);
+  useEffect(() => {
+    // 进监控页时顺手拉一次工具清单（后端会连服务器；失败只记 mcpError）
+    if (mcpServers.length > 0 && mcpTools.length === 0) void refreshMcpTools();
+  }, [mcpServers.length, mcpTools.length, refreshMcpTools]);
+  const mcpRows = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const tool of mcpTools) counts.set(tool.server, (counts.get(tool.server) ?? 0) + 1);
+    return mcpServers.map((server) => ({
+      name: server.name,
+      command: [server.command, ...(server.args ?? [])].join(" "),
+      tools: counts.get(server.name) ?? 0,
+    }));
+  }, [mcpServers, mcpTools]);
   const history = snapshot?.history;
   const series = history?.series ?? {};
   const slots = normalizeSlots(engine?.slots);
@@ -902,7 +921,49 @@ export function MonitoringPage({
                   : "引擎保留最近会话的状态，后续请求只读取新增内容。要保留多个会话（Agent 交替使用），请在运行配置的 args 中加入 \"--conversation-cache-mib\", \"8192\"。"}
               </p>
             </section>
-          )}        </div>
+          )}
+
+          {/* MCP 服务器汇总（照上游 OfficeMonitor 的「MCP servers」卡）：清单取 mcp.json，
+              工具数是上次检测的结果；改完清单要去聊天设置里重新检测。 */}
+          {mcpServers.length > 0 && (
+            <section className="st-card">
+              <div className="req-head">
+                <span className="card-title">MCP 服务器</span>
+                <span className="muted small">
+                  {mcpTools.length > 0
+                    ? `${mcpTools.length} 个工具可用`
+                    : mcpError
+                      ? "检测失败"
+                      : "还没检测"}
+                </span>
+              </div>
+              <div className="table-wrap">
+                <table className="st-table st-table--nowrap">
+                  <thead>
+                    <tr>
+                      <th>服务器</th>
+                      <th>启动命令</th>
+                      <th className="num">工具</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {mcpRows.map((row) => (
+                      <tr key={row.name}>
+                        <td>{row.name}</td>
+                        <td className="mono">{row.command}</td>
+                        <td className="num">{row.tools || "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {mcpError ? <p className="muted small">{mcpError}</p> : null}
+              <p className="muted small cc-note">
+                MCP 由 GUI 自己启动（见聊天设置），引擎不参与；模型要能调用还得在聊天设置里打开「MCP 工具」。
+              </p>
+            </section>
+          )}
+        </div>
       </div>
     </main>
   );
