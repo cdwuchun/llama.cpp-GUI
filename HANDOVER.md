@@ -225,6 +225,7 @@ Strata 的二进制不同名、没有 router mode，config 是 `strata-*.json`�
 - **`strata_prefix` 是服务端索引**：`{messages: n}` = 前 n 条消息当固定前缀；`{message: i, chars}` = 第 i 条消息的前 chars 个字符。索引按**实际发出去的 messages** 算（系统提示占 0 号位、出错/停掉的消息不发送），且文档之后必须还有一条提问。
 - **共享采样走引擎自己的 `/settings`**（`api/strata.ts`）：`GET` 读 `shared`、`POST {defaults: {...}|null}` 写/取消。只有 Strata 通道且引擎在跑时可用（`strataStatus.port`）；老服务端没有这个端点就静默保持关着。
 - **`strata_mcp` 与本地工具互斥**：交给引擎执行 MCP 时不能再带 `tools`，否则 `buildChatRequest` 直接报错（引擎会按它自己的 MCP 配置调工具）。
+- **图片生成页（`ImagesPage.tsx`）只连 Strata 引擎**：`POST /v1/images/generations`（`serve/images.py`），一次请求引擎拉起一个 `sd-cli` 进程；需要运行配置里有 `images` 段（`setup --images`），否则服务端报「needs "images" section」。llama.cpp 没有这个端点，所以没加载 Strata 模型时页面只给提示。
 
 ### 3.2 通知与弹窗形态
 - 通知走 `store.notice`，`App.tsx` 渲染成 toast：`.toast-icon` + `.toast-content`(`.toast-title` + `.toast-message`) + `.toast-close`；图标 `fa-check-circle` / `fa-exclamation-circle`。多行文本时标题取第一行、正文取其余。
