@@ -1631,7 +1631,20 @@ fn fallback_command(
     )
 }
 
-/// Strata 自己的日志读取器：整条流固定归到 `"strata"` 源。
+/// Strata 引擎日志的来源名：带上这次引擎加载的模型名。
+///
+/// 以前整条流固定是 `"strata"`，于是换过几个模型之后，所有模型的输出都挤在同一个
+/// 来源里（用户 m00545）。前端按 `strata:<模型名>` 拆标签；没有模型名时退回 `"strata"`。
+fn strata_log_source(model_name: &str) -> String {
+    let name = model_name.trim();
+    if name.is_empty() {
+        "strata".to_string()
+    } else {
+        format!("strata:{name}")
+    }
+}
+
+/// Strata 自己的日志读取器：整个引擎进程的输出归到同一个来源（见 [`strata_log_source`]）。
 ///
 /// 不能复用 [`crate::logs::spawn_reader`] —— 它按行首 `[端口]` 把日志分成
 /// `model:<端口>` / `system`，Strata 的输出没有那个前缀，全部会被塞进 `"system"`
@@ -1640,6 +1653,7 @@ fn spawn_strata_reader<R: std::io::Read + Send + 'static>(
     stream: R,
     hub: Arc<LogHub>,
     tx: mpsc::Sender<LogLine>,
+    source: String,
 ) {
     thread::spawn(move || {
         let reader = std::io::BufReader::new(stream);
@@ -1649,7 +1663,7 @@ fn spawn_strata_reader<R: std::io::Read + Send + 'static>(
             if text.is_empty() {
                 continue;
             }
-            let entry = hub.push("strata", text);
+            let entry = hub.push(&source, text);
             if tx.send(entry).is_err() {
                 break;
             }
@@ -1866,11 +1880,12 @@ pub fn spawn_strata(
 
     // 先接日志再等就绪（顺序不可调换，见 router.rs 同位置注释）。
     let (tx, rx) = mpsc::channel();
+    let source = strata_log_source(&entry.model_name);
     if let Some(stdout) = child.stdout.take() {
-        spawn_strata_reader(stdout, Arc::clone(&hub), tx.clone());
+        spawn_strata_reader(stdout, Arc::clone(&hub), tx.clone(), source.clone());
     }
     if let Some(stderr) = child.stderr.take() {
-        spawn_strata_reader(stderr, Arc::clone(&hub), tx.clone());
+        spawn_strata_reader(stderr, Arc::clone(&hub), tx.clone(), source);
     }
     drop(tx);
     spawn_pump(app.clone(), Arc::clone(&hub), rx);

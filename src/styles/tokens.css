@@ -28,7 +28,10 @@
 :root{
   /* type */
   --st-font:"Outfit",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-  --st-font-mono:ui-monospace,"Cascadia Mono",Consolas,monospace; /* (derived) */
+  /* 等宽栈末尾的中文回退不能交给 `monospace` 家族：Windows 上会落到新宋体（点阵、
+     笔画细），跟 Cascadia 的现代无衬线观感差得远（用户 m00472）。显式指到雅黑，
+     等宽只对英文字符起作用 —— 中文本来也不需要逐字对齐。 */
+  --st-font-mono:ui-monospace,"Cascadia Mono",Consolas,"Microsoft YaHei UI","Microsoft YaHei",monospace; /* (derived) */
   --st-fs-xs:12px;  --st-fs-sm:13px; --st-fs-md:14px; --st-fs-base:16px;
   --st-fs-lg:18px;  --st-fs-xl:24px; --st-fs-stat:32px; --st-fs-display:40px;
   --st-fw-regular:400; --st-fw-medium:500; --st-fw-bold:700; --st-fw-black:900;
@@ -37,6 +40,11 @@
   /* spacing (4pt) */
   --st-s-1:4px; --st-s-2:8px; --st-s-3:12px; --st-s-4:16px; --st-s-5:20px;
   --st-s-6:24px; --st-s-8:32px; --st-s-10:40px; --st-s-12:48px; --st-s-16:64px;
+
+  /* 顶栏（工具栏）控件统一高度：与设置页卡片里「保存」按钮同高（40px，用户 m00829）。
+     顶栏的按钮 / 搜索框 / 下拉都锁到这个值，各页顶栏不再一页一个样
+     （原来是搜索框 44.4、.btn 44.4、.st-btn 40、.st-btn--sm 32 混着来）。 */
+  --st-toolbar-h:40px;
 
   /* radius */
   --st-r-sm:8px; --st-r-md:14px; --st-r-lg:20px; --st-r-xl:24px; --st-r-pill:9999px;

@@ -26,7 +26,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::logs::LogHub;
 
@@ -172,6 +172,167 @@ fn locate() -> Result<(PathBuf, PathBuf, PathBuf), String> {
         return Err(format!("控制端缺少解释器：{}", python.display()));
     }
     Ok((python, script, terminal))
+}
+
+// ---------------------------------------------------------------------------
+// 控制端目录参考值（`setup.py` 的 `ram_gb` / `download_gb`）
+// ---------------------------------------------------------------------------
+
+/// 目录里一档的参考值。
+///
+/// 字段对齐 `setup.py` 的三张表：`ram_gb` 是「参考内存」（权重驻留 RAM+VRAM，
+/// 定义见 `docs/MODELS.md` 的 Pick by memory），`download_gb` 是压缩包体积，
+/// `mem_total` 标记这档的量按「显存 + 内存合计」算（Gyro）。
+///
+/// 用户 m00985：下载页的参考值要和控制端同步，别再靠 `src/utils/modelCatalog.ts`
+/// 里手抄的快照。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogQuant {
+    /// 控制端表里的家族名（`qwen` / `swift` / `coder` / `unsloth` / `qwen36` / `deepseek41` / `gyro` / `nvfp4`）
+    pub family: String,
+    /// 量化名（`IQ3_XXS` / `UD-Q4_K_XL` …）
+    pub quant: String,
+    pub ram_gb: f64,
+    /// 表里没写体积的给 `None`（前端保留自己的快照值）
+    #[serde(default)]
+    pub download_gb: Option<f64>,
+    #[serde(default)]
+    pub mem_total: bool,
+}
+
+/// 整份目录参考值 + 它是哪个控制端版本给的。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogSnapshot {
+    /// 控制端目录名（`0.1.52`）。**版本变了才重新读** `setup.py`（用户 m01170）
+    #[serde(default)]
+    pub version: String,
+    /// 上次读的时间（unix 秒），界面上只作提示
+    #[serde(default)]
+    pub synced_at: u64,
+    #[serde(default)]
+    pub quants: Vec<CatalogQuant>,
+}
+
+/// 缓存文件名，与 `settings.json` 同目录（`<app_config_dir>`，用户 m01234）。
+const CATALOG_CACHE: &str = "strata-catalog.json";
+
+fn cache_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(CATALOG_CACHE)
+}
+
+fn read_cache(path: &Path) -> Option<CatalogSnapshot> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn write_cache(path: &Path, snapshot: &CatalogSnapshot) {
+    if let Ok(text) = serde_json::to_string_pretty(snapshot) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// 一次读完 `MODELS` / `OWN_PATH_FAMILIES` / `MULTI_FILE_FAMILIES`。
+///
+/// 只 `import`，不跑 `main()`（`setup.py` 有 `if __name__ == "__main__"` 守卫）。
+/// 三张表的结构不一样：`MODELS` 是 `{量化: {families, ram_gb, download_gb}}`，
+/// 另两张是 `{家族: {models: {量化: {...}}}}`，所以展开方式分开写。
+fn read_tables(python: &Path, cwd: &Path) -> Result<Vec<CatalogQuant>, String> {
+    const SCRIPT: &str = r#"
+import json, setup
+
+rows = []
+def add(family, quant, meta):
+    rows.append({
+        "family": family,
+        "quant": quant,
+        "ramGb": float(meta.get("ram_gb") or 0),
+        "downloadGb": (float(meta["download_gb"]) if meta.get("download_gb") else None),
+        "memTotal": bool(meta.get("mem_total")),
+    })
+
+for quant, meta in (getattr(setup, "MODELS", {}) or {}).items():
+    for family in meta.get("families") or ("qwen", "swift"):
+        add(family, quant, meta)
+
+for name in ("OWN_PATH_FAMILIES", "MULTI_FILE_FAMILIES"):
+    for family, info in (getattr(setup, name, {}) or {}).items():
+        for quant, meta in ((info or {}).get("models") or {}).items():
+            add(family, quant, meta)
+
+print(json.dumps(rows, ensure_ascii=False))
+"#;
+
+    let mut cmd = Command::new(python);
+    cmd.arg("-c")
+        .arg(SCRIPT)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // 与安装器同一套编码设定：管道下的 Python 默认按 locale(cp936) 编码
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONUNBUFFERED", "1");
+    crate::winfix::hide_console(&mut cmd);
+
+    let output = cmd
+        .output()
+        .map_err(|err| format!("读取控制端目录失败：{err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let last = stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("没有错误输出");
+        return Err(format!("读取控制端目录失败：{last}"));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str::<Vec<CatalogQuant>>(text.trim())
+        .map_err(|err| format!("控制端目录输出无法解析：{err}"))
+}
+
+/// 同步一次目录参考值。
+///
+/// 用户 m01170：**升级控制端后才更新一次**，不要每次启动 GUI 都跑 python。
+/// 所以先比对缓存里的版本号和当前控制端目录名：一致就直接用缓存，
+/// 不一致（或 `force`）才读一次 `setup.py` 并把结果落盘。
+///
+/// 控制端目录名就是版本号来源，和 `terminal_dir` 的选择顺序（选中的 → `active.json`
+/// → 最高版本）天然一致，用户换版本后第一次调用自动刷新。
+pub fn control_catalog(config_dir: &Path, force: bool) -> Result<CatalogSnapshot, String> {
+    let path = cache_path(config_dir);
+    let cached = read_cache(&path);
+    let located = locate();
+    let version = located.as_ref().ok().and_then(|(_, _, cwd)| {
+        cwd.file_name().map(|name| name.to_string_lossy().to_string())
+    });
+
+    if !force {
+        if let (Some(version), Some(cached)) = (version.as_deref(), cached.as_ref()) {
+            if cached.version == version && !cached.quants.is_empty() {
+                return Ok(cached.clone());
+            }
+        }
+    }
+
+    let (python, _script, cwd) = located?;
+    let quants = read_tables(&python, &cwd)?;
+    if quants.is_empty() {
+        return Err("控制端目录里没有读到任何参考值".into());
+    }
+    let snapshot = CatalogSnapshot {
+        version: version.unwrap_or_default(),
+        synced_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0),
+        quants,
+    };
+    write_cache(&path, &snapshot);
+    Ok(snapshot)
 }
 
 /// 起一次非交互安装的全部参数（前端「下载并准备」时一次性给齐）。

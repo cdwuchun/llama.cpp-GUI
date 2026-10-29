@@ -3,7 +3,7 @@
 > 面向**接手这个仓库的新会话 / 新维护者**。`README.md` 讲能力与用法，本文讲**怎么接手**：架构与代码地图（§1）、
 > llama.cpp 行为约束（§2）、前端约定（§3）、后端要点（§4）、构建与验证（§5）、运行时数据文件（§6）、未决项（§7）。
 >
-> **现行版本 0.3.0（2026-10-28）**。逐轮实现日志与历史决策不写在这里，去 `docs/archive/`：
+> **现行版本 0.3.1（2026-10-29）**。逐轮实现日志与历史决策不写在这里，去 `docs/archive/`：
 > `ITERATION_LOG.md`（0.1.x → 0.2.0 的起因、实测证据与坑）、`DECISIONS-2026-10.md`（2026-10 关键决策）；
 > 已落地的设计文档：`PROXY_SCHEDULER_PLAN.md`（前门与配置层规格）、`STRATA_INTEGRATION_PLAN.md`（Strata 通道）、
 > `STRATA_MANAGER_PORT_ASSESSMENT.md`（聊天/监控/压测移植）、`WEB_SEARCH_PLAN.md`（五引擎搜索）、
@@ -223,7 +223,7 @@ Strata 的二进制不同名、没有 router mode，config 是 `strata-*.json`�
 - 通用弹窗是 `components/Sheet.tsx::Modal`（可选 `iconClass`、`domId`）；参照实现里按 id 作用域的样式靠 `domId` 命中。
 
 ### 3.3 UI 参照系（重要）
-参照实现有两套：默认首页 `index.html` + `css/index.css`（用户实际看到的那套，**我们照搬这套**，`src/styles/legacy/index.css` 是原样引用），以及 `index-new.html` + `css/newui.css`（只有**性能测试**与**系统日志**两页参考它）。改界面前先确认参照哪一套；早期按 newui 复刻导致长期与用户看到的界面不一致。
+参照实现有两套：默认首页 `index.html` + `css/index.css`（用户实际看到的那套，**我们照搬这套**，`src/styles/legacy/index.css` 是原样引用），以及 `index-new.html` + `css/newui.css`（只有**性能测试**页参考它；**系统日志**页的日志卡片版式改照上游 strata-manager「任务与日志」页，来源过滤是标签、搜索在工具栏）。改界面前先确认参照哪一套；早期按 newui 复刻导致长期与用户看到的界面不一致。
 
 ### 3.4 三处「hub 遗留样式 / 原生控件」的坑
 **① 小字号控件要自己压平行高。** legacy 的 `body { line-height: 1.6 }` 传给所有子元素，小字号控件不显式写行高时行框远高于字形（侧栏前门胶囊 12px 字号 + 19px 行框 + 内边距 = 31px 高，字形只占 12px；加 `line-height: 1` 并收窄内边距后 22px）。
@@ -254,7 +254,7 @@ Strata 的二进制不同名、没有 router mode，config 是 `strata-*.json`�
 npm install                        # 受限沙箱里需要 --ignore-scripts
 npm run cargo:proxy                # 另开终端保持运行：本机 crates 代理 http://127.0.0.1:8787
 npx tsc --noEmit                   # 前端类型检查（仓库根）
-cd src-tauri; cargo test --lib      # 后端单测（0.3.0 基线 172 passed / 17 ignored）
+cd src-tauri; cargo test --lib      # 后端单测（0.3.1 基线 173 passed / 18 ignored）
 npm test                           # test:web + test:rs
 npm run tauri build                # 打包（exe + NSIS 安装包）
 node scripts/make-icons.mjs        # 重新生成全部图标资产

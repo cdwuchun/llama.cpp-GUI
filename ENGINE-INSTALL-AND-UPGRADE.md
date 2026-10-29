@@ -1,7 +1,7 @@
 # 引擎安装目录与升级方法（Strata / llama.cpp）
 
 > GUI 管两套引擎：**Strata**（由 Strata 控制器安装升级，`strata update`）与 **llama.cpp**（`llama-server`，GUI 自己扫描启动）。
-> 两者的目录布局、版本发现、升级方式完全不同。实测基线：Strata 组件 **0.1.52**（发布 0.2.7，根 `E:\AI\Strata`）、llama.cpp **b11671**、GUI **0.3.0**。
+> 两者的目录布局、版本发现、升级方式完全不同。实测基线：Strata 组件 **0.1.52**（发布 0.2.7，根 `E:\AI\Strata`）、llama.cpp **b11671**、GUI **0.3.1**。
 > 接手见 `HANDOVER.md`（§2.11 是 Strata 约束），用法见 `README.md`。
 
 ## 1. Strata 引擎

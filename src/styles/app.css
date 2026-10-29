@@ -307,6 +307,43 @@
   padding: 0.4rem 2rem;
 }
 
+/* ---------- 顶栏控件统一高度（用户 m00829：一律 40px） ----------
+ * 和设置页卡片里的「保存」按钮同高。之前各页混着来
+ * （搜索框 44.4 / .btn 44.4 / .st-btn 40 / .st-btn--sm 32 / 筛选下拉 32.4 / 通道标签 36），
+ * 一排控件高低不齐；这里把顶栏里的按钮、搜索框、下拉统一锁到 --st-toolbar-h。
+ * 选择器只挂在 .top-bar 下，弹窗和页面内容区的按钮不受影响。 */
+.top-bar .top-actions .btn,
+.top-bar .top-actions .st-btn,
+.top-bar .top-actions .search-input,
+.top-bar .top-actions .form-control,
+.top-bar .top-actions select {
+  height: var(--st-toolbar-h);
+}
+
+/* 定高之后上下 padding 会把内容挤扁（.btn 的 0.625rem + 搜索框的 0.625rem 加行高
+   比 40px 还高），垂直居中改由 flex / input 自身负责 */
+.top-bar .top-actions .btn,
+.top-bar .top-actions .search-input {
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+/* 复选框不用和按钮一样高，但要和它们垂直居中对齐，否则夹在按钮中间像是掉下去了 */
+.top-bar .top-actions .form-check {
+  height: var(--st-toolbar-h);
+  margin-bottom: 0;
+}
+
+/* 工具栏里的标签组（模型页的通道切换、性能测试与设置页的分组标签）也跟到 40px：
+   容器 3px 内边距 + 1px 边框各一份，标签本体就是 40 - 8 = 32px（用户 m00833）。 */
+.top-bar .st-tabs {
+  height: var(--st-toolbar-h);
+}
+
+.top-bar .st-tabs .st-tab {
+  height: calc(var(--st-toolbar-h) - 8px);
+}
+
 /* ---------- 圆角统一取 hub 新版的数值 ----------
  * legacy 的圆角是混着来的（--radius 8px / 0.5rem / 1rem / 搜索框 9999px 胶囊），
  * newui 只有一小组固定值，按元素类型对应如下：
@@ -979,7 +1016,7 @@
   color: var(--st-danger);
 }
 
-/* ---------- 日志页（样式照搬 hub 新版 newui.css，变量换成 legacy 主题的） ---------- */
+/* ---------- 日志页（版式照搬上游 strata-manager「任务与日志」页的服务日志卡片） ---------- */
 /* 整页铺满型布局：顶栏之下由内容自己撑开并内部滚动。
    内边距取 hub 新版的 `.page { padding: 16px }`——legacy 的左右 2rem 会让模型栏
    与侧栏的间距（32px）明显大于两栏之间的间距（12px），看起来不对称。 */
@@ -993,47 +1030,69 @@
   padding: 16px 40px;
 }
 
-.logs-wrap {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  gap: 12px;
-}
-
-.log-sources {
-  width: 200px;
-  flex-shrink: 0;
-  overflow-y: auto;
-  background: var(--card-bg);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius);
-  padding: 6px;
-}
-
-.log-src-item {
+/* 上游这里是个「日志来源」下拉框，改成一排标签（用户 m00001）；标签外观照模型下载页
+   左栏的 `.model-download-scope-tab`（用户 m00301）。标签多了会横向溢出，两侧因此有
+   翻页箭头 —— 由 LogPanel 量实际宽度决定要不要显示。 */
+.log-source-bar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 7px 10px;
-  border-radius: 8px;
-  font-size: 13px;
+  gap: var(--st-s-1);
+  flex-shrink: 0;
+  margin-bottom: var(--st-s-3);
+}
+
+/* flex:1 + min-width:0 是溢出的前提：不收缩的话容器会跟着内容一起变宽，永远滚不起来 */
+.log-source-scroll {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--st-s-1);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.log-source-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.log-source-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  min-height: 30px;
+  padding: var(--st-s-1) var(--st-s-3);
+  border: 1px solid var(--st-line);
+  border-radius: var(--st-r-pill);
+  background: var(--st-surface);
+  color: var(--st-ink-muted);
+  font-family: inherit;
+  font-size: var(--st-fs-sm);
   cursor: pointer;
+  transition:
+    border-color var(--st-dur) var(--st-ease),
+    color var(--st-dur) var(--st-ease);
 }
 
-.log-src-item:hover {
-  background: var(--hover-bg);
+.log-source-tab:hover {
+  border-color: var(--st-accent);
+  color: var(--st-ink);
 }
 
-.log-src-item.active {
-  background: var(--active-bg);
-  font-weight: 600;
+.log-source-tab.is-active {
+  border-color: var(--st-accent);
+  background: var(--st-accent-tint);
+  color: var(--st-accent-text);
+  font-weight: var(--st-fw-medium);
 }
 
-.log-src-item.offline {
-  color: var(--text-secondary);
+/* 未加载的模型来源：标签还在，但没有运行中的绿点，整体压灰 */
+.log-source-tab.is-offline {
+  opacity: 0.65;
 }
 
-.log-src-item .ls-dot {
+.log-source-tab .ls-dot {
   width: 7px;
   height: 7px;
   border-radius: 50%;
@@ -1041,70 +1100,97 @@
   flex-shrink: 0;
 }
 
-.log-src-item .ls-name {
-  word-break: break-all;
-  line-height: 1.3;
+.log-source-nav {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--st-line);
+  border-radius: var(--st-r-pill);
+  background: var(--st-surface);
+  color: var(--st-ink-muted);
+  font-size: var(--st-fs-xs);
+  cursor: pointer;
 }
 
-.log-main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
+.log-source-nav:hover:not(:disabled) {
+  border-color: var(--st-accent);
+  color: var(--st-accent-text);
 }
 
-.log-src-select {
-  display: none;
+.log-source-nav:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
-/* 用户 m09910：日志卡片改成白底黑字，并加一圈描边与左侧来源列表对齐 —— 去掉状态行后
-   `.log-main` 里只剩它，flex:1 会让两张卡等高；描边也必须一致，否则右边看起来矮一截。 */
+/* 日志直接铺在页面上（用户 m00301 取消了卡片）：只有字号、行高与等宽字体，
+   底色 / 边框 / 圆角 / 内边距都不要。上游是 10px，但中文在 10px 下笔画糊，
+   按用户 m00498 取 12px，行高沿用上游的 1.8。 */
 .log-view {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  background: var(--st-surface);
   color: var(--st-ink);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius);
-  padding: 12px 14px;
-  font-size: 12.5px;
+  font-size: var(--st-fs-xs);
+  line-height: 1.8;
   font-family: var(--st-font-mono);
 }
 
-.log-view pre {
-  margin: 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-  overflow-wrap: break-word;
-  line-height: 1.55;
+/* 上游把每行拆成「时间 / 级别 / 内容」三列 */
+.log-line {
+  display: grid;
+  grid-template-columns: 64px 48px 1fr;
+  gap: 10px;
+  padding: 2px 0;
+  overflow-wrap: anywhere;
 }
 
-/* 收起来源列表（用户 m09910）：把 200px 让给日志 */
-.log-sources.is-hidden {
-  display: none;
+.log-line time {
+  color: var(--st-ink-muted);
+}
+
+/* 正文：日志是多行文本流（参数表、堆栈），保留原始换行与缩进，不能像上游
+   的单行消息那样折叠空白 */
+.log-msg {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 级别配色取 token；上游的 --accent 亮绿在白底上对比不足，换成加深版 */
+.log-level {
+  color: var(--st-accent-text);
+}
+
+.log-level.error {
+  color: var(--st-danger-text);
+}
+
+.log-level.warn {
+  color: var(--st-warn-text);
+}
+
+.log-empty {
+  color: var(--st-ink-muted);
+  /* 空态是说明文字，不用等宽小字（上游 Empty 组件同样是正文字号） */
+  font-family: var(--st-font);
+  font-size: var(--st-fs-sm);
 }
 
 @media (max-width: 900px) {
   .page-fill {
     padding: 12px 16px;
   }
+}
 
-  .log-sources {
-    display: none;
-  }
-
-  .log-src-select {
-    display: block;
-    width: 100%;
-    margin-bottom: 14px;
-    border: 1px solid var(--border-color);
-    border-radius: 10px;
-    background: var(--card-bg);
-    color: var(--text-primary);
-    padding: 10px 12px;
-    outline: none;
-    font-size: 14px;
+/* 上游的窄屏行宽在 700px 处收窄，站内断点只有 640 / 900，落到 640。
+   上游按 10px 算的 50 / 38 在 12px 下装不下 HH:MM:SS（8 字符 × 约 7.2px），
+   时间列放到 58px。 */
+@media (max-width: 640px) {
+  .log-line {
+    grid-template-columns: 58px 40px 1fr;
+    gap: 6px;
   }
 }
 
@@ -1392,6 +1478,18 @@
   padding-left: 0.5rem;
   padding-right: 0.5rem;
   white-space: nowrap;
+}
+
+/* 设置页卡片里的按钮统一到「保存」按钮的高度（40px，用户 m00794）：
+ * 卡片头原来是 `.st-btn--sm`（32px）、行内图标按钮 `.st-btn--icon`（36px），
+ * 跟同一行里的 `.st-input` 与保存按钮对不齐。这两档一律拉到 40px。 */
+.st-settings .st-card .st-btn--sm {
+  height: 40px;
+}
+
+.st-settings .st-card .st-btn--icon {
+  width: 40px;
+  height: 40px;
 }
 
 /* 配置弹窗底部的按钮文案更长（保存并加载 / 确认删除？），统一宽度放宽一档 */

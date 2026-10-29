@@ -38,6 +38,7 @@ import type {
   StrataDownloadSnapshot,
   StrataDownloadDisk,
   StrataHostInfo,
+  StrataCatalogSnapshot,
   StrataLocalGguf,
   StrataMtpCheck,
   StrataCommunityDiscovery,
@@ -150,6 +151,14 @@ export const ipc = {
     invoke<StrataDownloadDisk>("strata_download_preflight", { needBytes, dataDir: dataDir ?? null }),
   /** 本机内存 / 显卡（「适合这台电脑」与内存档位） */
   strataDownloadHost: () => invoke<StrataHostInfo>("strata_download_host"),
+  /**
+   * 控制端 `setup.py` 里的目录参考值（参考 RAM / 体积）。
+   *
+   * `force=false`（默认）时只有控制端版本变了才真的跑一次解释器，其余情况返回缓存
+   * （用户 m01170：升级控制器后同步一次即可）。`force=true` 用在「重新同步」这类手动操作上。
+   */
+  strataControlCatalog: (force = false) =>
+    invoke<StrataCatalogSnapshot>("strata_control_catalog", { force }),
   /** 扫一个目录里的本地 GGUF（「使用已有模型」区块） */
   strataDownloadScanGguf: (dir: string) =>
     invoke<StrataLocalGguf[]>("strata_download_scan_gguf", { dir }),

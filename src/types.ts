@@ -164,7 +164,10 @@ export interface HubImportReport {
 
 export interface LogLine {
   seq: number;
-  /** system / strata / model:<模型名>（前门化后按模型名分来源，router 时代是 model:<端口>） */
+  /**
+   * system / frontend / model:<模型名>（前门化后按模型名分来源，router 时代是 model:<端口>）/
+   * strata:<模型名>（Strata 引擎，模型名是这次引擎加载的那一个）/ strata（Strata 工具输出，如 Orca 任务）
+   */
   source: string;
   ts_ms: number;
   text: string;
@@ -368,6 +371,34 @@ export interface StrataDownloadDisk {
   needBytes: number;
   /** `ready` / `insufficient` / `unknown` */
   status: string;
+}
+
+/**
+ * 控制端 `setup.py` 里一档的参考值（`MODELS` / `OWN_PATH_FAMILIES` / `MULTI_FILE_FAMILIES`）。
+ *
+ * 用户 m00985：下载页的「参考 RAM」要和控制端同步；用户 m01170：**控制端升级后才同步一次**，
+ * 不是每次启动 GUI 都去读 —— 缓存落在 `<app_config_dir>/strata-catalog.json`。
+ */
+export interface StrataCatalogQuant {
+  /** 控制端表里的家族名（`qwen` / `unsloth` / `nvfp4` …） */
+  family: string;
+  /** 量化名（`IQ3_XXS` / `UD-Q4_K_XL` / `NVFP4` …） */
+  quant: string;
+  /** 参考内存 GB（权重驻留 RAM + VRAM，见 docs/MODELS.md 的 Pick by memory） */
+  ramGb: number;
+  /** 压缩包体积 GB，表里没写就是 null（前端保留自己的快照值） */
+  downloadGb: number | null;
+  /** 这一档的 ramGb 是「显存 + 内存合计」（Gyro） */
+  memTotal: boolean;
+}
+
+/** 从控制端读到的整份目录参考值。 */
+export interface StrataCatalogSnapshot {
+  /** 读出它的控制端目录名（`0.1.52`），变了才重新读 */
+  version: string;
+  /** 上次读取的时间（unix 秒） */
+  syncedAt: number;
+  quants: StrataCatalogQuant[];
 }
 
 /** 本机信息（「适合这台电脑」与内存档位判断用）。 */

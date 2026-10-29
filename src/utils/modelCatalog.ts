@@ -11,11 +11,27 @@
 
 export const UPSTREAM_REVISION = "477ac13cbe8e582c20484871ce459d20d82df09d";
 
-export type CatalogFamily = "qwen" | "swift" | "coder" | "unsloth" | "qwen36" | "gyro" | "deepseek41";
+export type CatalogFamily =
+  | "qwen"
+  | "swift"
+  | "coder"
+  | "unsloth"
+  | "qwen36"
+  | "gyro"
+  | "nvfp4"
+  | "deepseek41";
 
 export interface CatalogQuantInfo {
   /** 官方给的下载量 GB（10^9 字节） */
   downloadGB: number;
+  /**
+   * 官网 `docs/MODELS.md`「Pick by memory」给的参考占用 GB：**模型权重占的 RAM + VRAM**。
+   *
+   * 用户 m01417：参考值本来就该按「显存 + 内存」读，所以界面上显示的是它。
+   * 与 `ramGB`（安装器 `setup.py` 的 `ram_gb`，装得下所需的内存门槛，含系统余量）口径不同 ——
+   * qwen Q2_0 权重 37.6 GB，门槛 48 GB。
+   */
+  weightsGB?: number;
   /** 官方给的参考内存 GB（低于它就要 SSD 流式读，慢但允许） */
   ramGB: number;
   experimental?: boolean;
@@ -67,10 +83,10 @@ export const MODEL_CATALOG: CatalogModel[] = [
     source,
     snapshotDate,
     quantInfo: {
-      Q2_0: { downloadGB: 66.4, ramGB: 48 },
-      IQ2_XS: { downloadGB: 68, ramGB: 48 },
-      IQ3_XXS: { downloadGB: 75.8, ramGB: 60 },
-      IQ3_S: { downloadGB: 83.6, ramGB: 62 },
+      Q2_0: { downloadGB: 66.4, ramGB: 48, weightsGB: 37.6 },
+      IQ2_XS: { downloadGB: 68, ramGB: 48, weightsGB: 39.2 },
+      IQ3_XXS: { downloadGB: 75.8, ramGB: 60, weightsGB: 47.0 },
+      IQ3_S: { downloadGB: 83.6, ramGB: 62, weightsGB: 54.8 },
     },
   },
   {
@@ -82,9 +98,10 @@ export const MODEL_CATALOG: CatalogModel[] = [
     source,
     snapshotDate,
     quantInfo: {
-      IQ2_XS: { downloadGB: 68, ramGB: 48 },
-      IQ3_XXS: { downloadGB: 75.8, ramGB: 60 },
-      IQ3_S: { downloadGB: 83.6, ramGB: 62 },
+      // Swift 1.5 与同尺寸原版「Speed per token and RAM match」（MODELS.md）
+      IQ2_XS: { downloadGB: 68, ramGB: 48, weightsGB: 39.2 },
+      IQ3_XXS: { downloadGB: 75.8, ramGB: 60, weightsGB: 47.0 },
+      IQ3_S: { downloadGB: 83.6, ramGB: 62, weightsGB: 54.8 },
     },
   },
   {
@@ -95,7 +112,8 @@ export const MODEL_CATALOG: CatalogModel[] = [
     images: true,
     source,
     snapshotDate,
-    quantInfo: { IQ1_M: { downloadGB: 58.4, ramGB: 32 } },
+    // MODELS.md：Coder 的 shard 1 是 29.6 GB，「runs around 32 GB of RAM」
+    quantInfo: { IQ1_M: { downloadGB: 58.4, ramGB: 32, weightsGB: 32 } },
   },
   {
     id: "unsloth",
@@ -106,11 +124,11 @@ export const MODEL_CATALOG: CatalogModel[] = [
     source,
     snapshotDate,
     quantInfo: {
-      "UD-IQ4_XS": { downloadGB: 93.7, ramGB: 48 },
-      "UD-Q4_K_XL": { downloadGB: 111.3, ramGB: 48, experimental: true, nvidiaOnly: true, visionUntested: true },
-      "UD-Q5_K_XL": { downloadGB: 158.3, ramGB: 108, minEngine: "0.1.44" },
-      "UD-Q6_K_XL": { downloadGB: 169.2, ramGB: 118, minEngine: "0.1.44" },
-      Q8_0: { downloadGB: 188.2, ramGB: 136, minEngine: "0.1.38" },
+      "UD-IQ4_XS": { downloadGB: 93.7, ramGB: 48, weightsGB: 72 },
+      "UD-Q4_K_XL": { downloadGB: 111.3, ramGB: 48, weightsGB: 88, experimental: true, nvidiaOnly: true, visionUntested: true },
+      "UD-Q5_K_XL": { downloadGB: 158.3, ramGB: 108, weightsGB: 108, minEngine: "0.1.44" },
+      "UD-Q6_K_XL": { downloadGB: 169.2, ramGB: 118, weightsGB: 118, minEngine: "0.1.44" },
+      Q8_0: { downloadGB: 188.2, ramGB: 136, weightsGB: 136, minEngine: "0.1.38" },
     },
   },
   {
@@ -123,9 +141,10 @@ export const MODEL_CATALOG: CatalogModel[] = [
     snapshotDate,
     minEngine: "0.1.45",
     quantInfo: {
-      "UD-Q4_K_XL": { downloadGB: 22.9, ramGB: 32 },
-      "UD-Q6_K_XL": { downloadGB: 32.6, ramGB: 44 },
-      Q8_0: { downloadGB: 37.8, ramGB: 52 },
+      // MODELS.md 的「RAM setup plans for」：32 / 44 / 52 GB
+      "UD-Q4_K_XL": { downloadGB: 22.9, ramGB: 32, weightsGB: 32 },
+      "UD-Q6_K_XL": { downloadGB: 32.6, ramGB: 44, weightsGB: 44 },
+      Q8_0: { downloadGB: 37.8, ramGB: 52, weightsGB: 52 },
     },
   },
   {
@@ -156,8 +175,26 @@ export const MODEL_CATALOG: CatalogModel[] = [
     snapshotDate: "2026-10-28",
     minEngine: "0.1.45.1",
     quantInfo: {
-      "Gyro-S": { downloadGB: 58.5, ramGB: 27.6, memTotal: true },
-      "Gyro-M": { downloadGB: 92.0, ramGB: 35.0, memTotal: true },
+      // MODELS.md「Memory (VRAM + RAM)」：27.6 / 35 GB
+      "Gyro-S": { downloadGB: 58.5, ramGB: 27.6, weightsGB: 27.6, memTotal: true },
+      "Gyro-M": { downloadGB: 92.0, ramGB: 35.0, weightsGB: 35.0, memTotal: true },
+    },
+  },
+  {
+    // setup.py:475-495：sergqwer 的 NVFP4 打包版（`ready_repo`，没有 GGUF 可打包，直接落盘即可跑）。
+    // 仅 NVIDIA；ram_gb 是「每张卡常驻专家权重」80 GB；NVFP4-QAD 还要约 110 GB 临时空间做一次转换。
+    id: "nvfp4",
+    family: "nvfp4",
+    name: "Qwen3.8-Flash-Next (NVFP4)",
+    quants: ["NVFP4", "NVFP4-NVIDIA", "NVFP4-QAD"],
+    images: true,
+    source,
+    snapshotDate,
+    quantInfo: {
+      // MODELS.md：「All three need about 80 GB of RAM to keep every expert in RAM」
+      NVFP4: { downloadGB: 128.0, ramGB: 80, weightsGB: 80, nvidiaOnly: true, minEngine: "0.1.44" },
+      "NVFP4-NVIDIA": { downloadGB: 128.0, ramGB: 80, weightsGB: 80, nvidiaOnly: true, minEngine: "0.1.44" },
+      "NVFP4-QAD": { downloadGB: 102.2, ramGB: 80, weightsGB: 80, nvidiaOnly: true, minEngine: "0.1.45" },
     },
   },
 ];
@@ -295,6 +332,8 @@ export function familyDescription(family: string): string {
       return "读图与多请求并发（引擎 0.1.45+）";
     case "gyro":
       return "agentionai 的 Gyro 量化：小内存首选（显存 + 内存合计 27.6 GB 起，引擎 0.1.45.1+）";
+    case "nvfp4":
+      return "NVFP4 4 位权重打包版：仅 NVIDIA 显卡（引擎 0.1.44+）";
     case "deepseek41":
       return "284B 大模型，专家权重放内存或读盘，独立引擎（Strata 0.2.5+，仅文本 8K）";
     default:
@@ -310,6 +349,17 @@ export function downloadGBOf(family: string, quant: string): number {
 /** 参考内存 GB */
 export function ramGBOf(family: string, quant: string): number {
   return MODEL_CATALOG.find((entry) => entry.family === family)?.quantInfo[quant]?.ramGB ?? 0;
+}
+
+/**
+ * 官网参考占用 GB（**显存 + 内存合计**）—— 用户 m01417：参考 RAM 本身就该按这个口径读。
+ *
+ * 取 `docs/MODELS.md`「Pick by memory」的数值；没录入官网值的家族（deepseek41 用的是
+ * `dsv41_fit` 的专家内存模型）回退到安装器的 `ram_gb`。
+ */
+export function weightsGBOf(family: string, quant: string): number {
+  const info = MODEL_CATALOG.find((entry) => entry.family === family)?.quantInfo[quant];
+  return info?.weightsGB ?? info?.ramGB ?? 0;
 }
 
 /**
@@ -402,4 +452,35 @@ export function familyOfName(name: string, quant: string): CatalogFamily | null 
   if (quant.startsWith("UD-") || quant === "Q8_0") return "unsloth";
   if (!stem.includes("flash-next")) return null;
   return "qwen";
+}
+
+/**
+ * 用控制端 `setup.py` 里读到的值覆盖上面这份快照。
+ *
+ * 用户 m00985：「参考 RAM」（以及体积）要跟着控制端走，别再靠手抄的快照对不上。
+ * 用户 m01170：控制端升级后才读一次 —— 读什么、什么时候读由后端（`strata_control_catalog`）
+ * 决定，这里只负责把结果套进 `MODEL_CATALOG`。
+ *
+ * 只覆盖**两边都认识**的档位：控制端新增家族（本地还没定义）时忽略，
+ * 本地多出来的家族（快照独有）保持原值 —— 覆盖率靠 `result.missing` 提示。
+ */
+export function applyControlCatalog(snapshot: {
+  version: string;
+  quants: readonly { family: string; quant: string; ramGb: number; downloadGb: number | null; memTotal: boolean }[];
+}): { version: string; applied: number; missing: string[] } {
+  const missing: string[] = [];
+  let applied = 0;
+  for (const row of snapshot.quants) {
+    const entry = MODEL_CATALOG.find((model) => model.family === row.family);
+    const info = entry?.quantInfo[row.quant];
+    if (!info) {
+      missing.push(`${row.family} · ${row.quant}`);
+      continue;
+    }
+    if (Number.isFinite(row.ramGb) && row.ramGb > 0) info.ramGB = row.ramGb;
+    if (row.downloadGb != null && row.downloadGb > 0) info.downloadGB = row.downloadGb;
+    if (row.memTotal) info.memTotal = true;
+    applied += 1;
+  }
+  return { version: snapshot.version, applied, missing };
 }

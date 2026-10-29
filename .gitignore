@@ -16,6 +16,7 @@ src-tauri/target/
 tmp/
 .tmp/
 .tmp-strata/
+.tmp-build/
 *.log
 
 # 一次性验证产物（`strata generate --help` 的输出）

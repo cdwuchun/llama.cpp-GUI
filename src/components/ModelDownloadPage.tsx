@@ -33,6 +33,7 @@ import {
   CONTEXT_MIN,
   DOWNLOAD_CONTEXT_PRESETS,
   MODEL_CATALOG,
+  applyControlCatalog,
   catalogQuantEngineGate,
   catalogReleaseGate,
   deepseek41DiskNeedGB,
@@ -46,9 +47,9 @@ import {
   formatContextTokens,
   isExtendedContext,
   quantOfName,
-  ramGBOf,
   recommendDeepseek41,
   usableMemoryGb,
+  weightsGBOf,
   type CatalogModel,
 } from "../utils/modelCatalog";
 import {
@@ -178,6 +179,9 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
   const [presetOpen, setPresetOpen] = useState(true);
 
   const [host, setHost] = useState<StrataHostInfo | null>(null);
+  // 控制端 `setup.py` 的目录参考值（参考 RAM / 体积）。后端只在控制端版本变了时才读一次
+  // （用户 m01170），这里拿到的可能直接是缓存；`catalogMeta` 更新触发一次重渲染让数值生效。
+  const [catalogMeta, setCatalogMeta] = useState<{ version: string; applied: number } | null>(null);
   const [disk, setDisk] = useState<StrataDownloadDisk | null>(null);
   const [diskToken, setDiskToken] = useState(0);
   const [snapshot, setSnapshot] = useState<StrataDownloadSnapshot | null>(null);
@@ -376,6 +380,27 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
         setHost(hostInfo);
       } catch (err) {
         if (alive) setLocalError(String(err));
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // 控制端目录参考值：与上面同一次挂载里读。
+  //
+  // 用户 m01170：不要每次启动都跑一遍安装器 —— 读取时机全在后端判断（控制端目录名变了才真读），
+  // 这里只负责把结果套进 `MODEL_CATALOG`，让「参考 RAM / 体积 / 适配」跟着控制端走（用户 m00985）。
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      try {
+        const snapshot = await ipc.strataControlCatalog();
+        if (!alive) return;
+        const result = applyControlCatalog(snapshot);
+        setCatalogMeta({ version: result.version, applied: result.applied });
+      } catch {
+        // 没装控制端 / 解释器坏了：保留快照值，页脚那句「以所选控制端为准」仍然成立
       }
     })();
     return () => {
@@ -732,10 +757,11 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
 
   // 图像支持要多加载一份投影器（mmproj 约 2 GB 内存/显存），预览值跟着变
   const imagesExtra = selection.images ? 2 : 0;
-  const ramRef = ramGBOf(selected.family, selection.quant) + imagesExtra;
-  // 资源预估按「当前可用内存」判适配（表格的刻度仍按总量），这样打开图像支持时结论会跟着变
+  // 参考占用按官网口径「显存 + 内存合计」（用户 m01417），判定预算也按同一口径拼出来
+  const ramRef = weightsGBOf(selected.family, selection.quant) + imagesExtra;
   const availableGB = host?.availableMemoryGb ?? memoryGB;
-  const fit = fitOf(ramRef, availableGB, vramGB);
+  const budgetGB = availableGB != null ? availableGB + (vramGB ?? 0) : null;
+  const fit = fitOf(ramRef, budgetGB, null);
   const dsv41 = selected.family === "deepseek41";
   const available = disk?.availableBytes != null ? fmtSize(disk.availableBytes) : "—";
   const diskText =
@@ -745,12 +771,10 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
   // 刻度尺的最大值：本机预算与最大参考需求取大者，保证每行都落在轴上
   const axisMax = Math.max(
     usableGB ?? 0,
-    ...selected.quants.map((quant) => selected.quantInfo[quant]?.ramGB ?? 0),
+    ...selected.quants.map((quant) => selected.quantInfo[quant]?.weightsGB ?? selected.quantInfo[quant]?.ramGB ?? 0),
     32,
   );
   const estimate = estimatePerformance(selected.family, selection.quant, hardware);
-  // Gyro 的参考值是「显存 + 内存合计」，表头与评估卡要换个说法，不能叫「参考 RAM」
-  const memTotalFamily = Boolean(selected.quantInfo[selected.quants[0] ?? ""]?.memTotal);
 
   const taskCount = (running ? 1 : 0) + (orcaRunning ? 1 : 0);
 
@@ -861,7 +885,12 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
                           <span>{familyDescription(model.family)}</span>
                           <small>
                             {model.quants.length} 个量化版本 ·{" "}
-                            {Math.min(...model.quants.map((quant) => model.quantInfo[quant]?.ramGB ?? 0))} GB 内存起
+                            {Math.min(
+                              ...model.quants.map(
+                                (quant) => model.quantInfo[quant]?.weightsGB ?? model.quantInfo[quant]?.ramGB ?? 0,
+                              ),
+                            )}{" "}
+                            GB 起（显存 + 内存）
                           </small>
                         </span>
                         {unusable ? (
@@ -921,7 +950,9 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
             </div>
             <p className="model-download-catalog-note">
               {scope === "official"
-                ? `目录来自官方安装器快照（${selected.snapshotDate}），实际支持以所选控制端为准。`
+                ? catalogMeta
+                  ? `参考占用取官网 MODELS.md 的「显存 + 内存」口径（快照 ${selected.snapshotDate}）；下载体积随控制端 ${catalogMeta.version} 更新。`
+                  : `参考占用取官网 MODELS.md 的「显存 + 内存」口径（快照 ${selected.snapshotDate}），实际支持以所选控制端为准。`
                 : "社区条目同样交给官方安装器下载；ORCA 通道需要官方安装器，面板里给了说明。"}
             </p>
           </div>
@@ -954,7 +985,7 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
                     <div className="model-download-variant-head">
                       <span>量化</span>
                       <span>下载大小</span>
-                      <span>{memTotalFamily ? "参考内存（含显存）" : "参考 RAM"}</span>
+                      <span>{`参考占用（显存 + 内存）`}</span>
                       <span>本机 {memoryGB ? Math.round(memoryGB) : "—"} GB</span>
                       <span>速度（估算）</span>
                     </div>
@@ -962,7 +993,8 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
                       const info = selected.quantInfo[quant] ?? { downloadGB: 0, ramGB: 0 };
                       const gate = catalogQuantEngineGate(selected.family, quant, engineVersion);
                       const rowBlocked = gate !== null && !gate.ok;
-                      const rowFit = fitOf(info.ramGB, memoryGB, vramGB);
+                      const rowRam = info.weightsGB ?? info.ramGB;
+                      const rowFit = fitOf(rowRam, budgetGB, null);
                       const rowEstimate = estimatePerformance(selected.family, quant, hardware);
                       const rowSpeed = formatRange(rowEstimate.decode, rowEstimate.bound);
                       const rowFirst = formatRange(rowEstimate.ttft4k);
@@ -990,11 +1022,10 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
                           </span>
                           <span>{info.downloadGB} GB</span>
                           <span className="model-download-mem">
-                            {info.ramGB} GB
-                            {info.memTotal ? <small> 含显存</small> : null}
+                            {rowRam} GB
                           </span>
                           <span className="model-download-axis">
-                            <progress value={info.ramGB} max={axisMax} />
+                            <progress value={rowRam} max={axisMax} />
                             <small className={`model-download-fit is-${rowFit}`}>{FIT_LABEL[rowFit]}</small>
                           </span>
                           <span className="model-download-est">
@@ -1059,17 +1090,23 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
                           </p>
                         ) : (
                           <div className="model-download-context-presets">
-                            {/* 384K / 512K / 1M 三个「实验性」档用户要求去掉，只留常用三档 */}
-                            {DOWNLOAD_CONTEXT_PRESETS.filter((preset) => !isExtendedContext(preset)).map((preset) => (
-                              <button
-                                key={preset}
-                                type="button"
-                                className={selection.context === preset ? "is-active" : ""}
-                                onClick={() => updateSelection({ context: preset })}
-                              >
-                                {formatContextTokens(preset)}
-                              </button>
-                            ))}
+                            {/* 384K / 512K / 1M 三个「实验性」档用户要求去掉，只留常用三档。
+                                标签外观照性能测试页「测试计划」的 .st-tier：前面带勾选框、选中时淡绿底，
+                                但尺寸按下载页原来那套（28px 高 / 12px 字），不跟着放大（用户 m00888）。 */}
+                            {DOWNLOAD_CONTEXT_PRESETS.filter((preset) => !isExtendedContext(preset)).map((preset) => {
+                              const on = selection.context === preset;
+                              return (
+                                <button
+                                  key={preset}
+                                  type="button"
+                                  className={on ? "is-active" : ""}
+                                  onClick={() => updateSelection({ context: preset })}
+                                >
+                                  <span className="st-tier__box">{on && <i className="fas fa-check" />}</span>
+                                  {formatContextTokens(preset)}
+                                </button>
+                              );
+                            })}
                           </div>
                         )}
                         <div className="model-download-preset-row">
@@ -1131,7 +1168,7 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
                         </b>
                       </div>
                       <div>
-                        <span>{memTotalFamily ? "官方参考内存（显存 + 内存合计）" : "官方峰值 RAM 参考（含显存卸载可更低）"}</span>
+                        <span>官网参考占用（显存 + 内存）</span>
                         <b>
                           {ramRef} GiB
                           {imagesExtra > 0 && <small> 含图像 {imagesExtra} GB</small>}
@@ -1482,9 +1519,11 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
         >
           <ul className="model-download-assessment">
             <li>
-              内存：官方峰值 RAM 参考 = 专家权重 + 10 GB（MODELS.md「Will it fit?」）。本机
-              {memoryGB ? ` 可用 ${host?.availableMemoryGb?.toFixed(2) ?? Math.round(memoryGB)} GiB` : " 内存未读到"}，
-              显存卸载再补 {vramGB ? `${Math.max(0, vramGB - 5).toFixed(1)} GiB` : "未知"}。
+              内存：参考占用取官网 MODELS.md「Pick by memory」的口径 —— <b>模型权重占的「显存 + 内存」合计</b>
+              （qwen 2.00bpw 37.6、3.25bpw 39.2、4.25bpw 47.0、4.5bpw 54.8 GB）。本机
+              {memoryGB ? ` 可用 ${host?.availableMemoryGb?.toFixed(2) ?? Math.round(memoryGB)} GiB` : " 内存未读到"}
+              ，显存 {vramGB ? `${vramGB.toFixed(1)} GiB` : "未知"}，
+              判定按「可用内存 + 显存」合计；安装器的内存门槛（含系统余量，qwen 起步版 48 GB）另算。
             </li>
             <li>
               磁盘：预检按「下载体积 × 2 + 6 GB」估算（分片与成品并存 + 打包余量），
@@ -1659,7 +1698,9 @@ function CommunityPane({
   }
 
   const info = model.quantInfo[quant];
-  const rowFit = fitOf(info?.ramGb ?? 0, memoryGB, vramGB);
+  // 与官方页同口径：参考值是「显存 + 内存」，判定预算也把两者加起来
+  const budgetGB = memoryGB != null ? memoryGB + (vramGB ?? 0) : null;
+  const rowFit = fitOf(info?.ramGb ?? 0, budgetGB, null);
   const isOrca = model.family === "orca";
   const supported = setupFamilyOf(model.family);
   const estimate = estimatePerformance(model.family, quant, hardware);
@@ -1709,13 +1750,14 @@ function CommunityPane({
               <div className="model-download-variant-head">
                 <span>量化</span>
                 <span>下载大小</span>
-                <span>内存</span>
+                <span>参考占用（显存 + 内存）</span>
                 <span>本机 {memoryGB ? Math.round(memoryGB) : "—"} GB</span>
                 <span>速度（估算）</span>
               </div>
               {model.quants.map((name) => {
                 const entry = model.quantInfo[name];
-                const fit = fitOf(entry?.ramGb ?? 0, memoryGB, vramGB);
+                const rowRam = entry?.ramGb ?? 0;
+                const fit = fitOf(rowRam, budgetGB, null);
                 const rowEstimate = estimatePerformance(
                   setupFamilyOf(model.family) ? model.family : "qwen",
                   name,
@@ -1779,16 +1821,21 @@ function CommunityPane({
               {presetOpen && (
                 <div className="model-download-preset-body">
                 <div className="model-download-context-presets">
-                  {DOWNLOAD_CONTEXT_PRESETS.filter((preset) => !isExtendedContext(preset)).map((preset) => (
-                    <button
-                      key={preset}
-                      type="button"
-                      className={context === preset ? "is-active" : ""}
-                      onClick={() => onContext(preset)}
-                    >
-                      {formatContextTokens(preset)}
-                    </button>
-                  ))}
+                  {/* 与官方条目那套一致：外观照「测试计划」的档位标签，尺寸不变（用户 m00888） */}
+                  {DOWNLOAD_CONTEXT_PRESETS.filter((preset) => !isExtendedContext(preset)).map((preset) => {
+                    const on = context === preset;
+                    return (
+                      <button
+                        key={preset}
+                        type="button"
+                        className={on ? "is-active" : ""}
+                        onClick={() => onContext(preset)}
+                      >
+                        <span className="st-tier__box">{on && <i className="fas fa-check" />}</span>
+                        {formatContextTokens(preset)}
+                      </button>
+                    );
+                  })}
                 </div>
                 <div className="model-download-preset-row">
                   <label className="model-download-context-field">
@@ -1832,7 +1879,7 @@ function CommunityPane({
                   <b>{memoryGB ? `${Math.round(memoryGB)} GB` : "—"}</b>
                 </div>
                 <div>
-                  <span>参考内存（官方值）</span>
+                  <span>参考占用（显存 + 内存）</span>
                   <b>{info?.ramGb ?? "—"} GB</b>
                 </div>
                 <div>
@@ -1843,7 +1890,7 @@ function CommunityPane({
                 </div>
               </div>
               <p className="model-download-assess-note">
-                下载大小按仓库里各分片体积求和；内存参考与官方目录里同一量化的数值一致（没有对应值时才退回「体积 + 10 GB」。
+                下载大小按仓库里各分片体积求和；参考占用取官方同一量化的「显存 + 内存」值（取不到时按「体积 + 10 GB」估算）。
               </p>
             </section>
           </>

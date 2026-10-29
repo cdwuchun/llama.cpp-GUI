@@ -1226,6 +1226,23 @@ async fn strata_download_check_mtp(dir: String) -> Result<strata_download::MtpCh
         .map_err(|err| format!("检查 MTP 目录失败：{err}"))
 }
 
+/// 控制端目录里的参考值（各量化的「参考内存」与体积）。
+///
+/// 用户 m01170：**控制端升级后才同步一次**，不要每次启动都跑 python。
+/// 缓存落在 `<app_config_dir>/strata-catalog.json`（与 `settings.json` 同级），
+/// 命中缓存时不启动解释器；只有控制端目录名变了或 `force` 才读 `setup.py`。
+#[tauri::command]
+async fn strata_control_catalog(
+    state: State<'_, AppState>,
+    force: Option<bool>,
+) -> Result<strata_download::CatalogSnapshot, String> {
+    let config_dir = state.config_dir.clone();
+    let force = force.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || strata_download::control_catalog(&config_dir, force))
+        .await
+        .map_err(|err| format!("读取控制端目录失败：{err}"))?
+}
+
 /// 从 Hugging Face 发现可安装的社区 GGUF（前端切到「社区」时调用）。
 ///
 /// 走系统 curl.exe，所以放阻塞线程池；结果在模块内缓存 24 小时，`force` 跳过缓存。
@@ -2395,6 +2412,7 @@ pub fn run() {
             strata_download_host,
             strata_download_scan_gguf,
             strata_download_check_mtp,
+            strata_control_catalog,
             strata_community_discover,
         strata_orca_probe,
         strata_orca_start,

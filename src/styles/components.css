@@ -3983,6 +3983,9 @@ rect.scenario-column.is-failed {
 }
 
 .model-download-context-presets button {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--st-s-2);
     min-height: 28px;
     padding: var(--st-s-1) var(--st-s-3);
     border: 1px solid var(--st-line);
@@ -3993,9 +3996,25 @@ rect.scenario-column.is-failed {
     cursor: pointer;
 }
 
+/* 选中态照性能测试页「测试计划」的 .st-tier.is-on：淡绿底 + 绿色边框 + 加粗，
+   勾选框复用同一个 .st-tier__box（16px 方块，选中时绿底白勾）。
+   尺寸仍是下载页原来那套 28px / 12px，不跟 .st-tier 一起放大（用户 m00888）。 */
 .model-download-context-presets button.is-active {
     border-color: var(--st-accent);
+    background: var(--st-accent-tint);
     color: var(--st-accent-text);
+    font-weight: 600;
+}
+
+.model-download-context-presets button.is-active .st-tier__box {
+    border-color: var(--st-accent);
+    background: var(--st-accent);
+    color: var(--st-accent-ink);
+}
+
+/* 28px 高的按钮里，16px 的勾选框放在 flex 行里容易被压扁，固定住 */
+.model-download-context-presets .st-tier__box {
+    flex-shrink: 0;
 }
 
 .model-download-context-field,

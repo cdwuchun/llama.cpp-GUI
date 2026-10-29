@@ -1,5 +1,5 @@
 import type { StrataCommunityModel, StrataCommunityQuant } from "../types";
-import { ramGBOf } from "./modelCatalog";
+import { weightsGBOf } from "./modelCatalog";
 
 /**
  * 社区目录：内置条目 + 后端发现结果。
@@ -25,14 +25,14 @@ export function setupFamilyOf(family: string): boolean {
  *
  * `downloadGb` 必须是**全部本分片之和**：GSQ-RCO 家族是两片布局，第 2 片是 28.8 GB 的
  * n-gram 表（上游 `NGRAM.size`），只看第 1 片会少算近 30 GB。
- * `ramGb` 走官方目录里的同量化参考值（`officialRam`），没有才退回「体积 + 10」。
+ * `ramGb` 走官方目录里的同量化参考占用（「显存 + 内存」，`weightsGBOf`），没有才退回「体积 + 10」。
  */
 function quant(downloadGb: number, ramGb: number): StrataCommunityQuant {
   return { files: [], downloadGb, ramGb };
 }
 
-/** 官方目录 qwen 家族的内存参考（上游 `officialRam(family, quant)`）。 */
-const QWEN_RAM: Record<string, number> = { Q2_0: 48, IQ2_XS: 48, IQ3_XXS: 60, IQ3_S: 62 };
+/** 官方目录 qwen 家族的参考占用（显存 + 内存，`docs/MODELS.md`「Pick by memory」）。 */
+const QWEN_RAM: Record<string, number> = { Q2_0: 37.6, IQ2_XS: 39.2, IQ3_XXS: 47.0, IQ3_S: 54.8 };
 
 function builtin(
   base: Omit<StrataCommunityModel, "source" | "quantInfo" | "quants" | "mmproj"> & {
@@ -110,13 +110,15 @@ export const BUILTIN_COMMUNITY_MODELS: StrataCommunityModel[] = [
  * 拿官方目录的内存参考覆盖发现条目的估计值。
  *
  * 上游 `quantEntry` 是 `officialRam(family, quant) ?? ceil(首片体积 + 10)`：同一个量化（比如
- * `IQ3_XXS`）不管出自哪个仓库，内存参考都是官方那一份。后端只能看到文件体积，所以它给的
+ * `IQ3_XXS`）不管出自哪个仓库，参考值都是官方那一份。后端只能看到文件体积，所以它给的
  * 「体积 + 10」是个兜底，这里用官方表校正（校正不到才保留后端值）。
+ *
+ * 取的是官网「Pick by memory」的**显存 + 内存合计**口径（`weightsGBOf`），与官方页同一列。
  */
 function withOfficialRam(model: StrataCommunityModel): StrataCommunityModel {
   const quantInfo: Record<string, StrataCommunityQuant> = {};
   for (const [quant, info] of Object.entries(model.quantInfo)) {
-    const official = ramGBOf(model.family, quant);
+    const official = weightsGBOf(model.family, quant);
     quantInfo[quant] = official > 0 ? { ...info, ramGb: official } : info;
   }
   return { ...model, quantInfo };
@@ -137,7 +139,8 @@ export function mergeCommunityModels(
     .filter((model) => !builtin.has(model.repo.toLowerCase()))
     .map(withOfficialRam)
     .sort((left, right) => (right.downloads ?? 0) - (left.downloads ?? 0));
-  return [...BUILTIN_COMMUNITY_MODELS, ...extra];
+  // 内置条目也要过一遍：它们的 `builtin()` 只会填 qwen 的兜底值和 ORCA 的手填值
+  return [...BUILTIN_COMMUNITY_MODELS.map(withOfficialRam), ...extra];
 }
 
 const RISK_LABELS: Record<string, string> = {
