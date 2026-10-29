@@ -572,7 +572,9 @@ pub fn spawn_model(
             Ok(Some(exit)) => {
                 // 能在这里 try_wait 到，说明句柄还没交给调度表 —— 失败分支杀进程的责任在本地。
                 let msg = format!(
-                    "{} 启动后立刻退出（退出码 {:?}），请看日志",
+                    "{} 启动后立刻退出（退出码 {:?}）。常见原因：显存不够（上下文或 --fit 分配过大）、\
+                     API Key 与前端不一致、参数已被当前 llama.cpp 淘汰（日志里搜 option … not recognized）；\
+                     完整原因在「系统日志」页的该模型标签里。",
                     cfg.name,
                     exit.code()
                 );

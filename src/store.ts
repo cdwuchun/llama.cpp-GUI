@@ -3084,7 +3084,7 @@ export const useApp = create<AppStore>((set, get) => ({
       ? `（有 ${plan.draft.lost} 个附件只保留了文件名，回填时已略过，需要重新添加）`
       : "";
     if (branch) {
-      const next = branchConversation(conversation, plan.keep, conversationTitle(`${conversation.title} 的分支`));
+      const next = branchConversation(conversation, plan.keep, conversationTitle(`${conversation.title}（分支）`));
       set({
         chat: {
           ...state,

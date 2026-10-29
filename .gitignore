@@ -12,10 +12,14 @@ src-tauri/target/
 
 # 实测与临时文件。
 # tmp/ 是 §6.1 的验证资产（保留在本地，不进版本库）；.tmp/ 是单测临时目录
-# （TMP/TEMP 指到工作区时产生）；.tmp-strata/ 是 Strata 配置的实测样本。
+# （TMP/TEMP 指到工作区时产生）；.tmp-strata/
+.tmp-tests/
+.tmp-shots/ 是 Strata 配置的实测样本。
 tmp/
 .tmp/
 .tmp-strata/
+.tmp-tests/
+.tmp-shots/
 .tmp-build/
 *.log
 
@@ -34,3 +38,4 @@ docs/dsh-*.md
 
 # 注意：`.cargo/config.toml` 不要忽略 —— 它把 crates-io 指向本机代理（127.0.0.1:8787），
 # 是本机构建的必需项；CI 里则由流水线自行删除（见 .github/workflows/ci.yml）。
+

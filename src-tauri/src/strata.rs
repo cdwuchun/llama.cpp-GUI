@@ -1899,7 +1899,8 @@ pub fn spawn_strata(
         match child.try_wait() {
             Ok(Some(exit)) => {
                 let msg = format!(
-                    "Strata 启动后立刻退出（退出码 {:?}），请看日志",
+                    "Strata 启动后立刻退出（退出码 {:?}）。常见原因：显存/内存不够（上下文太大、专家缓存放不下）、\
+                     模型或引擎文件缺失；完整原因在「系统日志」页的该模型标签里。",
                     exit.code()
                 );
                 hub.push("system", format!("[gui] {msg}"));
