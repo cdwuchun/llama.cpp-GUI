@@ -7,6 +7,7 @@ import { BenchPanel } from "./components/BenchPanel";
 import { ChatPanel } from "./components/ChatPanel";
 import { LogPanel } from "./components/LogPanel";
 import { ModelListPanel } from "./components/ModelListPanel";
+import { ImagesPage } from "./components/ImagesPage";
 import { ModelDownloadPage } from "./components/ModelDownloadPage";
 import { MonitoringPage } from "./components/MonitoringPage";
 import { ServiceStatusPopover } from "./components/ServiceStatusPopover";
@@ -22,7 +23,7 @@ import { buildLiveMetric } from "./utils/telemetry";
 // tab 由 5 个减为 4 个。tab 状态不落 localStorage（只硬编码初值），
 // 所以没有旧值残留导致白屏的问题。
 // 2026-10-28：「模型下载」从模型页工具栏的 `+` 提升为独立页（照搬上游下载页）。
-type Tab = "models" | "download" | "chat" | "monitor" | "bench" | "logs" | "settings";
+type Tab = "models" | "download" | "chat" | "images" | "monitor" | "bench" | "logs" | "settings";
 
 /**
  * 页面外壳照搬 hub 默认首页（index.html）的结构：
@@ -33,6 +34,7 @@ const TABS: { id: Tab; label: string; icon: string }[] = [
   { id: "models", label: "模型", icon: "fas fa-cubes" },
   { id: "download", label: "模型下载", icon: "fas fa-download" },
   { id: "chat", label: "聊天", icon: "fas fa-comments" },
+  { id: "images", label: "图片生成", icon: "fas fa-image" },
   { id: "monitor", label: "监控", icon: "fas fa-chart-line" },
   { id: "bench", label: "性能测试", icon: "fas fa-gauge-high" },
   { id: "logs", label: "系统日志", icon: "fas fa-terminal" },
@@ -438,6 +440,7 @@ export default function App() {
         />
       )}
       {tab === "chat" && <ChatPanel />}
+      {tab === "images" && <ImagesPage />}
       {tab === "bench" && <BenchPanel />}
       {tab === "logs" && <LogPanel />}
       {tab === "settings" && <SettingsPanel />}
@@ -495,3 +498,4 @@ export default function App() {
     </>
   );
 }
+

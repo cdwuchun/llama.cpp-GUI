@@ -2297,6 +2297,59 @@ rect.scenario-column.is-failed {
     font-size: var(--st-fs-sm);
 }
 
+/* 图片生成页 */
+.images-prompt {
+    width: 100%;
+    font-family: inherit;
+    resize: vertical;
+}
+
+.images-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--st-s-3);
+    margin-top: var(--st-s-3);
+}
+
+.images-row .st-field {
+    flex: 0 0 auto;
+    min-width: 120px;
+}
+
+.images-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--st-s-3);
+    margin-top: var(--st-s-3);
+}
+
+.images-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: var(--st-s-3);
+    margin-top: var(--st-s-4);
+}
+
+.images-item {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--st-s-2);
+}
+
+.images-item img {
+    width: 100%;
+    border-radius: var(--st-r-md);
+    border: 1px solid var(--st-line-soft);
+    background: var(--st-surface);
+}
+
+.images-item figcaption {
+    display: flex;
+    align-items: center;
+    gap: var(--st-s-2);
+}
+
 .msg-error {
     margin-bottom: var(--st-s-2);
     color: var(--st-danger-text);

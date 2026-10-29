@@ -44,3 +44,46 @@ export async function saveSharedSampling(
   const body = (await res.json()) as { shared?: boolean };
   return body.shared === true;
 }
+
+export interface ImageRequest {
+  prompt: string;
+  /** "1024x1024" 这类；留空用引擎默认 */
+  size?: string;
+  n: number;
+  steps: number;
+  seed: number | null;
+}
+
+export interface GeneratedImage {
+  /** b64_json 的 Data URL（`url` 形态极少见，直接放原值） */
+  src: string;
+  revisedPrompt?: string;
+}
+
+/**
+ * 生图：引擎 `serve/images.py` 的 `POST /v1/images/generations`（OpenAI 形状 + `steps`/`seed`）。
+ * 需要引擎运行配置里有 `images` 段（`setup --images` 装过 sd-cli），否则服务端报错。
+ */
+export async function generateImages(port: number, request: ImageRequest, signal?: AbortSignal): Promise<GeneratedImage[]> {
+  const body: Record<string, unknown> = {
+    prompt: request.prompt,
+    n: request.n,
+    steps: request.steps,
+    response_format: "b64_json",
+  };
+  if (request.size) body.size = request.size;
+  if (request.seed !== null) body.seed = request.seed;
+  const res = await fetch(`${strataBase(port)}/v1/images/generations`, {
+    method: "POST",
+    signal,
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(errorText(await res.text(), res.status));
+  const payload = (await res.json()) as { data?: { b64_json?: string; url?: string; revised_prompt?: string }[] };
+  return (payload.data ?? []).flatMap((item) => {
+    const src = item.b64_json ? `data:image/png;base64,${item.b64_json}` : (item.url ?? "");
+    return src ? [{ src, revisedPrompt: item.revised_prompt }] : [];
+  });
+}
+
