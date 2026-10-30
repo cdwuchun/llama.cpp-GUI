@@ -155,19 +155,33 @@ export function ChatPanel() {
   const modelNames = useMemo(() => allModels.map((m) => m.section), [allModels]);
 
   /**
-   * 当前模型（用户 m00370 第 3 点 + m00437）。
+   * 当前模型（用户 m00370 第 3 点 + m00437 + m01878 第 2 点）。
    *
    * 记住的选择还在列表里就用它（未加载的由发送时自动拉起，不能悄悄换成别的模型）；
    * 否则退回「已加载里按 id 排序的第一个」；
    * 一个都没加载时退回「上次聊天的模型」（最近一份会话绑定的模型，还在列表里）；
    * 再没有才显示「请选择模型」。
+   *
+   * 另外进聊天页时把「正在运行的模型」写进记住的选择（见下面的 effect）：有模型在跑就用它，
+   * 没有在跑的才沿用上次的选择。
    */
   const remembered = allModels.find(
     (m) => m.section === chat.options.model || m.id === chat.options.model,
   );
-  const defaultLoaded = allModels
-    .filter((m) => m.status === "loaded")
-    .sort((a, b) => a.id.localeCompare(b.id))[0];
+  /**
+   * 正在运行的模型（用户 m01878 第 2 点）：多个在跑时，先认记住的那个 / 当前会话绑定的那个，
+   * 都不是在跑的才按 id 排序取第一个。
+   */
+  const runningModel = useMemo(() => {
+    const running = allModels.filter((m) => m.status === "loaded");
+    if (running.length === 0) return undefined;
+    const convModel = conversation?.model;
+    return (
+      running.find((m) => m.section === chat.options.model || m.id === chat.options.model) ??
+      (convModel ? running.find((m) => m.section === convModel) : undefined) ??
+      [...running].sort((a, b) => a.id.localeCompare(b.id))[0]
+    );
+  }, [allModels, chat.options.model, conversation?.model]);
   /** 上次聊天的模型（用户 m00437）：取最近一份会话绑定的模型，且它仍在列表里 */
   const lastChatModel = useMemo(() => {
     const latest = [...chat.conversations].sort((a, b) => b.updatedAt - a.updatedAt)[0];
@@ -175,7 +189,22 @@ export function ChatPanel() {
     return allModels.find((m) => m.section === latest.model || m.id === latest.model);
   }, [chat.conversations, allModels]);
   const activeModel =
-    remembered?.section ?? defaultLoaded?.section ?? lastChatModel?.section ?? "";
+    remembered?.section ?? runningModel?.section ?? lastChatModel?.section ?? "";
+
+  /**
+   * 进聊天页时自动选中正在运行的模型（用户 m01878 第 2 点）：只跑一次，
+   * 且只在模型列表已经就绪时判定——列表还空着说明扫描没回来，等下一轮再试。
+   * 没有模型在跑就不动记住的选择（= 上次用的模型）。
+   */
+  const modelSynced = useRef(false);
+  useEffect(() => {
+    if (modelSynced.current || allModels.length === 0) return;
+    modelSynced.current = true;
+    if (!runningModel) return;
+    if (chat.options.model !== runningModel.section) {
+      setChatOptions({ model: runningModel.section });
+    }
+  }, [allModels.length, runningModel, chat.options.model, setChatOptions]);
 
   const groups = useMemo(() => {
     const term = search.trim().toLocaleLowerCase("zh-CN");

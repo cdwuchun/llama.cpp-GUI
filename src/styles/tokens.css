@@ -83,7 +83,8 @@
      （S2 2026-10-16：把散落的 indigo/紫/绿/红/黄 rgba 收敛到色板，色相不再各写各的） */
   --st-accent-rgb:16 185 129;  --st-info-rgb:15 151 255;  --st-warn-rgb:227 155 11;  --st-danger-rgb:224 40 63;
 
-  --st-code-bg:#1b1f23;  --st-code-ink:#e6e9ec;  /* code blocks stay dark in both themes (derived) */
+  /* 代码块：浅灰底 + 深色字，跟聊天背景同一套中性色（用户 m01878 第 1 点：原来的近黑底太跳） */
+  --st-code-bg:#f1f2f4;  --st-code-ink:#262b31;  /* (derived) 取 --st-surface-2 再压深一档 */
 
   --st-sh-card:0 18px 7px rgba(0,0,0,.01),0 10px 6px rgba(0,0,0,.02),0 4px 4px rgba(0,0,0,.03),0 1px 2px rgba(0,0,0,.04);
   --st-sh-bar:0 54px 21px rgba(0,0,0,.01),0 30px 18px rgba(0,0,0,.03),0 13px 13px rgba(0,0,0,.05),0 3px 7px rgba(0,0,0,.06);
@@ -119,7 +120,7 @@
   /* (derived) 见浅色段的同名说明 */
   --st-accent-rgb:52 211 153;  --st-info-rgb:58 169 255;  --st-warn-rgb:245 181 61;  --st-danger-rgb:255 90 110;
 
-  --st-code-bg:#0a0c0e;  --st-code-ink:#e6e9ec;
+  --st-code-bg:#22272c;  --st-code-ink:#e6e9ec;  /* (derived) 灰底，别用近黑去顶 --st-surface */
 
   --st-sh-card:0 1px 2px rgba(0,0,0,.4);
   --st-sh-bar:0 12px 32px rgba(0,0,0,.45),0 2px 6px rgba(0,0,0,.35);
