@@ -4311,35 +4311,108 @@ rect.scenario-column.is-failed {
 .model-download-task {
     display: flex;
     flex-direction: column;
-    gap: var(--st-s-2);
-    padding: var(--st-s-3) var(--st-s-4);
+    gap: var(--st-s-3);
+    padding: var(--st-s-4);
     border: 1px solid var(--st-line);
+    border-left: 3px solid var(--st-line);
     border-radius: var(--st-r-md);
     background: var(--st-surface-2);
 }
 
+.model-download-task.is-running,
+.model-download-task.is-done {
+    border-left-color: var(--st-accent);
+}
+
+.model-download-task.is-failed {
+    border-left-color: var(--st-danger);
+}
+
 .model-download-task-head {
     display: flex;
-    align-items: baseline;
-    justify-content: space-between;
+    align-items: center;
     gap: var(--st-s-3);
+}
+
+.model-download-task-icon {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border-radius: var(--st-r-sm);
+    background: var(--st-accent-tint);
+    color: var(--st-accent-text);
     font-size: var(--st-fs-sm);
 }
 
-.model-download-task-head span {
+.model-download-task.is-failed .model-download-task-icon {
+    background: var(--st-danger-tint);
+    color: var(--st-danger-text);
+}
+
+.model-download-task-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.model-download-task-copy b {
+    color: var(--st-ink);
+    font-size: var(--st-fs-md);
+    font-weight: var(--st-fw-bold);
+}
+
+.model-download-task-copy small {
+    overflow: hidden;
     color: var(--st-ink-muted);
     font-size: var(--st-fs-xs);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.model-download-task-percent {
+    margin-left: auto;
+    color: var(--st-accent-text);
+    font-size: var(--st-fs-lg);
+    font-weight: var(--st-fw-bold);
+    font-variant-numeric: tabular-nums;
+}
+
+.model-download-task-percent.is-size {
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-md);
+}
+
+.model-download-task .st-btn {
+    flex: none;
 }
 
 .model-download-task-message {
     margin: 0;
+    color: var(--st-ink-soft);
+    font-size: var(--st-fs-xs);
+    line-height: var(--st-lh-body);
+}
+
+.model-download-task-log summary {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--st-s-2);
     color: var(--st-ink-muted);
     font-size: var(--st-fs-xs);
+    cursor: pointer;
+}
+
+.model-download-task-log summary:hover {
+    color: var(--st-ink);
 }
 
 .model-download-progress {
     width: 100%;
-    height: 6px;
+    height: 8px;
     overflow: hidden;
     border: 0;
     border-radius: var(--st-r-pill);
@@ -4360,14 +4433,18 @@ rect.scenario-column.is-failed {
     background: var(--st-accent);
 }
 
-.model-download-task .btn {
-    align-self: flex-start;
+.model-download-task.is-failed .model-download-progress::-webkit-progress-value {
+    background: var(--st-danger);
 }
 
-.model-download-task details summary {
-    color: var(--st-ink-muted);
-    font-size: var(--st-fs-xs);
-    cursor: pointer;
+.model-download-task.is-failed .model-download-progress::-moz-progress-bar {
+    background: var(--st-danger);
+}
+
+.model-download-task-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--st-s-3);
 }
 
 .model-download-log {
@@ -5242,3 +5319,16 @@ rect.scenario-column.is-failed {
     }
 }
 
+/* 详情页底部的紧凑进度：点下载后不用开弹窗也能看到阶段与百分比 */
+.model-download-inline {
+    display: flex;
+    align-items: center;
+    gap: var(--st-s-3);
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+}
+
+.model-download-inline .model-download-progress {
+    flex: 1;
+    min-width: 0;
+}

@@ -589,7 +589,10 @@ fn config_json(layout: &Layout, shard1: &Path, exe: &Path) -> Result<serde_json:
         "tokenizer": tokenizer,
         "model_name": MODEL_NAME,
         "log": log,
-        "port": free_port(layout),
+        // 端口写安装器默认值（8080）：GUI 扫描 config 时 `strata::ensure_ports` 会把
+        // 0/8080 视为「没定制过」，从 9091 起自动分配并同步 run 脚本（用户 m04080）。
+        // 这里自己挑号会绕过那套机制，和官方下载的 config 走两条规则。
+        "port": crate::strata::STRATA_PORT_DEFAULT,
         "gpu": 0,
         "gpus_asked": true,
         "sampling": {
@@ -599,29 +602,6 @@ fn config_json(layout: &Layout, shard1: &Path, exe: &Path) -> Result<serde_json:
             "min_p": 0.05
         }
     }))
-}
-
-/// 挑一个没被现有 `strata-*.json` 占用的端口（9094 起）。
-fn free_port(layout: &Layout) -> u16 {
-    let mut used = std::collections::BTreeSet::new();
-    if let Ok(entries) = std::fs::read_dir(&layout.configs) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                continue;
-            }
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if let Some(port) = value.get("port").and_then(|port| port.as_u64()) {
-                        used.insert(port as u16);
-                    }
-                }
-            }
-        }
-    }
-    (9094u16..9200)
-        .find(|port| !used.contains(port))
-        .unwrap_or(9199)
 }
 
 #[cfg(test)]
@@ -668,13 +648,6 @@ mod tests {
                 .map(|args| args.len()),
             Some(10)
         );
-    }
-
-    #[test]
-    fn port_is_picked_above_used_ones() {
-        let layout = sample_layout();
-        let port = free_port(&layout);
-        assert!((9094..9200).contains(&port));
     }
 
     /// 本机核对用：`cargo test --lib strata_orca -- --ignored --nocapture`

@@ -1190,6 +1190,26 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
 
                 <footer className="model-download-submit" ref={taskRef}>
                   {error && <p className="model-download-error">{error}</p>}
+                  {running && snapshot && (
+                    <div className="model-download-inline">
+                      <progress
+                        className="model-download-progress"
+                        value={Math.round(snapshot.percent)}
+                        max={100}
+                      />
+                      <span>
+                        {PHASE_LABEL[snapshot.phase] ?? snapshot.phase} ·{" "}
+                        {Math.round(snapshot.percent)}%
+                      </span>
+                      <button
+                        type="button"
+                        className="st-btn st-btn--secondary st-btn--sm"
+                        onClick={() => setSheet("tasks")}
+                      >
+                        <i className="fas fa-list-check" /> 任务
+                      </button>
+                    </div>
+                  )}
                   <div className="model-download-submit-row">
                     <span>
                       已选择 {selected.name} · {selection.quant} · {formatContextTokens(selection.context)}
@@ -1225,6 +1245,7 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
                 submitting={submitting}
                 running={running}
                 error={error}
+                snapshot={snapshot}
                 onStart={() => void startCommunity()}
                 taskRef={taskRef}
                 orcaProbe={orcaProbe}
@@ -1232,6 +1253,7 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
                 orcaSubmitting={submitting}
                 onOrcaStart={() => void startOrca()}
                 onEvidence={() => setSheet("evidence")}
+                onTasks={() => setSheet("tasks")}
                 context={communitySelection.context}
                 images={communitySelection.images}
                 onContext={(context) => updateCommunitySelection({ context })}
@@ -1501,13 +1523,19 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
           bodyClass="model-download-sheet"
           footer={<small>下载在后台跑，关掉这个窗口不影响进度。</small>}
         >
-          {error && <p className="model-download-error">{error}</p>}
-          <TaskPanel task={downloadTaskView(snapshot)} onCancel={() => void cancel()} />
-          <TaskPanel task={orcaTaskView(orca)} onCancel={() => void cancelOrca()} />
-          {!snapshot && !orca && <p className="model-download-empty">还没有下载任务。</p>}
-          <p className="model-download-desc">
-            一次只跑一个下载；完成后回到「模型」页，在 Strata 那档点刷新就能看到新配置。
-          </p>
+          <div className="model-download-task-list">
+            {error && <p className="model-download-error">{error}</p>}
+            <TaskPanel task={downloadTaskView(snapshot)} onCancel={() => void cancel()} />
+            <TaskPanel task={orcaTaskView(orca)} onCancel={() => void cancelOrca()} />
+            {!snapshot && !orca && (
+              <p className="model-download-empty">
+                <i className="fas fa-inbox" /> 还没有下载任务。
+              </p>
+            )}
+            <p className="model-download-desc">
+              一次只跑一个下载；完成后回到「模型」页，在 Strata 那档点刷新就能看到新配置。
+            </p>
+          </div>
         </Modal>
       )}
 
@@ -1575,7 +1603,21 @@ interface TaskView {
   detail: string;
   message: string;
   logTail: string[];
+  /** 完成时显示的总量（如「66.80 GB」） */
+  size?: string;
 }
+
+/** 安装器阶段的中文说法（与 `strata_download::consume` 写的 `phase` 对应）。 */
+const PHASE_LABEL: Record<string, string> = {
+  check: "检查环境",
+  download: "下载分片",
+  pack: "打包权重",
+  engine: "准备引擎",
+  config: "写入配置",
+  done: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+};
 
 function downloadTaskView(snapshot: StrataDownloadSnapshot | null): TaskView | null {
   if (!snapshot) {
@@ -1585,9 +1627,12 @@ function downloadTaskView(snapshot: StrataDownloadSnapshot | null): TaskView | n
     running: snapshot.running,
     ok: snapshot.ok,
     percent: snapshot.percent,
-    detail: `${snapshot.family} · ${snapshot.quant}`,
+    detail: [snapshot.family, snapshot.quant, PHASE_LABEL[snapshot.phase] ?? snapshot.phase]
+      .filter(Boolean)
+      .join(" · "),
     message: snapshot.message,
     logTail: snapshot.logTail,
+    size: snapshot.totalBytes > 0 ? fmtSize(snapshot.totalBytes) : undefined,
   };
 }
 
@@ -1610,6 +1655,7 @@ function orcaTaskView(snapshot: StrataOrcaSnapshot | null): TaskView | null {
     detail: `ORCA · IQ3_XXS · ${phase}`,
     message: snapshot.message,
     logTail: snapshot.logTail,
+    size: snapshot.totalBytes > 0 ? fmtSize(snapshot.totalBytes) : undefined,
   };
 }
 
@@ -1618,25 +1664,38 @@ function TaskPanel({ task, onCancel }: { task: TaskView | null; onCancel: () => 
   if (!task) {
     return null;
   }
+  const state = task.running ? "running" : task.ok ? "done" : "failed";
+  const label = task.running ? "正在下载" : task.ok ? "已完成" : "已结束";
+  const icon = task.running ? "fa-download" : task.ok ? "fa-circle-check" : "fa-triangle-exclamation";
+  const percent = Math.max(0, Math.min(100, Math.round(task.percent)));
   return (
-    <div className="model-download-task">
+    <div className={`model-download-task is-${state}`}>
       <div className="model-download-task-head">
-        <b>{task.running ? "正在处理" : task.ok ? "已完成" : "已结束"}</b>
-        <span>
-          {task.detail}
-          {task.percent > 0 ? ` · ${Math.round(task.percent)}%` : ""}
+        <span className="model-download-task-icon">
+          <i className={`fas ${icon}`} />
         </span>
+        <div className="model-download-task-copy">
+          <b>{label}</b>
+          <small>{task.detail}</small>
+        </div>
+        {task.running ? (
+          <span className="model-download-task-percent">{percent}%</span>
+        ) : task.size ? (
+          <span className="model-download-task-percent is-size">{task.size}</span>
+        ) : null}
+        {task.running && onCancel && (
+          <button type="button" className="st-btn st-btn--secondary st-btn--sm" onClick={onCancel}>
+            <i className="fas fa-stop" /> 取消
+          </button>
+        )}
       </div>
-      <progress className="model-download-progress" value={task.percent} max={100} />
-      <p className="model-download-task-message">{task.message}</p>
-      {task.running && onCancel && (
-        <button type="button" className="st-btn st-btn--secondary st-btn--sm" onClick={onCancel}>
-          <i className="fas fa-stop" /> 取消
-        </button>
-      )}
+      <progress className="model-download-progress" value={percent} max={100} />
+      {task.message && <p className="model-download-task-message">{task.message}</p>}
       {task.logTail.length > 0 && (
-        <details>
-          <summary>输出（{task.logTail.length} 行）</summary>
+        <details className="model-download-task-log">
+          <summary>
+            <i className="fas fa-terminal" /> 安装器输出 · {task.logTail.length} 行
+          </summary>
           <pre className="model-download-log">{task.logTail.slice(-60).join("\n")}</pre>
         </details>
       )}
@@ -1656,6 +1715,7 @@ function CommunityPane({
   submitting,
   running,
   error,
+  snapshot,
   onStart,
   taskRef,
   orcaProbe,
@@ -1663,6 +1723,7 @@ function CommunityPane({
   orcaSubmitting,
   onOrcaStart,
   onEvidence,
+  onTasks,
   context,
   images,
   onContext,
@@ -1678,6 +1739,8 @@ function CommunityPane({
   submitting: boolean;
   running: boolean;
   error: string | null;
+  /** 官方下载任务的快照（社区条目也走同一条安装器） */
+  snapshot: StrataDownloadSnapshot | null;
   onStart: () => void;
   taskRef: RefObject<HTMLDivElement | null>;
   orcaProbe: StrataOrcaProbe | null;
@@ -1685,6 +1748,8 @@ function CommunityPane({
   orcaSubmitting: boolean;
   onOrcaStart: () => void;
   onEvidence: () => void;
+  /** 打开「下载任务」弹窗（社区档的进度条旁边那颗按钮） */
+  onTasks: () => void;
   context: number;
   images: boolean;
   onContext: (context: number) => void;
@@ -1900,6 +1965,47 @@ function CommunityPane({
 
       <footer className="model-download-submit" ref={taskRef}>
         {error && <p className="model-download-error">{error}</p>}
+        {isOrca
+          ? orca?.running && (
+              <div className="model-download-inline">
+                <progress
+                  className="model-download-progress"
+                  value={Math.round(orca.percent)}
+                  max={100}
+                />
+                <span>
+                  ORCA · {Math.round(orca.percent)}%
+                </span>
+                <button
+                  type="button"
+                  className="st-btn st-btn--secondary st-btn--sm"
+                  onClick={onTasks}
+                >
+                  <i className="fas fa-list-check" /> 任务
+                </button>
+              </div>
+            )
+          : running &&
+            snapshot && (
+              <div className="model-download-inline">
+                <progress
+                  className="model-download-progress"
+                  value={Math.round(snapshot.percent)}
+                  max={100}
+                />
+                <span>
+                  {PHASE_LABEL[snapshot.phase] ?? snapshot.phase} ·{" "}
+                  {Math.round(snapshot.percent)}%
+                </span>
+                <button
+                  type="button"
+                  className="st-btn st-btn--secondary st-btn--sm"
+                  onClick={onTasks}
+                >
+                  <i className="fas fa-list-check" /> 任务
+                </button>
+              </div>
+            )}
         <div className="model-download-submit-row">
           {isOrca ? (
             <>

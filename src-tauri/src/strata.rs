@@ -2331,12 +2331,12 @@ fn engine_edits(
         .and_then(|v| v.get("exe"))
         .and_then(|v| v.as_str())
     {
-        if !vision.starts_with("component:") {
-            if let Some(sibling) = vision_sibling(target) {
-                let next = sibling.to_string_lossy().to_string();
-                if vision != next {
-                    edits.push((vision.to_string(), next));
-                }
+        // `component:` 引用也一并展开：server.py 同样解析不了它，视觉组件会跟着起不来
+        // （用户 m04159 那份 config 的 `vision.exe` 就是引用形态）。
+        if let Some(sibling) = vision_sibling(target) {
+            let next = sibling.to_string_lossy().to_string();
+            if vision != next {
+                edits.push((vision.to_string(), next));
             }
         }
     }
@@ -2428,6 +2428,67 @@ pub fn apply_engine(root: &Path, exe: &str) -> std::result::Result<Vec<String>, 
         return Err(failed.join("；"));
     }
     Ok(changed)
+}
+
+/// 把 config 里的 `component:<id>` 引用展开成本机真实引擎路径。
+///
+/// 为什么必须展开：引用形态是交给 **`serve/server.py` 自己解析**的（上游
+/// `engine_component.expand()`），它只认 `STRATA_COMPONENTS_DIR` 或
+/// `%LOCALAPPDATA%\Strata\components`；而这里的 [`resolve_component`] 扫的是
+/// `<Strata 根>\engine\<版本>`。手动解压的布局里官方组件目录是空的，server.py 会直接
+/// 报「No engine for this PC was found」并拒绝启动（用户 m04159）。
+///
+/// 幂等：没有引用时什么都不做；返回被改写的 config 个数。
+pub fn settle_engine(root: &Path) -> usize {
+    let Some(component) = resolve_component(root, ENGINE_COMPONENT_ID) else {
+        return 0;
+    };
+    let target = component.exe.to_string_lossy().to_string();
+    let Ok(read_dir) = fs::read_dir(configs_dir(root)) else {
+        return 0;
+    };
+    let mut fixed = 0;
+    for item in read_dir.flatten() {
+        let path = item.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !is_config_file(name) {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let referenced = |target: &serde_json::Value| {
+            target
+                .as_str()
+                .map(|text| text.starts_with("component:"))
+                .unwrap_or(false)
+        };
+        let has_reference = referenced(value.get("exe").unwrap_or(&serde_json::Value::Null))
+            || value
+                .get("vision")
+                .and_then(|vision| vision.get("exe"))
+                .map(referenced)
+                .unwrap_or(false);
+        if !has_reference {
+            continue;
+        }
+        if set_engine(root, name, &target).is_ok() {
+            // `rewrite_config_strings` 每条替换只改**首个**命中，而 `exe` 与 `vision.exe`
+            // 可能写着同一个引用（切换模型前先看过 config 的都会这么写）。所以再跑一次：
+            // 第一次已把 `exe` 换成路径，第二遍剩下的引用就轮到 `vision.exe` 了。
+            let _ = set_engine(root, name, &target);
+            fixed += 1;
+        }
+    }
+    fixed
 }
 
 /// 写 config（参数编辑 L2 用），落实 §8.6 的 W1-W8 安全规则。
@@ -2994,6 +3055,58 @@ mod tests {
         assert!(c >= STRATA_PORT_BASE as u64, "8080 的那份也要分配：{c}");
         assert_ne!(b, c, "两份不能落到同一个端口");
         assert_eq!(ensure_ports(&root), 0, "第二次不该再动");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 用户 m04159：`component:strata-engine` 由 server.py 自己解析，手动解压的布局里
+    /// 官方组件目录是空的，于是「启动模型」直接报 No engine for this PC。扫描时落成绝对路径。
+    #[test]
+    fn settle_engine_expands_component_reference() {
+        let root = std::env::temp_dir().join(format!("strata-settle-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let engines = root.join("engine");
+        fs::create_dir_all(&engines).unwrap();
+        let exe = if cfg!(windows) { "strata.exe" } else { "strata" };
+        put_component(&engines, "0.1.54", &host_platform(), exe);
+        // `vision_sibling()` 要求同目录真有视觉可执行文件，否则不会动 `vision.exe`。
+        let vision = if cfg!(windows) { "strata-vision.exe" } else { "strata-vision" };
+        fs::write(
+            engines
+                .join(format!("0.1.54-{}-cuda", host_platform()))
+                .join(vision),
+            b"",
+        )
+        .unwrap();
+
+        let configs = configs_dir(&root);
+        fs::create_dir_all(&configs).unwrap();
+        fs::write(
+            configs.join("strata-demo.json"),
+            serde_json::json!({
+                "exe": "component:strata-engine",
+                "args": [],
+                "model_name": "demo",
+                "vision": { "exe": "component:strata-engine", "mmproj": "m.gguf" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(settle_engine(&root), 1, "引用应被展开");
+        let expected = resolve_component(&root, "strata-engine").unwrap().exe;
+        let raw = fs::read_to_string(configs.join("strata-demo.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["exe"].as_str().unwrap(), expected.to_string_lossy());
+        assert_eq!(
+            value["vision"]["exe"].as_str().unwrap(),
+            expected
+                .parent()
+                .unwrap()
+                .join(vision)
+                .to_string_lossy(),
+            "vision 也要一起落成路径（同目录的视觉可执行文件）"
+        );
+        assert_eq!(settle_engine(&root), 0, "第二次不该再动");
         let _ = fs::remove_dir_all(&root);
     }
 

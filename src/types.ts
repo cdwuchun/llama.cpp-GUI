@@ -416,7 +416,6 @@ export interface StrataHostInfo {
   platform: string;
 }
 
-/** 一个本地 GGUF 文件组（同名分片合成一条）。 */
 /** 「MTP 草稿层」目录：安装器只在 `<dataDirectory>\mtp\rt` 找 experts.bin */
 export interface StrataMtpCheck {
   input: string;
@@ -426,6 +425,7 @@ export interface StrataMtpCheck {
   problems: string[];
 }
 
+/** 一个本地 GGUF 文件组（同名分片合成一条）。 */
 export interface StrataLocalGguf {
   /** 去掉分片后缀的显示名 */
   name: string;

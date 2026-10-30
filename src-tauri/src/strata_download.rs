@@ -4,12 +4,26 @@
 //! 打包 → 生成配置），而且支持完全非交互的参数：
 //!
 //! ```text
-//! python setup.py --family <家族> --model <量化> --context <N> --vision yes|no --yes --no-start
+//! python -u setup.py --setup --yes --no-start --no-browser --family <家族> --model <量化> --context <N> --vision yes|no
 //! ```
 //!
 //! `setup.py:863` 的 `ask()` 在 `yes=True` 时直接返回默认值，所以 `--yes` 就把整条
 //! 问答链钉死成推荐值，不会卡在 `input()` 上。GUI 只做三件事：定位解释器与
 //! `setup.py`、把它的输出流翻译成进度快照、进程退出时收尾。
+//!
+//! **必须带 `STRATA_CONTROL_INSTALL=1`**（`setup.py:82` 的 `CONTROL`）。不带它，安装器
+//! 会按「独立安装器」走 `engine_step()`：先找 `engine\BUILD.json`（我们没有 —— 引擎在
+//! `engine\<版本>\` 下面），找不到就去 GitHub 下预编译包，再失败就 `build_engine()` →
+//! `install_build_tools()` 索要 CUDA Toolkit，最终 `setup.py:5606` 报
+//! `the CUDA Toolkit did not install` 并把整条流程停掉。
+//! 带上它走 `control_engine_step()`（`setup.py:7548`）：引擎当作 strata 组件
+//! （`engine_component.resolve()`，认得 `engine\<版本>\` 布局），**既不下包也不编译**，
+//! 引擎缺失也只 warn 并继续下载模型。`STRATA_COMPONENTS_DIR` 指向用户设置的 Strata
+//! 根目录，正是 `engine_component.py:59` 认的那个变量。
+//!
+//! 还要一并给 `STRATA_INSTALL_DIR`（同一个根）：`setup.py:83` 的 `home()` 在 CONTROL 模式下
+//! 取它，**不设就回落到 `setup.py` 自己所在目录**（`control\<版本>\`），于是 `strata-*.json`
+//! 与 `run-*.bat` 会写进控制端版本目录，GUI 扫 `<根>\strata-*.json` 看不到新模型。
 //!
 //! **进度从 stdout 的 `\r` 行里读**（`setup.py:2652` / `:2863`）：
 //!
@@ -112,19 +126,29 @@ impl DownloadJob {
     pub fn running(&mut self) -> bool {
         match self.child.try_wait() {
             Ok(Some(status)) => {
+                let mut just_finished = false;
                 if let Ok(mut snap) = self.snapshot.lock() {
                     snap.running = false;
                     snap.exit_code = status.code();
                     if snap.ok.is_none() {
                         snap.ok = Some(status.success());
+                        just_finished = true;
+                        if status.success() {
+                            snap.phase = "done".into();
+                            snap.percent = 100.0;
+                            snap.message = "下载并准备完成：到「模型」页点刷新即可看到新模型".into();
+                        } else {
+                            snap.phase = "failed".into();
+                            snap.message = format!("安装器退出（退出码 {:?}），最后几行输出见下方日志", status.code());
+                        }
                     }
-                    if status.success() {
-                        snap.phase = "done".into();
-                        snap.percent = 100.0;
-                        snap.message = "下载并准备完成：到「模型」页点刷新即可看到新模型".into();
-                    } else {
-                        snap.phase = "failed".into();
-                        snap.message = format!("安装器退出（退出码 {:?}），最后几行输出见下方日志", status.code());
+                }
+                // 装完立刻把新 config 的 `component:strata-engine` 落成绝对路径：
+                // 引用形态要 `serve/server.py` 去官方组件目录找引擎，手动解压的布局里那是空的，
+                // 「启动模型」会直接报 No engine for this PC（用户 m04159 / m04232）。
+                if just_finished && status.success() {
+                    if let Some(root) = crate::strata::root().filter(|root| root.is_dir()) {
+                        crate::strata::settle_engine(&root);
                     }
                 }
                 false
@@ -345,7 +369,7 @@ pub struct DownloadRequest {
     pub quant: String,
     /// 启动上下文（`--context`）
     pub context: u32,
-    /// 是否带视觉（`--vision yes|no` + `--images qwen-image|no`）
+    /// 是否带视觉（`--vision yes|no`；视觉输入走引擎自带的 strata-vision）
     pub images: bool,
     /// 「使用已有 GGUF」时的本地目录（`--gguf-dir`）
     pub gguf_dir: Option<String>,
@@ -387,7 +411,15 @@ pub fn start(hub: Arc<LogHub>, req: DownloadRequest) -> Result<(Option<DownloadJ
     snapshot.phase = "starting".into();
 
     let mut cmd = Command::new(&python);
-    cmd.arg(&script)
+    cmd.arg("-u")
+        .arg(&script)
+        // `--setup` 是「安装 / 改配置」入口（与上游桌面端拼的参数一致），`--no-browser` 不去开浏览器
+        .arg("--setup")
+        // `--yes` 把整条问答链钉成推荐值（`setup.py:863` 的 ask()）
+        .arg("--yes")
+        // 只安装不启动：装完由用户在「模型」页手动启用（与上游文案一致）
+        .arg("--no-start")
+        .arg("--no-browser")
         .arg("--family")
         .arg(family)
         .arg("--model")
@@ -396,21 +428,32 @@ pub fn start(hub: Arc<LogHub>, req: DownloadRequest) -> Result<(Option<DownloadJ
         .arg(context.to_string())
         .arg("--vision")
         .arg(if images { "yes" } else { "no" })
-        .arg("--images")
-        .arg(if images { "qwen-image" } else { "no" })
-        // `--yes` 把整条问答链钉成推荐值（`setup.py:863` 的 ask()）
-        .arg("--yes")
-        // 只安装不启动：装完由用户在「模型」页手动启用（与上游文案一致）
-        .arg("--no-start")
+        // 端口：**不传 `--port`**。非交互下 setup.py 写默认 8080，而 8080 正是
+        // [`crate::strata::STRATA_PORT_DEFAULT`] —— GUI 扫描 config 时
+        // （`strata::ensure_ports`）会把 0/8080 视为「没定制过」，从 9091 起自动分配并把
+        // `run-<slug>.bat` 的 `--port` 一起改掉。下载器自己挑号会绕过这套机制（用户 m04080）。
         .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // 应用模式：引擎交给 strata 组件管理，安装器既不下预编译包、也不从源码编译。
+        // 少了这一行它会去索取 CUDA Toolkit 并把流程停掉（见文件头注释）。
+        .env("STRATA_CONTROL_INSTALL", "1")
         // 输出里有中文路径，管道下的 Python 会按 locale(cp936) 编码 → 显式钉成 UTF-8；
         // `-u` 的等价物是 PYTHONUNBUFFERED，否则管道缓冲会把进度憋成一坨。
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUTF8", "1")
         .env("PYTHONUNBUFFERED", "1");
+    if let Some(root) = crate::strata::root() {
+        // 应用模式的两个根：
+        // - `engine_component.components_dir()` 认 `STRATA_COMPONENTS_DIR`（`engine_component.py:59`）：
+        //   指到用户设置的 Strata 根，`engine\<版本>\` 才找得到；
+        // - `setup.py:83` 的 `home()` 在 CONTROL 模式下取 `STRATA_INSTALL_DIR`，**不设就是
+        //   `setup.py` 自己所在目录**（`control\<版本>\`）—— 配置、`run-*.bat`、数据目录都会写错位置，
+        //   GUI 扫描 `<根>\strata-*.json` 就看不到新模型。
+        cmd.env("STRATA_COMPONENTS_DIR", &root);
+        cmd.env("STRATA_INSTALL_DIR", &root);
+    }
     if let Some(dir) = req
         .data_dir
         .as_deref()

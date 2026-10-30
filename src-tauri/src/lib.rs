@@ -282,6 +282,15 @@ async fn strata_scan(state: State<'_, AppState>) -> Result<Vec<strata::StrataMod
             .logs
             .push("system", format!("[gui] {fixed} 份 Strata config 缺端口，已自动分配"));
     }
+    // `component:strata-engine` 由 `serve/server.py` 自己解析，它只认官方组件目录；
+    // 手动解压的布局里那个目录是空的，server.py 会拒绝启动（用户 m04159）。这里落成绝对路径。
+    let settled = strata::settle_engine(&root);
+    if settled > 0 {
+        state.logs.push(
+            "system",
+            format!("[gui] {settled} 份 Strata config 的引擎引用已展开成本机路径"),
+        );
+    }
     let entries = strata::scan_configs(&root, preferred.as_deref());
     state.store_strata_scan(&root, &entries);
     Ok(entries)

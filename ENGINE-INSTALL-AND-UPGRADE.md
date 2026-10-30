@@ -30,7 +30,7 @@
 - 引擎：`strata.rs::engine_folders` 从 `<根>` 自身、一级子目录及其直接子目录里找**含 `engine-component.json` 或 `strata.exe`** 的目录，**目录名不参与判断**；再补控制器组件根，按 `canonicalize` 去重。
 - 控制器：`strata.rs::list_controllers` 同时认 `<根>\control\<版本>` 与 `<根>\terminal\<版本>`；`usable` = 有 `serve\server.py` 且有 `python\python.exe`；`active` 取 `control\active.json` 的 `folder`。
 - 完整性：manifest 里每个文件的 SHA-256 + 清单 ed25519 签名，失败抛 `EngineIntegrityError`，无可用引擎抛 `EngineMissing`（CLI exit 5）。
-- config 的 `exe` 两种形态：绝对路径，或 `component:strata-engine`（自动最新）。GUI **只解析不改写**；切版本时 `vision.exe` 一起指向新目录。
+- config 的 `exe` 两种形态：绝对路径，或 `component:strata-engine`（自动最新）。GUI 的解析器只读不写，但**扫描与下载完成时会把引用落成绝对路径**（`strata::settle_engine`）：引用要 `serve/server.py` 自己去官方组件目录（`STRATA_COMPONENTS_DIR` / `%LOCALAPPDATA%\Strata\components`）找引擎，手动解压布局里那目录是空的，「启动模型」会报 `No engine for this PC was found`。切版本时 `vision.exe` 一起指向新目录。
 - **版本号两条线**：组件号 `0.1.x`（目录名、`version`），Strata 发布版本在同文件 `notes` 首词（本机 `0.2.7 NVIDIA cuda13 engine …`）。GUI 的模型目录闸门（`catalogReleaseGate`，如 DeepSeek 要 `0.2.5+`）读的是**发布版本**，拿 `0.1.52` 去比会误报「版本不符合」。
 
 ### 1.3 升级方法
