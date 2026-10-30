@@ -152,6 +152,7 @@ export function MonitoringPage({
   live,
   snapshot,
   engine,
+  channel,
   engineError,
   engineNote,
   recentTurns: allTurns,
@@ -165,6 +166,8 @@ export function MonitoringPage({
   live: LiveMetric | null;
   snapshot: MonitorSnapshot | null;
   engine: MonitorEngine | null;
+  /** 当前监控对象跑在哪条通道上（llama.cpp 子实例 / Strata 引擎）。 */
+  channel: "llamacpp" | "strata";
   engineError: string | null;
   /** 引擎指标不可用的原因（不是故障），显示为灰色提示。 */
   engineNote: string | null;
@@ -220,20 +223,23 @@ export function MonitoringPage({
   const history = snapshot?.history;
   const series = history?.series ?? {};
   const slots = normalizeSlots(engine?.slots);
-  const metrics = engine?.metrics as Record<string, unknown> | null | undefined;
+  const metrics = engine?.metrics;
   // 引擎自报的实时状态块（Strata 的 /metrics.live：state/queued/tok_s/generated/max_tokens/
   // prompt_read/prompt_total/prefill_tok_s_mean）。状态卡与速度卡**直接用它的数据**，
   // 不再用 GUI 本地推导 —— 本地推导会把「上次请求的残留」当成当前值（用户 m06736）。
   const rawLive = (metrics?.live ?? null) as Record<string, unknown> | null;
   const deferred = typeof metrics?.requestsDeferred === "number" ? metrics.requestsDeferred : null;
   const kvTokens = typeof metrics?.kvCacheTokens === "number" ? metrics.kvCacheTokens : null;
-  // 当前引擎是不是 Strata：它的 /metrics 带 requests 数组与 expert_slots，llama.cpp 的 Prometheus
-  // 指标里没有这两样。用来决定「上游有、llama.cpp 没有」的列要不要渲染（用户 m06168）。
-  const isStrata = Array.isArray((metrics as Record<string, unknown> | undefined)?.requests);
-  // Strata 每个请求带 hit_rate（生成时专家命中显存里的份额）；llama.cpp 没有
-  const strataRequests = isStrata
-    ? ((metrics as Record<string, unknown>).requests as Record<string, unknown>[])
-    : [];
+  // 当前监控对象是不是 Strata 引擎。以前从 `metrics.requests` 是不是数组推断，但引擎指标拿不到
+  //（探测失败、模型刚停）时 metrics 为 null，推断会掉回 llama.cpp 分支，Strata 页显示成
+  // llama.cpp 的专属文案。改为由调用方直接告诉通道（用户 m06168 那批列的取舍不变）。
+  const isStrata = channel === "strata";
+  // Strata 每个请求带 hit_rate（生成时专家命中显存里的份额）；llama.cpp 没有。
+  // 通道对了也还要确认引擎真的回了这个数组（指标拿不到时是 undefined）。
+  const strataRequests =
+    isStrata && Array.isArray(metrics?.requests)
+      ? (metrics.requests as Record<string, unknown>[])
+      : [];
   const rawCache = (metrics as Record<string, unknown> | undefined)?.conversation_cache as
     | Record<string, unknown>
     | undefined;
@@ -358,23 +364,32 @@ export function MonitoringPage({
     const gpuMemUsed = series.gpuMemUsed ?? [];
     const gpuMemTotal = snapshot?.static.gpuName ? (snapshot.now.gpu?.memTotalMib ?? null) : null;
     const total = live?.gpuMemoryTotal ?? (gpuMemTotal === null ? null : gpuMemTotal * mib);
+    // llama.cpp 的 /metrics 自带两个速度 gauge（`predicted_tokens_seconds` /
+    // `prompt_tokens_seconds`，空闲时归 0）。压测、自带 WebUI 与其它客户端的请求都不经过
+    // GUI 的聊天 store，本地攒不出速度，只有引擎自己知道 —— 有正数时优先用它。
+    const predicted = number2(metrics?.predictedTokS);
+    const enginePredictedTokS = predicted !== null && predicted > 0 ? predicted : null;
+    const prompted = number2(metrics?.promptTokS);
+    const enginePromptTokS = prompted !== null && prompted > 0 ? prompted : null;
     return [
       {
         key: "speed",
         icon: "fa-gauge-high",
         label: "速度",
         unit: "t/s",
-        // 数值优先取引擎 /metrics.live（生成中给 tok_s / prefill_tok_s_mean，空闲时上游回 null），
-        // 引擎没报才用本地最近一次请求的口径（用户 m06736）。
-        value: fixed1(number2(rawLive?.tok_s) ?? live?.decodeTokS),
+        // 数值优先取引擎 /metrics.live（Strata：生成中给 tok_s / prefill_tok_s_mean，空闲时回 null），
+        // 其次取 llama.cpp 的引擎 gauge，最后才用本地最近一次请求的口径（用户 m06736）。
+        value: fixed1(number2(rawLive?.tok_s) ?? enginePredictedTokS ?? live?.decodeTokS),
         sub: "最近生成",
         alt: {
-          value: fixed1(number2(rawLive?.prefill_tok_s_mean) ?? live?.prefillTokS),
+          value: fixed1(
+            number2(rawLive?.prefill_tok_s_mean) ?? enginePromptTokS ?? live?.prefillTokS,
+          ),
           label: "最近输入处理",
         },
         // 上游用 engine 的 `history.tok_s`（每秒一点）；本工程由前端每次采样时推一个点（store.speedSeries）
-    values: engineTokS.length > 0 ? engineTokS : speedSeries.tokS,
-    altValues: enginePrefill.length > 0 ? enginePrefill : speedSeries.prefillTokS,
+        values: engineTokS.length > 0 ? engineTokS : speedSeries.tokS,
+        altValues: enginePrefill.length > 0 ? enginePrefill : speedSeries.prefillTokS,
       },
       {
         key: "gpu",
@@ -459,7 +474,7 @@ export function MonitoringPage({
         tone: "info",
       },
     ];
-  }, [series, live, snapshot, gpuName, kvTokens, expertSlots, speedSeries]);
+  }, [series, live, snapshot, gpuName, kvTokens, expertSlots, speedSeries, metrics]);
 
   // 近期请求：Strata 直接用 `/metrics` 的 `requests`（引擎自己记的，含别的客户端与已断开的）、
   // llama.cpp 没有逐请求接口，退回 GUI 本地记录（用户 m06469 第 3 点）。
@@ -502,23 +517,25 @@ export function MonitoringPage({
         };
       });
     }
-    return recentTurns.map((turn) => ({
-      key: turn.id,
-      time: turn.at / 1000,
-      badge: turn.ok ? "st-badge--ok" : "st-badge--error",
-      state: turn.ok ? "完成" : "失败",
-      prompt: turn.promptTokens === null ? "—" : turn.promptTokens.toLocaleString("zh-CN"),
-      reused: turn.cacheTokens == null ? "—" : turn.cacheTokens.toLocaleString("zh-CN"),
-      output: frank(turn.outputTokens),
-      prefill: turn.prefillTokS == null ? "—" : `${fixed1(turn.prefillTokS)} tok/s`,
-      decode: turn.decodeTokS == null ? "—" : `${fixed1(turn.decodeTokS)} tok/s`,
-      hit: hitRateOf(turn.at) == null ? "—" : `${hitRateOf(turn.at)!.toFixed(1)}%`,
-      pcie:
-        pcieShareOf(turn.at) != null && pcieShareOf(turn.at)! > 0
-          ? ` +${(pcieShareOf(turn.at)! * 100).toFixed(1)}% PCIe`
-          : "",
-      duration: turn.elapsedMs == null ? "—" : `${(turn.elapsedMs / 1000).toFixed(1)} s`,
-    }));
+    return recentTurns.map((turn) => {
+      // 每次都现算的话，一行里 hitRateOf/pcieShareOf 各被调用两三次（审查发现）
+      const hit = hitRateOf(turn.at);
+      const pcie = pcieShareOf(turn.at);
+      return {
+        key: turn.id,
+        time: turn.at / 1000,
+        badge: turn.ok ? "st-badge--ok" : "st-badge--error",
+        state: turn.ok ? "完成" : "失败",
+        prompt: turn.promptTokens === null ? "—" : turn.promptTokens.toLocaleString("zh-CN"),
+        reused: turn.cacheTokens == null ? "—" : turn.cacheTokens.toLocaleString("zh-CN"),
+        output: frank(turn.outputTokens),
+        prefill: turn.prefillTokS == null ? "—" : `${fixed1(turn.prefillTokS)} tok/s`,
+        decode: turn.decodeTokS == null ? "—" : `${fixed1(turn.decodeTokS)} tok/s`,
+        hit: hit == null ? "—" : `${hit.toFixed(1)}%`,
+        pcie: pcie != null && pcie > 0 ? ` +${(pcie * 100).toFixed(1)}% PCIe` : "",
+        duration: turn.elapsedMs == null ? "—" : `${(turn.elapsedMs / 1000).toFixed(1)} s`,
+      };
+    });
   })();
   const newestAt = requestRows[0]?.time ?? null;
   // 底部汇总照上游（OfficialMonitoring.tsx:118-126）：优先 `/metrics` 的 totals，没有就用本地累计
@@ -538,7 +555,13 @@ export function MonitoringPage({
       const oSpeed = decodeMs !== null && decodeMs > 0 && output !== null && output > 0 ? ` 速度 ${fixed1(output / (decodeMs / 1000))} tok/s` : "";
       return `自 ${time}: ${requestsTotal.toLocaleString("zh-CN")} 个请求 · ${frank(read)} 提示词 tokens 已读取${pSpeed} (${frank(reused)} 已复用) · ${frank(output)} 已输出${oSpeed}`;
     }
-    if (recentTurns.length === 0) return "还没有请求。";
+    // llama.cpp 通道没有 totals，只能本地累计；本地只记本应用发出的请求，
+    // 自带 WebUI / 其它客户端的请求不会进来，空表时把这一点说清楚（用户 m00279）
+    if (recentTurns.length === 0) {
+      return isStrata
+        ? "还没有请求。"
+        : "还没有请求。这张表只记录本应用聊天页与压测发出的请求；模型自带 WebUI 或其它客户端发的请求不会出现在这里（它们的速度看上面的速度卡）。";
+    }
     const totalPrompt = recentTurns.reduce((sum, turn) => sum + (turn.promptTokens ?? 0), 0);
     const totalOutput = recentTurns.reduce((sum, turn) => sum + (turn.outputTokens ?? 0), 0);
     const cache = recentTurns.reduce((sum, turn) => sum + (turn.cacheTokens ?? 0), 0);
@@ -676,7 +699,7 @@ export function MonitoringPage({
             <div className="state-card__head">
               <span className="card-title">模型状态</span>
               <div className="badges">
-                <span className={`st-badge ${state === "idle" ? "on" : ""}`}>空闲</span>
+                <span className={`st-badge ${state === "idle" || state === "waiting" ? "on" : ""}`}>空闲</span>
                 <span className={`st-badge st-badge--reading ${state === "reading" ? "on" : ""}`}>读取中</span>
                 <span className={`st-badge st-badge--generating ${state === "generating" ? "on" : ""}`}>生成中</span>
                 <span className={`st-badge st-badge--queued ${state === "queued" ? "on" : ""}`}>排队中</span>

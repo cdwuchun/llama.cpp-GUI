@@ -382,7 +382,9 @@ function ValueControl({
   onEditJson: (def: ParamDef, state: ParamState) => void;
   onChange: (next: ParamState) => void;
 }) {
-  const set = (value: string) => onChange({ ...state, value });
+  // 改值就视为用户要显式设置它：否则「改了数字但没勾启用」会被静默忽略（审查发现：
+  // 这里与 DropdownInput / PathControl 的 set 不一致）
+  const set = (value: string) => onChange({ ...state, value, enabled: true });
   const numeric = def.type === "INTEGER" || def.type === "FLOAT";
 
   // 值是一个 gguf 路径的参数：给候选下拉 + 「浏览…」按钮

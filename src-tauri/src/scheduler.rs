@@ -728,6 +728,11 @@ pub fn ensure_ready(app: &AppHandle, state: &AppState, id: &str) -> Result<u16, 
         .ok_or_else(|| format!("模型 {} 未能分配端口", item.id))?;
     let hub = Arc::clone(&state.logs);
 
+    // 版本解析放在插表项之前：解析失败时必须原样返回，不能先插一条 Starting 再 `?`
+    // 早退 —— 那会让这个模型永久停在「正在启动」，后续请求全部 503（审查发现）。
+    let settings = state.settings.get();
+    let version = resolve_version(state, &settings)?;
+
     {
         let mut sched = lock_sched(state);
         match sched.table.state_of(&item.id) {
@@ -774,8 +779,6 @@ pub fn ensure_ready(app: &AppHandle, state: &AppState, id: &str) -> Result<u16, 
         });
     }
 
-    let settings = state.settings.get();
-    let version = resolve_version(state, &settings)?;
     let link_root = state.link_root();
     let spawned = spawn_model(
         app,

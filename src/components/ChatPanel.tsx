@@ -129,9 +129,12 @@ export function ChatPanel() {
     const stop = () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", stop);
+      // 指针被系统取消（切窗口、触摸被滚动接管）时不会发 pointerup，监听器会一直挂着（审查发现）
+      window.removeEventListener("pointercancel", stop);
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
   }, [chatWidth]);
 
   const conversation = chat.conversations.find((item) => item.id === chat.activeId) ?? null;

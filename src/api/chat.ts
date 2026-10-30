@@ -123,6 +123,7 @@ export async function streamChat(options: ChatStreamOptions): Promise<ChatStream
   let finishReason: string | null = null;
   const usage: ChatUsage = { promptTokens: null, completionTokens: null, cachedTokens: null };
   let timings: ChatTimings | null = null;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 
   try {
     const res = await fetch(`${routerBase(port)}/v1/chat/completions`, {
@@ -143,7 +144,7 @@ export async function streamChat(options: ChatStreamOptions): Promise<ChatStream
     if (!res.body) throw new Error("聊天响应没有可读的流");
     ttfbMs = performance.now() - started;
 
-    const reader = res.body.getReader();
+    reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
     let done = false;
@@ -210,6 +211,9 @@ export async function streamChat(options: ChatStreamOptions): Promise<ChatStream
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener("abort", forward);
+    // 提前 return（[DONE] / 超时 / 报错）时流还没读完：取消掉，否则连接留在池里
+    // 等 GC（审查发现）
+    void reader?.cancel().catch(() => undefined);
   }
 }
 

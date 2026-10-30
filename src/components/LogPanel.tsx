@@ -336,7 +336,15 @@ export function LogPanel() {
             <i className="fas fa-folder-open" />
             <span>日志目录</span>
           </button>
-          <button type="button" className="btn btn-secondary" onClick={() => void clearLogs()}>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => {
+              // 清空不可撤销（日志缓冲与当前筛选结果一起没），先问一句（审查发现）
+              if (!confirm("清空当前筛选出的日志？清掉后无法恢复。")) return;
+              void clearLogs();
+            }}
+          >
             <i className="fas fa-eraser" />
             <span>清空</span>
           </button>

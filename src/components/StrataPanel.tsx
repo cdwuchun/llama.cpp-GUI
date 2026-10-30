@@ -89,7 +89,7 @@ function ConfigCard({
   isFavourite: boolean;
   isRunning: boolean;
   isLoading: boolean;
-  /** 正在卸载这个模型：这段时间胶囊说「卸载中」（用户 m04854） */
+  /** 正在停止这个模型（卸模型 + 收引擎）：这段时间胶囊说「停止中」（用户 m04854） */
   isStopping: boolean;
   /** 引擎进程在跑这个 config，但模型未加载（胶囊启了引擎、模型还没拉起） */
   engineHere: boolean;
@@ -199,8 +199,9 @@ function ConfigCard({
     </div>
   );
 
-  // 状态胶囊四态（用户 m03855 / m04854）：运行中 / 卸载中 / 加载中 / 已停止。
-  // 引擎在跑但模型已卸载也显示「已停止」—— 卡片管的是模型，不是引擎进程。
+  // 状态胶囊四态（用户 m03855 / m04854）：运行中 / 停止中 / 加载中 / 已停止。
+  // 「停止」= 卸模型 + 收掉 GUI 起的引擎（与 llama.cpp 侧一致，用户 m00373）；
+  // 外部实例仍在跑、只是模型卸了，也照样显示「已停止」—— 卡片管的是模型。
   const busyState = isStopping || isLoading;
   const badge = (
     <div
@@ -209,7 +210,7 @@ function ConfigCard({
       }`}
     >
       <i className={`fas ${isRunning ? "fa-check-circle" : busyState ? "fa-spinner fa-spin" : "fa-stop-circle"}`} />
-      {isRunning ? "运行中" : isStopping ? "卸载中" : isLoading ? "加载中" : "已停止"}
+      {isRunning ? "运行中" : isStopping ? "停止中" : isLoading ? "加载中" : "已停止"}
     </div>
   );
 
@@ -221,11 +222,11 @@ function ConfigCard({
         disabled={busy || isLoading || isStopping}
         title={
           isStopping
-            ? "正在卸载这个模型（等子实例退出，显存随后释放）"
+            ? "正在停止这个模型（卸载后引擎一并退出，显存随后释放）"
             : isLoading
               ? "模型正在加载（引擎已起，权重还没就绪）"
               : isRunning
-                ? "卸载这个模型（引擎进程留着，显存释放）"
+                ? "停止这个模型（卸载后引擎一并退出，显存释放）"
                 : mutex
                   ? "加载这个模型（显存互斥已开：会先卸载 llama.cpp 侧已加载的模型）"
                   : engineHere
@@ -897,7 +898,8 @@ export function StrataPanel({
     return () => {
       alive = false;
     };
-  }, [entries.length]);
+    // 预设是按模型目录匹配的：只盯条数，遇到「换了模型文件、条数没变」就不会刷新（审查发现）
+  }, [entries.map((entry) => entry.model_path ?? "").join("|")]);
   const presetOf = (entry: StrataModelEntry): StrataLaunchPreset | null => {
     const folder = normFolder(entry.model_path ?? "");
     if (!folder) return null;
@@ -957,10 +959,10 @@ export function StrataPanel({
 
   const toggleOne = useCallback(
     (file: string) => {
-      // 卡片管模型（用户 m03572）：引擎正在跑这份 config **且模型还加载着** → 卸载；否则加载。
-      // 判据必须带上 `loaded`（用户 m03241）：卸载后引擎进程仍在（`running=true`、
-      // `config_path` 还是这份），只看 runningFile 会把「再点启动」当成又卸载一次，
-      // 于是卡片永远停在「已停止」。探测不明（`loaded === null`）时仍按卸载走，
+      // 卡片管模型（用户 m03572）：引擎正在跑这份 config **且模型还加载着** → 停止；否则加载。
+      // 判据必须带上 `loaded`（用户 m03241）：`/unload` 与进程退出之间有一段窗口
+      // （`running=true`、`config_path` 还是这份），只看 runningFile 会把「再点启动」当成又停止一次，
+      // 于是卡片永远停在「已停止」。探测不明（`loaded === null`）时仍按停止走，
       // 那是 m04917 的场景（加载中点了停止，探测没跟上）。
       if (runningFile === file && status.loaded !== false) {
         void stopStrataModel(file);
@@ -979,14 +981,16 @@ export function StrataPanel({
   /**
    * WebUI 按钮：引擎没在跑时不显示（用户 m01795 要求取消常显）。
    *
-   * WebUI 是**引擎进程自己**在它的端口上提供的页面，所以打开的是这张卡片的端口
-   * （`status.port` 优先：端口被占用时后端会换一个）。
+   * WebUI 是**引擎进程自己**在它的端口上提供的页面，所以打开的是**这张卡片自己的**
+   * `entry.port`，不能用「当前在跑引擎的端口」：后者在代理背后切换引擎时会开成
+   * **另一个模型**的页面（用户 m02028「About 里的模型不对」就是这么来的）。
+   * 审查发现这里曾写成 `status.port || entry.port`，与下面卡片处的注释正好相反。
    */
   const openWebui = useCallback(
     (entry: StrataModelEntry) => {
-      void ipc.openLocalUrl(`http://127.0.0.1:${status.port || entry.port}/`);
+      void ipc.openLocalUrl(`http://127.0.0.1:${entry.port}/`);
     },
-    [status.port],
+    [],
   );
 
   return (
@@ -1035,7 +1039,7 @@ export function StrataPanel({
                     starting === fileOf(e) ||
                     (status.proxy_serving === fileOf(e) && !status.loaded)
                   }
-                  // 卸载中（用户 m04854）：这段时间胶囊要说「卸载中」，不能说「加载中」
+                  // 停止中（用户 m04854）：这段时间胶囊要说「停止中」，不能说「加载中」
                   isStopping={stopping === fileOf(e)}
                   mutex={!!settings?.strata_router_mutex}
                   grid={grid}

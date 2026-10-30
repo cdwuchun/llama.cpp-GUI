@@ -592,6 +592,9 @@ export function buildChatRequest(
  * `push` 喂原始字节或字符串，`finish` 收尾把残留行吐出去。
  */
 export class SSEParser {
+  /** 单个事件的最大缓冲：上游发疯（或没按 SSE 格式回）时不能无限吃内存（审查发现） */
+  private static readonly MAX_BUFFER = 1_048_576;
+
   private buffer = "";
   private data: string[] = [];
   private readonly decoder = new TextDecoder();
@@ -601,6 +604,11 @@ export class SSEParser {
   push(chunk: string | Uint8Array): void {
     this.buffer += typeof chunk === "string" ? chunk : this.decoder.decode(chunk, { stream: true });
     this.drain(false);
+    if (this.buffer.length > SSEParser.MAX_BUFFER) {
+      this.buffer = "";
+      this.data = [];
+      throw new Error("SSE 数据块超过 1 MiB，已中断");
+    }
   }
 
   finish(): void {

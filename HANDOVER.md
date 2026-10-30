@@ -3,7 +3,7 @@
 > 面向**接手这个仓库的新会话 / 新维护者**。`README.md` 讲能力与用法，本文讲**怎么接手**：架构与代码地图（§1）、
 > llama.cpp 行为约束（§2）、前端约定（§3）、后端要点（§4）、构建与验证（§5）、运行时数据文件（§6）、未决项（§7）。
 >
-> **现行版本 0.3.3（2026-10-30）**。逐轮实现日志与历史决策不写在这里，去 `docs/archive/`：
+> **现行版本 0.3.4（2026-10-30）**。逐轮实现日志与历史决策不写在这里，去 `docs/archive/`：
 > `ITERATION_LOG.md`（0.1.x → 0.2.0 的起因、实测证据与坑）、`DECISIONS-2026-10.md`（2026-10 关键决策）；
 > 已落地的设计文档：`PROXY_SCHEDULER_PLAN.md`（前门与配置层规格）、`STRATA_INTEGRATION_PLAN.md`（Strata 通道）、
 > `STRATA_MANAGER_PORT_ASSESSMENT.md`（聊天/监控/压测移植）、`WEB_SEARCH_PLAN.md`（五引擎搜索）、
@@ -116,6 +116,7 @@ llama.cpp 的 router mode 已于 2026-10-15 退役（`router.rs` → `logs.rs`�
 - 原生 `--sleep-idle-seconds` 只 `destroy()` 权重 / context/KV / mmproj / 草稿，**子进程与 CUDA context 还在**。实机实测（610 MB Q8、单卡、`--sleep-idle-seconds 5`）：加载后 10158 MB → 休眠 156 MB → 卸载 0 MB —— 用户看到的「还剩 0.2 GB」就是这一段。**本应用不用这个参数**。
 - `src-tauri/src/idle.rs` 是**常驻线程**（`lib.rs` setup 里挂一次，2 s 一轮）：每轮重读 `settings.sleep_idle_seconds`，`> 0` 时挑「`Ready` + `active == 0` + `now - last_used_ms >= 门槛`」的模型 `Scheduler::stop`（强杀进程树，显存归零），日志写 `[gui] 模型 <id> 空闲超过 <n> 秒，已卸载实例释放显存`。
 - 判定用调度器自己的 `ModelRuntime::last_used_ms`（前门每次转发成功时 `touch`），不查引擎的休眠状态；下一次请求由 `scheduler::ensure_ready` 按需重拉（iq3 冷启约 69 s）。
+- **被动探测不刷新「最后使用时间」**：`/props`、`/slots`、`/metrics`、`/v1/health` 转发成功也**不** `touch`（`strata_proxy.rs::serve_llama` 里按 `is_passive_probe` 判断）。否则监控页每 2 秒轮询一次，空闲卸载永远等不到 —— 请求数照记，只是不算「在用」。
 - 线程常驻且每轮重读设置 ⇒ 改完保存即生效，不用重启前门或程序。正在生成（`active > 0`）不打断，`Starting` / `Stopping` 不动。
 - 容量上限 `settings.models_max`（默认 4）由 scheduler 的容量闸执行：满了先卸最久未用的（`last_used_ms`）。
 - 前门合成的 `/models` 不报 `sleeping`，所以 llama.cpp 通道不会出现「休眠」胶囊（Strata 通道的 `sleeping` 是引擎自己报的）。
@@ -160,7 +161,7 @@ Strata 的二进制不同名、没有 router mode，config 是 `strata-*.json`�
 - **一个端口 = 一份 config = 一个引擎**：多份 config 写同一端口天然互斥，切模型必须先 `/unload` 旧模型（上游顺手保存 learned expert profile、立刻放显存）再杀进程树（`store.ts::startStrataModel`）。
 - **端口上跑的是哪份 config，只认 `/health` 的 `model`**：按端口猜归属会把在跑的实例记到别的卡片上。`lib.rs::attribute_strata_hit` 反查（有单测），报错一律点名模型名。
 - **卡片播放按钮 = 启动引擎 + `/load`**：只起引擎不 `/load` 的话 `/health.loaded=false`，卡片永远显示「已停止」。只有侧栏「启动 Strata」胶囊是纯启引擎（强制 `lazy_load: true`）。
-- **Strata 卡片按钮管的是「模型」不是「进程」**：`/unload` 只放权重，进程与 `config_path` 都还在，`running=true / loaded=false` 是正常态。按钮判据必须带 `loaded`（`StrataPanel.tsx::toggleOne`），只看 `runningFile` 会把「卸载后再启动」当成又卸载一次。
+- **卡片「停止」= 卸模型 + 停引擎（0.3.4 起，与 llama.cpp 档对齐）**：`store.ts::stopStrataModel` 先 `POST /unload`（上游优雅退出、保存 learned expert profile、立刻放显存），再对**本 GUI 启动的**（`running && !external`）实例调 `strata_stop` 收进程树；用户自己用 `run-<model>.bat` 起的实例不动 —— `lib.rs::strata_stop` 在槽位为空且快照 running 时报「……不是由本 GUI 启动的，请在它自己的控制台里停止」。**自动显存互斥是另一回事**：`startModel` 里腾地方时只 `/unload` 不停引擎（别把用户正开着的 WebUI 停掉），注释已钉住。`/unload` 与进程退出之间有窗口（`running=true / loaded=false`），按钮判据必须带 `loaded`（`StrataPanel.tsx::toggleOne`），只看 `runningFile` 会把「停止后再启动」当成又停止一次。
 - **端口从 9091 起自动分配**：真正被绑定的是 `run-<slug>.bat` 的 `--port`，config 顶层 `port` 只是 GUI 连它用的元数据，不一致时 `spawn_strata` 直接 bail。`allocate_port` 找第一个「别的 config 没声明、系统也没占用」的端口（`STRATA_PORT_BASE = 9091`）；`set_port` **同时**写 config 与 bat（先 `.json.bak` 再原子写）；`strata_scan` 开头 `ensure_ports` 给「没定制过」的补端口（`port == 0` 与安装器默认的 `8080` 都算没定制）；`spawn_strata` 在「没配置」或「端口被占用」时现场重分配。`parse_config` 缺 `port` 返回 **0**（0 = 未分配），前端只在 `port > 0` 时显示。
 - **归属信息（`config_path` / `model_name` / `pid` / `started_at_ms` / `port`）只能在「槽位为空」时清**：spawn 到端口监听之间、以及 `/load` 期间探测都会判「端口无响应」，而**探测失败不等于引擎没了**；曾无条件清 `config_path` ⇒ 卡片永远「已停止」而侧栏写着「引擎运行中」。三层堵法：`merge_strata_probe` 每次用槽位信息覆盖归属（`apply_owned_status`，有单测）、「无响应」分支在 `slot_owned` 时不动归属、`spawn_monitor` 在进程退出时把归属一起清掉；前端 `runningEntry` 在 `config_path` 缺失时退回按 `/health` 的模型名认。
 
@@ -203,6 +204,13 @@ Strata 的二进制不同名、没有 router mode，config 是 `strata-*.json`�
 - ORCA 打包用 `tools/iq_pack.py --gguf <shard1> --out <pack> --compat-bf16`（`--compat-bf16` 与 `--base` 互斥；它自己调 `strata_tokenizer.py` 导出 `tokenizer/`），成功后写 `strata-orca-iq3_xxs.json`。
 - MTP 草稿层没有安装器参数：安装器只认 `<数据目录>\mtp\rt\experts.bin`，所以「选 MTP 目录」等价于把所选目录的父级当 `--data-dir` 传下去（`check_mtp` 的 `data_directory`）。
 
+### 2.12 `/metrics` 自带实时吞吐 gauge，速度别只靠本地实测
+- `--metrics` 下有两支 gauge：`llamacpp:predicted_tokens_seconds`（HELP "Average generation throughput in tokens/s"）与 `llamacpp:prompt_tokens_seconds`（"Average prompt throughput in tokens/s"）。实测 b11671 一次 24 token 的请求后分别是 `19.6849` / `70.6986`，**空闲时归 0** —— 是瞬时均值，不是累计值，别做差分。
+- 想算区间均值再用累计对：`llamacpp:tokens_predicted_seconds_total` / `prompt_seconds_total` 与 `tokens_predicted_total` / `prompt_tokens_total`。
+- GUI 起的实例由 `scheduler.rs` 自动补 `--metrics`；用户自己起的实例没开时 `/metrics` 返回 501（`This server does not support metrics endpoint`），前端显示「这个实例没开 --metrics」提示而不是报错。
+- **压测、模型自带 WebUI、其它 OpenAI 客户端的请求不经过 GUI 的 store**，本地 `lastTurn` 攒不出速度；只看 `lastTurn` 就会在压测期间显示空（0.3.4 前的 bug）。速度卡固定按「引擎 gauge → 本地实测」回落。
+- `/slots` **没有速度字段**（只有 `n_ctx` / `is_processing` / `n_prompt_tokens` 这些），`normalizeSlots` 的 `speed` 对 llama.cpp 永远是 null，不要指望它。
+
 ---
 
 ## 3. 前端约定
@@ -216,6 +224,8 @@ Strata 的二进制不同名、没有 router mode，config 是 `strata-*.json`�
 - **主窗口是「隐藏创建、首帧后显示」**：`tauri.conf.json` 的 main 窗口 `visible: false`，`src/main.tsx` 两帧后调 `ipc.appBootFinished()` 才 `show()`（WebView2 首帧前显示会「一块一块黑」）。配套：`--minimized` 自启动时后端忽略该调用、窗口留在托盘；上次最大化时不能在建窗阶段 `window.maximize()`（会把隐藏窗口顶出来），意图记进 `RESTORE_MAXIMIZED` 等显示后再应用。后端还有 4 秒兜底：前端崩在首帧前也会显示窗口。
 - **监控页「上下文占用」的分母是上下文窗口**，不是 `/status.max_tokens`（那是本次请求的输出上限）。分母取 `normalizeSlots(engine.slots)[0].context`（= `/slots[].n_ctx`），没有槽位时退回 config 的 `max_context`；分子按状态取 `live.prompt_read` / `live.prompt_total + generated` / 最近一次请求的 `promptTokens`。
 - **监控页「并行任务」卡只在真开了多槽位时出现**（`normalizeSlots(engine.slots).length > 1`）。
+- **速度卡有两条来源，别只认 `lastTurn`**：① 引擎 `/metrics` 自报的 gauge（`llamacpp:predicted_tokens_seconds` / `prompt_tokens_seconds`，`monitor.rs::parse_prometheus` 挑成 `predictedTokS` / `promptTokS`，空闲时归 0，前端只在 `> 0` 时用）；② 本地 `lastTurn`（`buildLiveMetric`）。**压测、模型自带 WebUI、其它 OpenAI 客户端的请求不经过 GUI 的 store，只有 ① 能看到它们** —— 0.3.4 前只读 ②，于是压测期间两张速度卡全空（用户实测报告）。
+- **「最近请求」表由两处写入**：`sendChat` 收尾与 `runContextBench` 的每条样本都写一行 `RecentTurn`（后者顺带更新 `lastTurn`）。`runScenarioBench` 只写 `lastTurn`（样本几十条，不占这张 12 行的表）。`refreshMonitor` 的 `tokS` / `prefillTokS` 两条线用同一个门控，要带 `contextBench.running` / `scenarioBench.running`，否则压测期间折线断在 `null`；空闲期不推值（否则折线是一条假水平线）。走自带 WebUI / 其它客户端的请求本来就不进这张表，空态文案已写明。
 - **聊天页输入框右侧的模型下拉**列出**全部**模型，已加载的用绿色文字（`.composer-model__item.is-loaded`）。当前模型取值顺序：记住的选择 → 已加载里 id 排序第一个 → 上次聊天的模型 → 空（显示「请选择模型」）；`sendChat` 用同一套顺序，未加载时发送前先自动拉起。聊天历史默认收起。
 - **编辑回退是纯前端改写历史**（照 Strata 0.1.52 `history.js`）：`utils/chatHistory.ts` 的 `rewindPlan` / `regeneratePlan` / `editAnswerPlan` / `branchConversation` 算「保留到哪条 + 回填什么草稿」，`store.rewindChat` / `regenerateReply` / `editAnswerText` 落盘，`undo` 存整份旧消息供撤销条还原。改完助手消息会打 `meta: "已编辑"` 并丢掉 `reasoning` / `tools` / `usage`。三个开关都在采样抽屉：`chatEdit`（整排操作按钮显隐）、`chatList`（左侧历史栏显隐）、`busyMode`。
 - **生成中的发送三态（`busyMode`）**：`wait` 直接忽略、`queue` 把草稿挂进 `chat.pending`、`interrupt` 先 `chatAbort?.abort()` 再挂。排队的那一问在 `sendChat` 的 `finally` 里（`streaming:false` 之后）自动续发；失败或被打断也照发。
@@ -263,7 +273,7 @@ Strata 的二进制不同名、没有 router mode，config 是 `strata-*.json`�
 npm install                        # 受限沙箱里需要 --ignore-scripts
 npm run cargo:proxy                # 另开终端保持运行：本机 crates 代理 http://127.0.0.1:8787
 npx tsc --noEmit                   # 前端类型检查（仓库根）
-cd src-tauri; cargo test --lib      # 后端单测（0.3.3 基线 173 passed / 18 ignored）
+cd src-tauri; cargo test --lib      # 后端单测（0.3.4 基线 175 passed / 18 ignored）
 npm test                           # test:web + test:rs
 npm run tauri build                # 打包（exe + NSIS 安装包）
 node scripts/make-icons.mjs        # 重新生成全部图标资产
@@ -279,6 +289,7 @@ node scripts/make-icons.mjs        # 重新生成全部图标资产
 
   否则前端 `88 modules transformed` 之后报 `[vite:esbuild-transpile] remove C:\Users\…\Temp\esbuild-<hash>: Access is denied.`，cargo 测试里大量写临时文件的用例会以 `Os { code: 5, kind: PermissionDenied }` 失败（**那是环境问题，不是代码缺陷**，本仓库曾因此误判 48 个失败用例）。
 - **提权被拒绝就不要重试同一个命令**，换做法或先问用户。
+- **CI 与发布门禁**：`.github/workflows/ci.yml` 跑 `npm run build`（含 tsc）+ `test:rs` + `test:smoke`；`release.yml` 打 tag 时校验 **tag 与 `tauri.conf.json` / `package.json` / `Cargo.toml` / `Cargo.lock` 四处版本一致**（0.3.4 起；以前只比 `tauri.conf.json`，其余三处漂了也照样发版）。CI 目前**不跑** `cargo fmt --check` / `clippy` —— 存量 42 条 clippy 警告，清完再加这一道。
 - **换图标后必须删 `src-tauri\target\release\build\llamacpp-gui-*` 与 `.fingerprint/llamacpp-gui-*` 再构建**（`tauri-build` 不监听 `icons/*`；不删的话 exe 在原路径上仍是旧图标）。
 - 只想看真实扫描结果：`cargo test --lib real_environment_model_scan -- --ignored --nocapture`。
 - **磁盘占用**：`target/` 是唯一膨胀源。`Cargo.toml` 已做三项控制：`[lib] crate-type = ["rlib"]`、`[profile.dev] debug = "line-tables-only"` + `[profile.dev.package."*"] debug = false`、release 的 `lto + opt-level="s" + strip`。腾空间直接删 `src-tauri/target/debug`。

@@ -71,9 +71,14 @@ export function SettingsPanel() {
   }
   /** 当前生效的控制器版本：就是设置里记的那个（「自动跟随最新版本」开着时由后端写进去） */
   const chosenController = settings.strata_controller ?? "";
-  /** 兼容 API 的 base URL：跟「前门与服务」里那条配置一致（留空 = 127.0.0.1:9090） */
-  const frontHost = strataHost.trim() || "127.0.0.1";
-  const frontPort = strataPort.trim() || String(strataStatus.proxy_port ?? 9090);
+  /**
+   * 兼容 API 的 base URL：跟「前门与服务」里那条配置一致（留空 = 127.0.0.1:9090）。
+   *
+   * 用**已保存**的值拼：输入框里还没保存的端口对应的服务并不存在，复制出去只会指向空端口（审查发现）。
+   */
+  const frontHost = (settings.strata_host ?? "").trim() || "127.0.0.1";
+  const frontPort =
+    settings.strata_port != null ? String(settings.strata_port) : String(strataStatus.proxy_port ?? 9090);
   const openAiBase = `http://${frontHost}:${frontPort}/v1`;
   const anthropicBase = `http://${frontHost}:${frontPort}`;
   const copyEndpoint = async (value: string) => {
@@ -273,8 +278,12 @@ export function SettingsPanel() {
         return;
       }
       const parsedPort = Math.trunc(Number(strataPort));
-      const nextPort = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : null;
-      const nextMax = Number(modelsMax) || 4;
+      // 端口得能在 u16 里：只判 > 0 时 70000 存进去，后端监听才失败（审查发现）
+      const nextPort =
+        Number.isFinite(parsedPort) && parsedPort > 0 && parsedPort <= 65535 ? parsedPort : null;
+      const parsedMax = Math.trunc(Number(modelsMax));
+      // 0 / 负数 / 非数字都会让调度器行为不可预期，夹到 1..=64
+      const nextMax = Number.isFinite(parsedMax) ? Math.min(64, Math.max(1, parsedMax)) : 4;
       const parsedSleep = Math.trunc(Number(sleepIdle)); // llama.cpp 只在 > 0 时启用；-1 / 0 / 空都表示关闭
       const nextSleep = Number.isFinite(parsedSleep) ? parsedSleep : -1;
       const idleParsed = Math.trunc(Number(strataIdle));

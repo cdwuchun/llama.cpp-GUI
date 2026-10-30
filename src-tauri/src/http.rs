@@ -65,10 +65,14 @@ pub fn request(
         return Err("响应为空".into());
     }
 
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let (head, body_text) = match text.split_once("\r\n\r\n") {
-        Some((h, b)) => (h.to_string(), b.to_string()),
-        None => (text.clone(), String::new()),
+    // 响应头与体按字节切开：分块编码的长度行是**字节**数，先做 from_utf8_lossy 再按字符
+    // 偏移切分，边界落在多字节字符中间就没法对齐（审查发现）
+    let (head, body_bytes) = match raw.windows(4).position(|window| window == b"\r\n\r\n") {
+        Some(pos) => (
+            String::from_utf8_lossy(&raw[..pos]).into_owned(),
+            &raw[pos + 4..],
+        ),
+        None => (String::from_utf8_lossy(&raw).into_owned(), &raw[raw.len()..]),
     };
 
     let status = head
@@ -80,9 +84,9 @@ pub fn request(
 
     let lower = head.to_ascii_lowercase();
     let payload = if lower.contains("transfer-encoding: chunked") {
-        dechunk(&body_text)
+        String::from_utf8_lossy(&dechunk(body_bytes)).into_owned()
     } else {
-        body_text
+        String::from_utf8_lossy(body_bytes).into_owned()
     };
 
     if !(200..300).contains(&status) {
@@ -101,24 +105,31 @@ pub fn request(
 }
 
 /// 去掉 chunked 编码的分块长度行。
-fn dechunk(body: &str) -> String {
-    let mut out = String::new();
+///
+/// 按字节处理：分块长度是字节数，而响应体可能含多字节字符（UTF-8 的 `中` 是 3 字节）。
+/// 以前把整份响应先 lossy 成 `&str` 再 `&tail[..size]` 切片，边界落在字符中间就 panic，
+/// 读响应的线程直接打死（审查发现）。
+fn dechunk(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
     let mut rest = body;
-    loop {
-        let Some((len_line, tail)) = rest.split_once("\r\n") else {
-            break;
-        };
-        let size = usize::from_str_radix(len_line.trim().split(';').next().unwrap_or("0"), 16)
+    while let Some(pos) = rest.windows(2).position(|window| window == b"\r\n") {
+        let line = String::from_utf8_lossy(&rest[..pos]).into_owned();
+        rest = &rest[pos + 2..];
+        let size = usize::from_str_radix(line.trim().split(';').next().unwrap_or("0").trim(), 16)
             .unwrap_or(0);
         if size == 0 {
             break;
         }
-        if tail.len() < size {
-            out.push_str(tail);
+        if rest.len() < size {
+            // 长度行说还有 size 字节，但连接已经结束：把剩下的原样收下
+            out.extend_from_slice(rest);
             break;
         }
-        out.push_str(&tail[..size]);
-        rest = tail[size..].strip_prefix("\r\n").unwrap_or(&tail[size..]);
+        out.extend_from_slice(&rest[..size]);
+        rest = &rest[size..];
+        if rest.starts_with(b"\r\n") {
+            rest = &rest[2..];
+        }
     }
     out
 }
@@ -129,7 +140,21 @@ mod tests {
 
     #[test]
     fn dechunk_decodes_chunked_body() {
-        let body = "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
-        assert_eq!(dechunk(body), "hello world");
+        let body = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        assert_eq!(dechunk(body), b"hello world");
+    }
+
+    #[test]
+    fn dechunk_survives_a_boundary_inside_a_multibyte_char() {
+        // 「中」是 3 字节，分块长度写 1：按字节切，不 panic、也不把后面的行当正文
+        let body = b"1\r\n\xe4\xb8\xad\r\n0\r\n\r\n";
+        assert_eq!(dechunk(body), b"\xe4");
+    }
+
+    #[test]
+    fn dechunk_keeps_what_arrived_when_a_chunk_is_truncated() {
+        // 长度行说 8 字节，实际只到了 3 字节：不能丢，也不能死等
+        let body = b"8\r\nabc";
+        assert_eq!(dechunk(body), b"abc");
     }
 }

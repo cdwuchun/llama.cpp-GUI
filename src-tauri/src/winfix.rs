@@ -9,7 +9,8 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
@@ -147,10 +148,18 @@ fn remove_junction(link: &Path) -> Result<()> {
 }
 
 /// 路径转成能安全塞进 `cmd` 命令串的形式（转义过的反斜杠路径，不含引号）。
-fn cmd_path(path: &Path) -> Result<String> {
-    let text = path.to_string_lossy().to_string();
+pub(crate) fn cmd_path(path: &Path) -> Result<String> {    let text = path.to_string_lossy().to_string();
     if text.contains('"') {
         bail!("路径含引号，无法安全传给 cmd: {text}");
+    }
+    // cmd 的元字符：`%` 即使在引号里也会展开变量，`&` `|` `^` `<` `>` 能截断命令串。
+    // 正常安装路径不会出现（Windows 文件名本就禁用 <>|&^），遇到就拒绝，别把命令拆两半执行
+    //（审查发现：以前只挡双引号）。
+    if let Some(bad) = text
+        .chars()
+        .find(|c| matches!(c, '%' | '&' | '|' | '^' | '<' | '>'))
+    {
+        bail!("路径含 cmd 元字符 {bad:?}，无法安全传给 cmd: {text}");
     }
     Ok(text)
 }
@@ -168,6 +177,33 @@ pub fn hide_console(cmd: &mut Command) -> &mut Command {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
+}
+
+/// 跑一个子进程并把输出收回来，最多等 `timeout`；超时就杀掉、返回 `None`。
+///
+/// 用在这些「探测外部 exe」的地方：`llama-server --help`、`--list-devices`、
+/// `llama-fit-params`。被杀软拦住 / 缺 DLL / 参数让它卡住时，`Command::output()`
+/// 会**无限期等下去**，而调用方是同步命令 —— 一次就把界面卡死（审查发现）。
+pub fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<Output> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => return None,
+        }
+    }
+    // 子进程已经退出：这里只是把管道里剩下的读完，不会卡住
+    child.wait_with_output().ok()
 }
 
 /// 让子进程脱离父 Job Object（Windows 的 `CREATE_BREAKAWAY_FROM_JOB`）。

@@ -871,7 +871,11 @@ fn serve_llama(
     {
         let mut sched = scheduler::lock_sched(state);
         sched.table_mut().end_request(&item.id);
-        if outcome.is_ok() {
+        // 监控页每 2 秒的 `/metrics`、`/slots`、`/props`、`/v1/health` 不算「在用」：
+        // 以前它们成功返回也会 touch，于是只要监控页开着，空闲卸载永远等不到
+        // （审查发现）。请求数照记，只是不刷新 `last_used_ms`。
+        let passive = is_passive_probe(target.split('?').next().unwrap_or(target));
+        if outcome.is_ok() && !passive {
             let now = crate::logs::now_ms();
             sched.table_mut().touch(&item.id, now);
         }
@@ -1352,10 +1356,17 @@ fn read_body(client: &mut TcpStream, headers: &[(String, String)]) -> std::io::R
     {
         return read_chunked(client);
     }
-    let Some(len) = header_value(headers, "content-length").and_then(|v| v.trim().parse::<usize>().ok())
-    else {
+    // 没有 Content-Length 才是「确实没有体」；有但解析不了是坏请求，转发一份截断的
+    // 请求上游只会得到莫名其妙的 400，不如当场说清楚（审查发现）
+    let Some(raw_len) = header_value(headers, "content-length") else {
         return Ok(Vec::new());
     };
+    let len = raw_len.trim().parse::<usize>().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Content-Length 不是数字：{raw_len}"),
+        )
+    })?;
     if len == 0 {
         return Ok(Vec::new());
     }
@@ -1379,17 +1390,30 @@ fn read_chunked(client: &mut TcpStream) -> std::io::Result<Vec<u8>> {
             break;
         }
         let size_text = String::from_utf8_lossy(&line);
+        // 解析不了就报错：以前 unwrap_or(0) 会把它当成结束块，请求体被静默截断（审查发现）
         let size = usize::from_str_radix(
             size_text.trim().split(';').next().unwrap_or("0").trim(),
             16,
         )
-        .unwrap_or(0);
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("分块长度不是十六进制：{}", size_text.trim()),
+            )
+        })?;
         if size == 0 {
             // 结束块之后只有一个空行（trailer 不转发了）。
             out.extend_from_slice(&read_crlf_line(client)?);
             break;
         }
-        if out.len() + size + 2 > MAX_BODY_BYTES {
+        // 长度来自客户端：加法溢出在上限判断之前就会 panic（debug 构建）
+        let needed = size
+            .checked_add(2)
+            .and_then(|chunk_len| out.len().checked_add(chunk_len))
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "分块长度溢出")
+            })?;
+        if needed > MAX_BODY_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("分块请求体超过 {MAX_BODY_BYTES} 上限"),

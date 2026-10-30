@@ -37,7 +37,7 @@
 ```powershell
 npm run cargo:proxy               # 另开终端保持运行（127.0.0.1:8787），cargo 必需
 npx tsc --noEmit                  # 前端类型检查（仓库根）
-cd src-tauri; cargo test --lib     # 后端单测（当前 172 passed / 17 ignored；ignore 里是联网与本机引擎相关用例）
+cd src-tauri; cargo test --lib     # 后端单测（当前 175 passed / 18 ignored；ignore 里是联网与本机引擎相关用例）
 npm test                           # 前端类型检查 + 后端单测（test:web + test:rs）
 npm run test:smoke                 # 参数表单渲染冒烟测试（需 esbuild，受限沙箱要提权）
 npm run tauri build               # 打包；沙箱内需要提权

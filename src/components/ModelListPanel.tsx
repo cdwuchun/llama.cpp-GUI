@@ -133,7 +133,8 @@ const ModelCard = memo(function ModelCard({
   // 段落里关掉了自带 WebUI 的模型没有界面，按钮给禁用态
   // 不在这里扫整份 presets.ini：父组件用 webuiDisabledSections 一次算成集合，
   // 每张卡只做一次 Set.has（原来每张卡每次渲染都要 split 全文重扫一遍）
-  // 待启停期间直接给「加载中 / 卸载中」，和 Strata 卡片一致（用户 m04854：停下来的过程叫「卸载中」）。
+  // 待启停期间直接给「加载中 / 卸载中」，判据与 Strata 卡片的「停止中」是同一套（用户 m04854
+  // 当时叫「卸载中」，Strata 侧后来改成「停止中」——那边连引擎一起停，这边只卸模型）。
   // 判据是「这件事还没落地」：加载等前门报 loaded，卸载等前门报 unloaded。中间态也算进行中——前门把
   // stopping 也报成 loading，只认 loaded 的话卸载途中会掉回 statusOf，显示成「加载中」（用户 m05592）。
   // 一旦状态落地就以前门状态为准：`modelPending` 是前端乐观标记，它的收尾可能比状态轮询晚——提示都
@@ -598,6 +599,9 @@ export function ModelListPanel() {
                 <option value="all">全部模型</option>
                 <option value="loaded">运行中</option>
                 <option value="favourite">收藏</option>
+                {/* 以前只存不显示：localStorage 里记着 missing 时下拉没有对应项，
+                    select 显示「全部模型」但列表其实还在按「未建配置」筛（审查发现） */}
+                <option value="missing">未建配置</option>
               </>
             )}
           </select>

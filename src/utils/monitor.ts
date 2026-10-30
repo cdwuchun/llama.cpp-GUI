@@ -128,7 +128,9 @@ export function normalizeSlots(value: unknown): SlotView[] {
         outputTokens,
         cacheTokens: past !== null && promptTokens !== null ? Math.max(0, past - promptTokens) : null,
         speed: pick(["predicted_per_second", "decode_tok_s"]),
-        elapsedMs: pick(["elapsed_ms", "t_start"]),
+        // 只认 elapsed_ms：`t_start` 是「开始时刻」的绝对时间戳，当耗时用会显示成
+        // 上百亿毫秒（审查发现）。llama.cpp 的 `/slots` 实测两个字段都不报。
+        elapsedMs: pick(["elapsed_ms"]),
       };
     });
 }

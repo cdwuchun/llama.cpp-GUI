@@ -323,12 +323,31 @@ pub fn force_kill_tree(pid: u32, child: &mut std::process::Child) {
     }
 }
 
-/// 日志里给 `--api-key` 打码：启动参数会整条推送到前端日志页，明文密钥不该进去。
+/// 日志里给密钥参数打码：启动参数会整条推送到前端日志页，明文密钥不该进去。
+///
+/// 认三种形态：`--api-key VALUE`（两段）、`--api-key=VALUE` / `--api_key=VALUE`
+/// （单段），以及任何以 `sk-` 开头的 token 兜底（审查发现：原来只认两段式，
+/// 写成等号形式时明文密钥会进日志页与 `gui-*.log`）。
 pub(crate) fn redact_args(args: &[String]) -> Vec<String> {
     let mut out = args.to_vec();
-    if let Some(pos) = out.iter().position(|a| a == "--api-key") {
-        if pos + 1 < out.len() {
-            out[pos + 1] = "***".to_string();
+    for index in 0..out.len() {
+        let lower = out[index].to_ascii_lowercase();
+        if lower == "--api-key" || lower == "--api_key" {
+            if let Some(next) = out.get_mut(index + 1) {
+                *next = "***".to_string();
+            }
+            continue;
+        }
+        if lower.starts_with("--api-key=") {
+            out[index] = "--api-key=***".to_string();
+            continue;
+        }
+        if lower.starts_with("--api_key=") {
+            out[index] = "--api_key=***".to_string();
+            continue;
+        }
+        if out[index].starts_with("sk-") {
+            out[index] = "***".to_string();
         }
     }
     out

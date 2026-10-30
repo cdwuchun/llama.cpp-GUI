@@ -160,7 +160,25 @@ pub fn load_config(config_dir: &PathBuf) -> SearchConfig {
 
 pub fn save_config(config_dir: &PathBuf, config: &SearchConfig) -> Result<(), String> {
     let text = serde_json::to_string_pretty(config).map_err(|error| format!("序列化配置失败：{error}"))?;
-    fs::write(config_path(config_dir), text).map_err(|error| format!("写 search.json 失败：{error}"))
+    // 与其它 config 一致：先留一份 `.bak`，再写临时文件 + rename 原子替换。
+    // 原来直接 `fs::write`，写一半崩溃/断电就把整份（含各引擎 Key）配置弄丢了。
+    let path = config_path(config_dir);
+    if path.exists() {
+        let backup = path.with_extension("json.bak");
+        fs::copy(&path, &backup).map_err(|error| format!("备份 search.json 失败：{error}"))?;
+    }
+    let tmp = config_dir.join(format!("search-{}.tmp", unique_stamp()));
+    fs::write(&tmp, text).map_err(|error| format!("写 search.json 临时文件失败：{error}"))?;
+    fs::rename(&tmp, &path).map_err(|error| {
+        let _ = fs::remove_file(&tmp);
+        format!("替换 search.json 失败：{error}")
+    })?;
+    // 用户保存配置多半是换了 Key 或充值后重试，不该继续被旧的配额冷却锁着
+    //（审查发现：365 天的冷却以前只能重启程序才解）
+    if let Ok(mut guard) = cooldowns().lock() {
+        guard.clear();
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- 结果与失败分类
@@ -358,6 +376,7 @@ fn http_post_json(url: &str, headers: &[(&str, String)], body: &Value) -> Result
     let stamp = unique_stamp();
     let body_path = dir.join(format!("llamacpp-search-{stamp}.json"));
     let out_path = dir.join(format!("llamacpp-search-{stamp}.out"));
+    let cfg_path = dir.join(format!("llamacpp-search-{stamp}.cfg"));
 
     let payload = serde_json::to_vec(body)
         .map_err(|error| Fail::new(FailureClass::Unknown, format!("拼请求体失败：{error}")))?;
@@ -377,14 +396,20 @@ fn http_post_json(url: &str, headers: &[(&str, String)], body: &Value) -> Result
         "4000000",
         "-X",
         "POST",
-        "-H",
-        "content-type: application/json",
-        "-H",
-        "accept: application/json",
     ]);
+    // 请求头（尤其 x-api-key / authorization）走 `--config` 临时文件：Windows 上任何
+    // 同用户进程都能从命令行读到 `curl.exe -H x-api-key: sk-...`，密钥不能出现在那里。
+    // curl 8.x 实测支持 `header = "name: value"` 这种 config 行。
+    let mut cfg_text = String::from("header = \"content-type: application/json\"\n");
+    cfg_text.push_str("header = \"accept: application/json\"\n");
     for (name, value) in headers {
-        command.arg("-H").arg(format!("{name}: {value}"));
+        let name = name.replace(['"', '\\'], "");
+        let value = value.replace('\\', "\\\\").replace('"', "\\\"");
+        cfg_text.push_str(&format!("header = \"{name}: {value}\"\n"));
     }
+    fs::write(&cfg_path, cfg_text)
+        .map_err(|error| Fail::new(FailureClass::Transient, format!("写临时文件失败：{error}")))?;
+    command.arg("--config").arg(&cfg_path);
     command
         .arg("--data-binary")
         .arg(format!("@{}", body_path.display()))
@@ -396,6 +421,8 @@ fn http_post_json(url: &str, headers: &[(&str, String)], body: &Value) -> Result
 
     let output = command.output();
     let _ = fs::remove_file(&body_path);
+    // cfg 里有密钥，curl 退出后立刻删，别留在 %TEMP% 里
+    let _ = fs::remove_file(&cfg_path);
     let output = match output {
         Ok(output) => output,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1593,6 +1620,13 @@ struct OwnPage {
 /// 自己用 `curl` 抓 + 本地洗正文。
 fn fetch_own(target: &str) -> Result<OwnPage, Fail> {
     let reply = http_get(target)?;
+    // 重定向可能从公网跳到内网：内容不能再交给模型
+    if !is_public_url(&reply.final_url) {
+        return Err(Fail::new(
+            FailureClass::Unknown,
+            "页面重定向到了本机/内网地址，已拒绝",
+        ));
+    }
     if reply.status >= 400 {
         return Err(Fail::from_status(reply.status, "", "网页"));
     }
@@ -1697,6 +1731,52 @@ fn should_fallback(page: Option<&OwnPage>) -> bool {
     page.map_or(true, |own| own.text.chars().count() < FETCH_MIN_USEFUL)
 }
 
+/// 只放行公网地址：本机、私有网段、链路本地（含云元数据 169.254.169.254）一律不抓。
+///
+/// web_fetch 的 URL 可能来自模型输出或被注入的页面内容，后端替它 GET 本机端口就是
+/// SSRF（审查发现：原来只校验 scheme）。这里只判字面量 IP —— 域名解析交给 curl，
+/// 解析到内网的重绑定不在这层防。
+fn is_public_url(url: &str) -> bool {
+    let host = host_of(url)
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    if host == "localhost" || host.ends_with(".localhost") {
+        return false;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => !is_private_ip(ip),
+        Err(_) => true,
+    }
+}
+
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.octets()[0] == 0
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
+            // ::ffff:a.b.c.d 是 IPv4 映射地址，按 V4 规则再判一次
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_ip(std::net::IpAddr::V4(v4));
+            }
+            let seg = v6.segments();
+            (seg[0] & 0xfe00) == 0xfc00 || (seg[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
 fn fetch_page_inner(
     config: &SearchConfig,
     url: &str,
@@ -1706,6 +1786,12 @@ fn fetch_page_inner(
     let lower = target.to_lowercase();
     if !(lower.starts_with("http://") || lower.starts_with("https://")) {
         return Err(Fail::new(FailureClass::Unknown, "只支持 http/https 链接"));
+    }
+    if !is_public_url(target) {
+        return Err(Fail::new(
+            FailureClass::Unknown,
+            "只抓公网页面：本机、内网与链路本地地址不抓",
+        ));
     }
     let max = max_chars.unwrap_or(FETCH_MAX).clamp(1_000, FETCH_MAX);
 

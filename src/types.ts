@@ -1016,9 +1016,27 @@ export interface MonitorSnapshot {
   history: MonitorHistory;
 }
 
+/** llama.cpp `/metrics`（Prometheus 文本）经后端 `parse_prometheus` 归一后的字段，键名见
+ *  `src-tauri/src/monitor.rs`；Strata 的 `/metrics` 是另一套 JSON（live / history / requests /
+ *  totals），靠索引签名兜住。收窄成这个接口，字段名拼错时 tsc 才报（以前是 `unknown`，全页断言）。 */
+export interface EngineMetrics {
+  requestsProcessing?: number;
+  requestsDeferred?: number;
+  tokensPredicted?: number;
+  tokensPredictedSeconds?: number;
+  promptTokens?: number;
+  promptSeconds?: number;
+  kvCacheTokens?: number | null;
+  kvCacheUsage?: number | null;
+  /** 引擎自报的实时吞吐（gauge，空闲时归 0）：解码 / 预填充。 */
+  predictedTokS?: number | null;
+  promptTokS?: number | null;
+  [key: string]: unknown;
+}
+
 /** `/metrics` 与 `/slots` 的原始 JSON（结构随引擎版本变化，前端按需取）。 */
 export interface MonitorEngine {
-  metrics: unknown;
+  metrics: EngineMetrics | null;
   slots: unknown;
   error: string | null;
 }

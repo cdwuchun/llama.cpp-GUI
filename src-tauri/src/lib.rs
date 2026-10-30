@@ -316,11 +316,20 @@ async fn strata_engines(
     if let Some(wanted) = wanted {
         let exe = wanted.exe.to_string_lossy().to_string();
         if saved.as_deref() != Some(exe.as_str()) {
-            state.settings.patch(SettingsPatch {
+            // 落盘失败只影响「下次启动还记不记得这个引擎」：记系统日志，不打断扫描
+            if let Err(err) = state.settings.patch_checked(SettingsPatch {
                 strata_engine: Some(Some(exe.clone())),
                 ..Default::default()
-            });
-            let _ = strata::apply_engine(&root_path, &exe);
+            }) {
+                state.logs.push("system", format!("[gui] 设置没能保存：{err}"));
+            }
+            // 自动切引擎失败不能让设置与 config 悄悄脱节（以前 `let _ =` 吞掉）：记一条系统日志
+            if let Err(err) = strata::apply_engine(&root_path, &exe) {
+                state.logs.push(
+                    "system",
+                    format!("[gui] 切换 Strata 引擎失败（设置已指向 {}）：{err}", wanted.exe.display()),
+                );
+            }
             state.store_strata_scan(
                 &root_path,
                 &strata::scan_configs(&root_path, Some(&wanted.exe)),
@@ -391,20 +400,24 @@ async fn strata_controllers(
         if saved.as_deref() != Some(newest.version.as_str()) {
             // 写文件失败不该让整张表显示不出来：记下选择，错误交给 apply 的调用方（用户手点）去暴露。
             let _ = strata::apply_controller(&root, &newest.version);
-            state.settings.patch(SettingsPatch {
+            if let Err(err) = state.settings.patch_checked(SettingsPatch {
                 strata_controller: Some(Some(newest.version.clone())),
                 ..Default::default()
-            });
+            }) {
+                state.logs.push("system", format!("[gui] 控制器选择没能保存：{err}"));
+            }
             strata::configure_controller(Some(newest.version.clone()));
             let preferred = strata::preferred_engine(state.settings.get().strata_engine.as_deref());
             state.store_strata_scan(&root, &strata::scan_configs(&root, preferred.as_deref()));
         }
     } else if auto && saved.is_some() && !saved_alive {
         // 自动模式下记的版本已经不在了、又没有能用的可用版本：清掉失效的选择，别让前端勾一个不存在的版本。
-        state.settings.patch(SettingsPatch {
+        if let Err(err) = state.settings.patch_checked(SettingsPatch {
             strata_controller: Some(None),
             ..Default::default()
-        });
+        }) {
+            state.logs.push("system", format!("[gui] 清除失效的控制器选择失败：{err}"));
+        }
         strata::configure_controller(None);
     }
     Ok(list)
@@ -425,10 +438,11 @@ async fn strata_apply_controller(
         .ok_or_else(|| "尚未指定 Strata 目录（设置 → 通用 → Strata 目录）".to_string())?;
     let result = strata::apply_controller(&root, &version)?;
     let chosen = result.version.clone();
-    state.settings.patch(SettingsPatch {
+    // 记住选择是这次操作的收尾：没存住就如实报错（run-*.bat 已经改过了，用户需要知道重启后会回到旧选择）
+    state.settings.patch_checked(SettingsPatch {
         strata_controller: Some(Some(chosen.clone())),
         ..Default::default()
-    });
+    })?;
     strata::configure_controller(Some(chosen));
     // 各 config 的 cwd 已经变了，扫描缓存必须重来
     let preferred = strata::preferred_engine(state.settings.get().strata_engine.as_deref());
@@ -1580,7 +1594,12 @@ fn sync_model_configs(
             match model_config::move_to_orphan(dir, &item.id) {
                 Ok(Some(_)) => removed.push(item.id),
                 Ok(None) => {}
-                Err(err) => eprintln!("[config] 归档 {} 失败: {err:#}", item.id),
+                // 归档失败就**留着**：以前这里既没进 kept 也没进 removed，内存里当它没了、
+                // 磁盘上还在，下一轮扫描又读回来再失败一次（审查发现）
+                Err(err) => {
+                    eprintln!("[config] 归档 {} 失败: {err:#}", item.id);
+                    kept.push(item);
+                }
             }
         }
         items = kept;

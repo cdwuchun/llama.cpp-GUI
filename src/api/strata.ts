@@ -11,6 +11,9 @@ export function strataBase(port: number): string {
   return `http://127.0.0.1:${port}`;
 }
 
+/** `/settings` 两个小请求的兜底超时（生图不设：那本来就慢） */
+const SETTINGS_TIMEOUT_MS = 15_000;
+
 function errorText(body: string, status: number): string {
   try {
     const parsed = JSON.parse(body) as { error?: { message?: string } };
@@ -22,7 +25,11 @@ function errorText(body: string, status: number): string {
 
 /** 服务端当前是否把这份默认值共享给其它客户端 */
 export async function readSharedSampling(port: number, signal?: AbortSignal): Promise<boolean> {
-  const res = await fetch(`${strataBase(port)}/settings`, { signal, headers: { accept: "application/json" } });
+  // 调用方没传 signal 时给个兜底：引擎卡死（显存耗尽）时这几个小请求会一直挂着（审查发现）
+  const res = await fetch(`${strataBase(port)}/settings`, {
+    signal: signal ?? AbortSignal.timeout(SETTINGS_TIMEOUT_MS),
+    headers: { accept: "application/json" },
+  });
   if (!res.ok) throw new Error(errorText(await res.text(), res.status));
   const body = (await res.json()) as { shared?: boolean };
   return body.shared === true;
@@ -36,7 +43,7 @@ export async function saveSharedSampling(
 ): Promise<boolean> {
   const res = await fetch(`${strataBase(port)}/settings`, {
     method: "POST",
-    signal,
+    signal: signal ?? AbortSignal.timeout(SETTINGS_TIMEOUT_MS),
     headers: { "content-type": "application/json", accept: "application/json" },
     body: JSON.stringify({ defaults }),
   });

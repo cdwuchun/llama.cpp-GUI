@@ -1118,6 +1118,9 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
                               min={CONTEXT_MIN}
                               max={CONTEXT_MAX}
                               value={selection.context}
+                              // 固定上下文的模型不接受别的值：这里直接禁掉，别让用户改完
+                              // 到提交时才发现被拒（审查发现）
+                              disabled={Boolean(selected.fixedContext)}
                               onChange={(e) => updateSelection({ context: Number(e.target.value) || CONTEXT_MIN })}
                             />
                           </label>
@@ -1758,11 +1761,9 @@ function CommunityPane({
                 const entry = model.quantInfo[name];
                 const rowRam = entry?.ramGb ?? 0;
                 const fit = fitOf(rowRam, budgetGB, null);
-                const rowEstimate = estimatePerformance(
-                  setupFamilyOf(model.family) ? model.family : "qwen",
-                  name,
-                  hardware,
-                );
+                // 传真实 family：兜底成 "qwen" 会在这里显示一排速度、而底部汇总按「无实测数据」处理，
+                // 两处自相矛盾（审查发现）。未知 family 由 estimatePerformance 返回 none，行内显示「—」
+                const rowEstimate = estimatePerformance(model.family, name, hardware);
                 const rowSpeed = formatRange(rowEstimate.decode, rowEstimate.bound);
                 const rowFirst = formatRange(rowEstimate.ttft4k);
                 return (
@@ -1923,7 +1924,7 @@ function CommunityPane({
           ) : (
             <>
               <span>
-                已选择 {model.name} · {quant || "—"} · 32K
+                已选择 {model.name} · {quant || "—"} · {formatContextTokens(context)}
               </span>
               <button
                 type="button"

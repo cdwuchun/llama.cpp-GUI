@@ -174,32 +174,29 @@ export function ScenarioBenchPanel() {
   const compareRows =
     selected && compareReport ? compareScenarioReports(selected, compareReport) : [];
 
-  /** 逐次请求点图：按顺序摊平，带上场景名 */
+  /** 逐次请求点图：按顺序摊平，带上场景名（预热样本不计；先滤一次，别在 map 里反复 filter） */
+  const liveSamples = useMemo(() => samples.filter((s) => !s.warmup), [samples]);
   const points = useMemo(
     () =>
-      samples
-        .filter((s) => !s.warmup)
-        .map((s, index) => ({
-          order: index + 1,
-          label: sampleLabel(s),
-          value: s.decodeTokS,
-          failed: s.state !== "completed",
-          current: index === samples.filter((x) => !x.warmup).length - 1,
-        })),
-    [samples],
+      liveSamples.map((s, index) => ({
+        order: index + 1,
+        label: sampleLabel(s),
+        value: s.decodeTokS,
+        failed: s.state !== "completed",
+        current: index === liveSamples.length - 1,
+      })),
+    [liveSamples],
   );
   const ttftPoints = useMemo(
     () =>
-      samples
-        .filter((s) => !s.warmup)
-        .map((s, index) => ({
-          order: index + 1,
-          label: sampleLabel(s),
-          value: s.ttftMs,
-          failed: s.state !== "completed",
-          current: false,
-        })),
-    [samples],
+      liveSamples.map((s, index) => ({
+        order: index + 1,
+        label: sampleLabel(s),
+        value: s.ttftMs,
+        failed: s.state !== "completed",
+        current: false,
+      })),
+    [liveSamples],
   );
 
   const toggleScenario = (id: ScenarioId): void => {
@@ -537,7 +534,8 @@ export function ScenarioBenchPanel() {
                 <button
                   type="button"
                   className="st-input bench-picker__button"
-                  title="这个模型的场景测试记录"
+                  title={bench.running ? "正在测试，结束后才能切换记录" : "这个模型的场景测试记录"}
+                  disabled={bench.running}
                   onClick={() => setHistoryOpen((open) => !open)}
                 >
                   <span className="bench-picker__name">

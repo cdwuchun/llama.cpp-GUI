@@ -514,6 +514,12 @@ pub fn allocate_port(config_dir: &Path, port_base: u16) -> u16 {
         }
         port += 1;
     }
+    // 200 个都不空：至少别再静默。返回 port_base 可能与声明了它的配置撞端口，
+    // 但调用方还会被 bind 失败挡一次（审查发现）
+    eprintln!(
+        "[config] {port_base}～{} 这段没有空闲端口，回退 {port_base}",
+        port_base.saturating_add(200)
+    );
     port_base
 }
 

@@ -1616,3 +1616,35 @@ build139：`10,418,688 B / 2026-10-20 14:00:30 / A5880DB0D7B86CB7`，备份 `lla
 验证：`npx tsc --noEmit` 无输出（exit 0）。后端未动，未重跑 `cargo test`。
 
 build140：`10,417,664 B / 2026-10-20 17:59:19 / 47325BE3AC265880`，备份 `llamacpp-gui.exe.bak-before-modelcards`（上版 build139 `10,418,688 B`）。
+
+## 压测期间监控页速度/最近请求为空 + Strata「停止」连引擎一起收（用户 m00001 / m00279 / m00373，0.3.4，未打包）
+
+现象（用户 m00001，m00279 补充场景）：性能测试 → **上下文压测**跑起来后，监控页「解码速度」「预填充速度」两张卡都没有数，「最近请求」表只有空态文案。
+
+根因三条：
+- 速度卡只认 `lastTurn`（`utils/telemetry.ts::buildLiveMetric`）。压测走 `store.runContextBench` → `api/chat.ts::streamChat`，结果只写 `contextBench.samples` 与历史，**从不写 `lastTurn` / `recentTurns`**。而 llama.cpp 的 `/metrics` 早就把实时速度作为 gauge 报出来（`llamacpp:predicted_tokens_seconds` / `llamacpp:prompt_tokens_seconds`，HELP 写明 "tokens/s"），后端 `monitor.rs::parse_prometheus` 却**没有解析这两个字段**，前端没有引擎侧数值可回落。
+- 「最近请求」表只由 `sendChat` 收尾写入，压测请求根本不进表；空态文案还只写「还没有请求」，看不出「这里只记本应用发出的请求」。
+- `refreshMonitor` 的 `tokS` 门控只看 `chat.streaming`，压测期间每秒推 `null`，折线断掉。
+
+修法（`src-tauri/src/monitor.rs`、`src/store.ts`、`src/components/MonitoringPage.tsx`）：
+- `parse_prometheus` 新增 `predictedTokS` / `promptTokS`；单测 `prometheus_metrics_are_parsed` 追加两行样例并断言 `19.6849` / `70.6986`。
+- 速度卡回落顺序改为「引擎 gauge（>0 才用）→ 本地 `lastTurn`」：`rawLive?.tok_s ?? enginePredictedTokS ?? live?.decodeTokS`，输入处理同理；`cards` 的 useMemo 依赖补 `metrics`。
+- `runContextBench` 每条样本写一行 `RecentTurn`（复用 `RECENT_TURN_LIMIT`、顺带更新 `lastTurn`）；`refreshMonitor` 的 `tokS` 门控带上 `contextBench.running` / `scenarioBench.running`。
+- 空态文案区分通道：llama.cpp 侧说清「只记本应用聊天页与压测；自带 WebUI / 其它客户端不进来，速度看上方的卡」。
+
+Strata 侧（用户 m00373：「strata模型卸载后引擎还在，不像 llama.cpp 模型卸载后引擎也卸了」）：`stopStrataModel` 原来只 `POST /unload`，进程留着。改成 `/unload` 之后再对 `running && !external` 的实例调 `strata_stop` 收进程树；外部启动的实例不动（`lib.rs::strata_stop` 在槽位为空时报「不是由本 GUI 启动的，请在它自己的控制台里停止」）。`startModel` 的**自动显存互斥**保持只 `/unload` —— 那是系统替用户腾地方，不能顺手关掉用户正开着的 WebUI，注释已钉住。卡片文案与 tooltip 改「停止（卸载后引擎一并退出）」，`HANDOVER.md` §2.11 原「按钮管模型不管进程」条目按此改写。
+
+验证：`npx tsc --noEmit` 无输出；`cd src-tauri; cargo test --lib` **173 passed / 18 ignored**（与 0.3.3 基线一致）。用户明确要求**不打安装包**，所以本轮只到源码 + 文档，没有 build 号。版本升 0.3.4（`package.json` / `Cargo.toml` / `tauri.conf.json` / `Cargo.lock` / `README.md` / `HANDOVER.md` / `ENGINE-INSTALL-AND-UPGRADE.md`）。
+
+## 0.3.4 审查后的修补（用户 m00585「对当前版本的代码进行审查」）
+
+自查 + 独立复核跑出来、这次一并修掉的：
+
+- `runContextBench` 的 `decodeMs` 写成 `result.wallMs - (result.firstTokenMs ?? result.wallMs)`：没有 TTFT 时差值为 0、被 `Math.max(1, …)` 压成 1ms，兜底速度变成 `completion × 1000`。改成 `?? 0`。同时失败/中止的样本行不再带尝试中残留的数据 —— attempt0 成功、attempt1 抛错时 `result` 仍是第一次的值，原样写进「最近请求」会出现「标着失败却 tokens 与速度齐全」的行，和 `sendChat` 的失败行口径不一致。
+- `runScenarioBench` 每条样本也写 `lastTurn`（不写 `recentTurns`，免得几十条样本把 12 行的表冲空）；`prefillTokS` 折线补上与 `tokS` 相同的门控（原先空闲期每秒重复推最近值，折线走成一条假水平线）。
+- `stopStrataModel` 的文案按真实结果分支：外部实例不再谎称「引擎已退出」；`strataStop` 失败的 catch 改成「已卸载模型，但引擎没有停下来」（原来一律说成「引擎是外部启动的」，而外部实例在上一行就被 `!external` 挡掉了）。引擎状态取卸载后的最新快照，不再用 await 前的快照判断。
+- `MonitorEngine.metrics` 从 `unknown` 收窄成 `EngineMetrics`（带索引签名），`predictedTokS` 之类的键名拼错 tsc 会报；`monitor.rs` 补两条单测钉住前端回落依赖的两个契约：空闲时 gauge 为 `0` 要读出 `Some(0.0)`、键缺失要读出 `null`。
+- 监控页的通道判定改用 `channel` prop（`App.tsx` 由 `strataEntries` 匹配推出），不再从 `metrics.requests` 反推：引擎指标拿不到时（`metrics` 为 null）原先会掉回 llama.cpp 分支，Strata 页显示成 llama.cpp 的专属空态文案。
+- 顺手：`MonitoringPage.tsx` 里多余的 `as Record<string, unknown>` 断言与错位缩进、`StrataPanel.tsx` / `ModelListPanel.tsx` 里仍叫「卸载中」的注释。
+
+验证：`npx tsc --noEmit` 无输出；`cd src-tauri; cargo test --lib` **175 passed / 18 ignored**（比上一轮多 2 条新单测）。仍未打包。

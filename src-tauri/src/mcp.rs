@@ -25,7 +25,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -166,8 +166,10 @@ impl Proc {
     }
 }
 
-fn manager() -> &'static Mutex<HashMap<String, Proc>> {
-    static MANAGER: OnceLock<Mutex<HashMap<String, Proc>>> = OnceLock::new();
+/// 进程表：每台服务器一把自己的锁。表锁只在取/放槽位时短暂持有 —— `tools/list`、
+/// `tools/call` 这类要等服务器回包的 RPC 不能压着表锁（审查发现：以前一把全局锁跨 RPC）。
+fn manager() -> &'static Mutex<HashMap<String, Arc<Mutex<Proc>>>> {
+    static MANAGER: OnceLock<Mutex<HashMap<String, Arc<Mutex<Proc>>>>> = OnceLock::new();
     MANAGER.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -427,25 +429,31 @@ fn call_tool(proc: &mut Proc, tool: &str, arguments: &Value) -> Result<String, S
 }
 
 /// 取一台服务器的进程：没有就启动；有但已经退出就重建（服务器崩过一次不该让工具永久失效）。
-fn ensure_proc<'a>(
-    map: &'a mut HashMap<String, Proc>,
+///
+/// 返回的是槽位本身（`Arc<Mutex<Proc>>`），调用方拿表锁只到这一步，之后的 RPC 在
+/// 自己的锁里做。
+fn ensure_proc(
+    map: &mut HashMap<String, Arc<Mutex<Proc>>>,
     server: &McpServer,
-) -> Result<&'a mut Proc, String> {
-    let dead = map
-        .get_mut(server.name.as_str())
-        .map(|proc| !proc.alive())
-        .unwrap_or(false);
+) -> Result<Arc<Mutex<Proc>>, String> {
+    let dead = match map.get(server.name.as_str()) {
+        Some(slot) => slot.lock().map(|mut proc| !proc.alive()).unwrap_or(true),
+        None => false,
+    };
     if dead {
-        if let Some(mut dead_proc) = map.remove(server.name.as_str()) {
-            dead_proc.kill();
+        if let Some(dead_slot) = map.remove(server.name.as_str()) {
+            if let Ok(mut proc) = dead_slot.lock() {
+                proc.kill();
+            }
         }
     }
-    if !map.contains_key(server.name.as_str()) {
-        let proc = start(server)?;
-        map.insert(server.name.clone(), proc);
+    if let Some(slot) = map.get(server.name.as_str()) {
+        return Ok(slot.clone());
     }
-    map.get_mut(server.name.as_str())
-        .ok_or_else(|| format!("MCP 服务器「{}」不可用", server.name))
+    let proc = start(server)?;
+    let slot = Arc::new(Mutex::new(proc));
+    map.insert(server.name.clone(), slot.clone());
+    Ok(slot)
 }
 
 // ---------------------------------------------------------------- 工具名
@@ -553,19 +561,34 @@ pub async fn mcp_tools_list(
         let mut view = McpToolsView::default();
         let mut map = manager().lock().map_err(|_| "MCP 进程表被占用".to_string())?;
         for server in config.servers.iter().filter(|server| server.enabled) {
+            let slot = match ensure_proc(&mut map, server) {
+                Ok(slot) => slot,
+                Err(error) => {
+                    view.servers.push(McpServerView {
+                        name: server.name.clone(),
+                        ok: false,
+                        count: 0,
+                        error: Some(error),
+                    });
+                    continue;
+                }
+            };
+            // RPC 要等服务器回包（最长 LIST_TIMEOUT）：表锁放到这里，只压这台自己的锁
+            drop(map);
             let outcome = (|| -> Result<Vec<McpToolView>, String> {
-                let proc = ensure_proc(&mut map, server)?;
+                let mut proc = slot.lock().map_err(|_| "MCP 进程被占用".to_string())?;
                 let cached = proc.tools.clone();
                 if !cached.is_empty() {
                     return Ok(cached);
                 }
-                let mut tools = list_tools(proc)?;
+                let mut tools = list_tools(&mut proc)?;
                 for tool in tools.iter_mut() {
                     tool.server = server.name.clone();
                 }
                 proc.tools = tools.clone();
                 Ok(tools)
             })();
+            map = manager().lock().map_err(|_| "MCP 进程表被占用".to_string())?;
             match outcome {
                 Ok(tools) => {
                     view.servers.push(McpServerView {
@@ -578,8 +601,10 @@ pub async fn mcp_tools_list(
                 }
                 Err(error) => {
                     // 起不来就丢掉进程，下次刷新重新拉
-                    if let Some(mut proc) = map.remove(server.name.as_str()) {
-                        proc.kill();
+                    if let Some(dead_slot) = map.remove(server.name.as_str()) {
+                        if let Ok(mut proc) = dead_slot.lock() {
+                            proc.kill();
+                        }
                     }
                     view.servers.push(McpServerView {
                         name: server.name.clone(),
@@ -591,19 +616,20 @@ pub async fn mcp_tools_list(
             }
         }
         assign_keys(&mut view.tools);
-        drop(map);
         // 缓存进各自进程的工具没有 key（key 在全局编号后才算），这里补回去，避免下次
         // 命中缓存时 key 为空
-        let mut map = manager().lock().map_err(|_| "MCP 进程表被占用".to_string())?;
         for tool in &view.tools {
-            if let Some(proc) = map.get_mut(tool.server.as_str()) {
-                for cached in proc.tools.iter_mut() {
-                    if cached.name == tool.name {
-                        cached.key = tool.key.clone();
+            if let Some(slot) = map.get(tool.server.as_str()) {
+                if let Ok(mut proc) = slot.lock() {
+                    for cached in proc.tools.iter_mut() {
+                        if cached.name == tool.name {
+                            cached.key = tool.key.clone();
+                        }
                     }
                 }
             }
         }
+        drop(map);
         Ok(view)
     })
     .await
@@ -625,9 +651,13 @@ pub async fn mcp_tool_call(
         .find(|item| item.name == server && item.enabled)
         .ok_or_else(|| format!("MCP 服务器「{server}」不存在或已禁用"))?;
     tauri::async_runtime::spawn_blocking(move || {
-        let mut map = manager().lock().map_err(|_| "MCP 进程表被占用".to_string())?;
-        let proc = ensure_proc(&mut map, &found)?;
-        call_tool(proc, &tool, &arguments)
+        let slot = {
+            let mut map = manager().lock().map_err(|_| "MCP 进程表被占用".to_string())?;
+            ensure_proc(&mut map, &found)?
+        };
+        // 只压这台服务器自己的锁：一次 tools/call 可能跑几十秒
+        let mut proc = slot.lock().map_err(|_| "MCP 进程被占用".to_string())?;
+        call_tool(&mut proc, &tool, &arguments)
     })
     .await
     .map_err(|error| format!("MCP 工具调用失败：{error}"))?
@@ -635,11 +665,15 @@ pub async fn mcp_tool_call(
 
 /// 停掉全部服务器进程（保存配置、退出 GUI 时调用）。
 pub fn stop_all() {
-    if let Ok(mut map) = manager().lock() {
-        for proc in map.values_mut() {
+    // 先摘空表再逐个杀：kill 要等进程退出，不该压着表锁
+    let slots: Vec<Arc<Mutex<Proc>>> = match manager().lock() {
+        Ok(mut map) => map.drain().map(|(_, slot)| slot).collect(),
+        Err(_) => return,
+    };
+    for slot in slots {
+        if let Ok(mut proc) = slot.lock() {
             proc.kill();
         }
-        map.clear();
     }
 }
 

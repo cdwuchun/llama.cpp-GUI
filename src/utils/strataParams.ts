@@ -826,6 +826,21 @@ export function validateStrataParams(
     const error = checkStrataParamEnable(key, state, args);
     if (error) return error;
   }
+  // 这两个值直接进 `--serve`，0 或越界会让引擎启动就卡住/报 LOW，表单先前不校验（审查发现）
+  const reserve = state["vram-reserve-mib"];
+  if (reserve?.enabled) {
+    const n = Number(reserve.value.trim());
+    if (!Number.isFinite(n) || n <= 0 || n > 262_144) {
+      return `显存预留必须是 1–262144 之间的整数 MiB（现在是「${reserve.value}」）。填 0 等于把显存全让给专家缓存，引擎会报 LOW 并可能卡住。`;
+    }
+  }
+  const pcie = state["pcie-frac"];
+  if (pcie?.enabled) {
+    const n = Number(pcie.value.trim());
+    if (!Number.isFinite(n) || n <= 0 || n > 1) {
+      return `PCIe 专家比例必须在 0–1 之间（现在是「${pcie.value}」）。`;
+    }
+  }
   // --host-core 只认引擎列的这三个值，手输别的值会让引擎启动失败
   const hostCore = state["host-core"];
   if (hostCore?.enabled) {

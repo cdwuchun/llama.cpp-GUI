@@ -678,10 +678,22 @@ pub fn apply_controller(
         ));
     }
     let configs = configs_dir(root);
+    // 整批回滚用：每份即将被改写的文件先留一份内存快照，任何一步失败就全部恢复。
+    // 以前切一半就返回错误：run-*.bat 已经指向新目录、部分 config 还指着旧的，引擎直接起不来，
+    // 而用户只看到一句错误（审查发现）。
+    let mut backups: Vec<(PathBuf, String)> = Vec::new();
     let mut scripts = Vec::new();
     for name in run_script_names(&configs) {
         let path = configs.join(&name);
-        rewrite_run_script(&path, &dir, &configs).map_err(|err| format!("{name}: {err}"))?;
+        let original = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => return Err(format!("{name}: {err}")),
+        };
+        if let Err(err) = rewrite_run_script(&path, &dir, &configs) {
+            restore_files(&backups);
+            return Err(format!("{name}: {err}"));
+        }
+        backups.push((path, original));
         scripts.push(name);
     }
     let mut changed = Vec::new();
@@ -690,9 +702,20 @@ pub fn apply_controller(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let raw = fs::read_to_string(&path).map_err(|err| format!("读 {name} 失败: {err}"))?;
-        let json: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|err| format!("{name} 不是合法 JSON: {err}"))?;
+        let raw = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                restore_files(&backups);
+                return Err(format!("读 {name} 失败: {err}"));
+            }
+        };
+        let json: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(err) => {
+                restore_files(&backups);
+                return Err(format!("{name} 不是合法 JSON: {err}"));
+            }
+        };
         let target = dir.to_string_lossy().to_string();
         let mut edits: Vec<(String, String)> = Vec::new();
         if let Some(old) = json.get("cwd").and_then(|value| value.as_str()) {
@@ -719,7 +742,11 @@ pub fn apply_controller(
             .iter()
             .map(|(old, next)| (old.as_str(), next.as_str()))
             .collect();
-        rewrite_config_strings(&path, &pairs).map_err(|err| format!("{name}: {err:#}"))?;
+        if let Err(err) = rewrite_config_strings(&path, &pairs) {
+            restore_files(&backups);
+            return Err(format!("{name}: {err:#}"));
+        }
+        backups.push((path, raw));
         changed.push(name);
     }
     Ok(ApplyControllerResult {
@@ -728,6 +755,17 @@ pub fn apply_controller(
         scripts,
         configs: changed,
     })
+}
+
+/// 把 `apply_controller` 已经改过的文件按内存快照写回去。
+///
+/// 回滚本身再失败只记日志 —— 主错误已经往上抛了，这里再抛会把真正的原因盖掉。
+fn restore_files(backups: &[(PathBuf, String)]) {
+    for (path, text) in backups {
+        if let Err(err) = write_text_atomic(path, text) {
+            eprintln!("[strata] 回滚 {} 失败: {err:#}", path.display());
+        }
+    }
 }
 
 /// 打开控制端自带的安装向导（`setup.py --setup`）。
@@ -757,14 +795,16 @@ pub fn open_setup() -> std::result::Result<String, String> {
         use std::os::windows::process::CommandExt;
         // CREATE_NEW_CONSOLE：向导要真终端（问选项、画进度），不能继承本进程隐藏的控制台
         const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        // 路径直接拼进 `cmd /k` 命令串：含引号或 cmd 元字符（% & | ^ < >）会把命令拆坏，
+        // 复用 winfix::cmd_path 的同一套判断（审查发现）
+        let python_arg = crate::winfix::cmd_path(&python)
+            .map_err(|err| format!("打开安装向导失败：{err}"))?;
+        let script_arg = crate::winfix::cmd_path(&script)
+            .map_err(|err| format!("打开安装向导失败：{err}"))?;
         std::process::Command::new("cmd.exe")
             .current_dir(&dir)
             .arg("/k")
-            .arg(format!(
-                "\"{}\" \"{}\" --setup",
-                python.display(),
-                script.display()
-            ))
+            .arg(format!("\"{python_arg}\" \"{script_arg}\" --setup"))
             .creation_flags(CREATE_NEW_CONSOLE)
             .spawn()
             .map_err(|err| format!("打开安装向导失败：{err}"))?;
@@ -921,7 +961,25 @@ fn rewrite_run_script(
     if out == raw {
         return Ok(());
     }
-    fs::write(path, out).map_err(|err| format!("写 {} 失败: {err}", path.display()))
+    // 原子替换 + 备份：原来直接 `fs::write`，写一半失败（磁盘满/被杀毒锁住）脚本就残了，
+    // 模型再也起不来，还没有备份可恢复（审查发现）。
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let backup = path.with_file_name(format!("{name}.bak"));
+    if let Err(err) = fs::copy(path, &backup) {
+        return Err(format!("备份 {} 失败: {err}", backup.display()));
+    }
+    let tmp = path.with_file_name(format!(".{name}.tmp"));
+    if let Err(err) = fs::write(&tmp, &out) {
+        return Err(format!("写临时文件 {} 失败: {err}", tmp.display()));
+    }
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("替换 {} 失败: {err}", path.display()));
+    }
+    Ok(())
 }
 
 /// 一个 `cd` 行指向的路径（带引号取引号内，否则取最后一个空白之后）。
@@ -1195,27 +1253,26 @@ pub fn allocate_port(root: &Path, config_file: &str) -> u16 {
 /// 把 `run-<slug>.bat` 里的 `--port` 改成新值（找不到脚本就跳过）。
 ///
 /// 不改 `--port` 前面的引号与空白格式：只替换数字本身，其余字节原样。
-fn sync_run_script(root: &Path, slug: &str, port: u16) {
+fn sync_run_script(root: &Path, slug: &str, port: u16) -> Result<()> {
     let Some(script) = find_run_script(root, slug) else {
-        return;
+        return Ok(());
     };
-    let Ok(raw) = fs::read_to_string(&script) else {
-        return;
-    };
+    let raw = fs::read_to_string(&script)
+        .with_context(|| format!("读 {} 失败", script.display()))?;
     let Some(pos) = raw.find("--port") else {
-        return;
+        return Ok(());
     };
     // 跳过 `--port` 这六个字节本身：后面只允许「引号/空白 + 数字」，
     // 否则命中的是 `--port-mib` 这类同前缀参数
     let tail = &raw[pos + 6..];
     let Some(offset) = tail.find(|c: char| c.is_ascii_digit()) else {
-        return;
+        return Ok(());
     };
     if !tail[..offset]
         .chars()
         .all(|c| c == '"' || c == '\'' || c.is_whitespace())
     {
-        return;
+        return Ok(());
     }
     let first = offset;
     let len = tail[first..]
@@ -1228,8 +1285,32 @@ fn sync_run_script(root: &Path, slug: &str, port: u16) {
     next.push_str(&port.to_string());
     next.push_str(&raw[start + len..]);
     if next != raw {
-        let _ = fs::write(&script, next);
+        // 写失败必须报上去：端口改了、脚本没改，下次启动会在 `--port` 校验处
+        // 以「config 里写的端口是…」失败，而用户看到的是启动失败而非写脚本失败（审查发现）。
+        write_text_atomic(&script, &next)
+            .with_context(|| format!("同步 {} 的 --port 失败", script.display()))?;
     }
+    Ok(())
+}
+
+/// 文本文件原子替换 + 固定名 `.bak` 备份：先写同目录临时文件再 rename。
+///
+/// run 脚本被截断时模型会直接起不来，所以这里的写盘不能用裸 `fs::write`
+/// （写一半失败/被杀毒锁住 → 脚本残半，且没有备份可恢复）。
+fn write_text_atomic(path: &Path, text: &str) -> Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let backup = path.with_file_name(format!("{name}.bak"));
+    fs::copy(path, &backup).with_context(|| format!("备份 {} 失败", backup.display()))?;
+    let tmp = path.with_file_name(format!(".{name}.tmp"));
+    fs::write(&tmp, text).with_context(|| format!("写临时文件 {} 失败", tmp.display()))?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err).with_context(|| format!("替换 {} 失败", path.display()));
+    }
+    Ok(())
 }
 
 /// 把端口写进 config 顶层 `port`，并同步 `run-<slug>.bat` 的 `--port`（用户 m05322）。
@@ -1239,25 +1320,25 @@ fn sync_run_script(root: &Path, slug: &str, port: u16) {
 /// 先备份固定名 `.json.bak`、原子替换、JSON 合法性自检。
 pub fn set_port(root: &Path, config_file: &str, port: u16) -> Result<()> {
     let path = configs_dir(root).join(config_file);
-    let raw = fs::read_to_string(&path).with_context(|| format!("读不到 {}", path.display()))?;
-    let next = match replace_json_port(&raw, port) {
-        Some(text) => text,
-        // 没有 `"port"` 键：插到对象开头。单行 config 补一个换行+两空格，
-        // 已经是多行格式的（`{` 后紧跟换行）就不再加空行。
-        None => match raw.strip_prefix('{') {
-            Some(rest) => {
-                let sep = if rest.starts_with('\n') { "" } else { "\n  " };
-                format!("{{\n  \"port\": {port},{sep}{rest}")
-            }
-            None => raw.clone(),
-        },
-    };
-    write_config_raw(&path, &next)?;
+    update_config(&path, |raw| {
+        Ok(match replace_json_port(raw, port) {
+            Some(text) => text,
+            // 没有 `"port"` 键：插到对象开头。单行 config 补一个换行+两空格，
+            // 已经是多行格式的（`{` 后紧跟换行）就不再加空行。
+            None => match raw.strip_prefix('{') {
+                Some(rest) => {
+                    let sep = if rest.starts_with('\n') { "" } else { "\n  " };
+                    format!("{{\n  \"port\": {port},{sep}{rest}")
+                }
+                None => raw.to_string(),
+            },
+        })
+    })?;
     let slug = split_config_path(&path)
         .map(|(_, _, slug)| slug)
         .unwrap_or_default();
     if !slug.is_empty() {
-        sync_run_script(root, &slug, port);
+        sync_run_script(root, &slug, port)?;
     }
     Ok(())
 }
@@ -2362,31 +2443,69 @@ pub fn apply_engine(root: &Path, exe: &str) -> std::result::Result<Vec<String>, 
 pub fn write_config_raw(path: &Path, text: &str) -> Result<()> {
     // 组件引用原样落盘（用户 2026-10-22 的会话：三份 config 统一用 `component:strata-engine`，
     // 由控制器的组件目录决定实际版本）。不再在写盘时展开成绝对路径。
+    validate_config_text(text)?;
+
+    // 校验过了才拿锁：解析失败时连锁都不用碰。
+    // 中毒不走 `let Ok(..) = ...lock() else`（那会静默跳过整段写入），统一 `into_inner()`。
+    let _guard = strata_lock().lock().unwrap_or_else(|e| e.into_inner());
+    write_config_raw_locked(path, text)
+}
+
+/// 上游认的 config 形状：JSON 可解析、顶层有 `exe`、`args` 是数组。
+///
+/// 抽出来是为了让「读-改-写」的调用者能在**同一把锁内**先校验再落盘
+/// （`write_config_raw` 的校验仍在锁外，纯计算不占锁）。
+fn validate_config_text(text: &str) -> Result<()> {
     let value: serde_json::Value =
-        serde_json::from_str(&text).context("JSON 解析失败，已取消写入（未改动原文件）")?;
+        serde_json::from_str(text).context("JSON 解析失败，已取消写入（未改动原文件）")?;
     let obj = value
         .as_object()
         .context("config 顶层必须是 JSON 对象，已取消写入")?;
     if obj.get("exe").and_then(|v| v.as_str()).is_none() {
         anyhow::bail!("config 缺少顶层 exe 字段，已取消写入（上游会跳过这份 config）");
     }
-    if !obj.get("args").and_then(|v| v.as_array()).is_some() {
+    if obj.get("args").and_then(|v| v.as_array()).is_none() {
         anyhow::bail!("config 的 args 必须是数组，已取消写入（上游会跳过这份 config）");
     }
+    Ok(())
+}
 
-    // 校验过了才拿锁：解析失败时连锁都不用碰。
-    // 中毒不走 `let Ok(..) = ...lock() else`（那会静默跳过整段写入），统一 `into_inner()`。
+/// 读-改-写在 `strata_lock()` 内一气呵成。
+///
+/// 审查发现：`set_port` / `set_config_api_key` / `write_config_args` 原来是「锁外读、
+/// 锁内写」，两个写者并发（保存 Key 与保存参数/端口）时后者整份覆盖前者，表现为
+/// 「改的东西自己变回去」。读文本这一步必须和写进同一把锁。
+fn update_config<F>(path: &Path, build: F) -> Result<()>
+where
+    F: FnOnce(&str) -> Result<String>,
+{
     let _guard = strata_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let text = fs::read_to_string(path).with_context(|| format!("读 config 失败: {}", path.display()))?;
+    let next = build(&text)?;
+    validate_config_text(&next)?;
+    write_config_raw_locked(path, &next)
+}
 
+/// 已持锁时的落盘：备份 → 写临时文件 → rename。
+fn write_config_raw_locked(path: &Path, text: &str) -> Result<()> {
     // W3：备份固定一份 `<config>.json.bak`，每次覆盖（用户 m03392：不要堆积带时间戳的多份，
     // 与 `model_config::write_config` / `settings` 的备份策略一致）。
+    //
+    // 备份失败就取消写入：这层备份是「改坏了能回滚」的唯一凭据，静默吞掉等于在磁盘满 /
+    // 文件被占用时直接毁掉原 config（审查发现，原实现是 `let _ = fs::copy(..)`）。
     let backup = path.with_extension("json.bak");
-    let _ = fs::copy(path, &backup);
+    if let Err(err) = fs::copy(path, &backup) {
+        anyhow::bail!("备份 {} 失败，已取消写入: {err}", backup.display());
+    }
 
-    // W4：原子写（临时文件名唯一，见 `temp_config_path`）。
+    // W4：原子写（临时文件名唯一，见 `temp_config_path`）。rename 失败时清掉临时文件，
+    // 别在 config 目录里留半份垃圾。
     let tmp = temp_config_path(path);
     fs::write(&tmp, &text).with_context(|| format!("写入临时文件失败: {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("替换 config 失败: {}", path.display()))?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err).with_context(|| format!("替换 config 失败: {}", path.display()));
+    }
     Ok(())
 }
 
@@ -2503,20 +2622,22 @@ fn scan_json_value(bytes: &[u8], i: usize) -> Option<usize> {
 /// 值写 `null` 而不是删键：删键要处理前后逗号（键序是上游写的，不能重排），
 /// 而 `null` 在上游等价于「没有 key」（`cfg.get("api_key")` 取不到字符串）。
 pub fn set_config_api_key(path: &Path, key: Option<&str>) -> Result<()> {
-    let text = fs::read_to_string(path).with_context(|| format!("读 config 失败: {}", path.display()))?;
     let rendered = match key {
         Some(value) => serde_json::to_string(value).context("编码 API Key 失败")?,
         None => "null".to_string(),
     };
-    let next = match top_level_values(&text).into_iter().find(|(name, ..)| name == "api_key") {
-        Some((_, start, end)) => format!("{}{}{}", &text[..start], rendered, &text[end..]),
-        None => {
-            // 没有这个键：插在开头的 `{` 之后，缩进对齐顶层其它键（1 空格）。
-            let brace = text.find('{').context("config 原文不是 JSON 对象")?;
-            format!("{}\n \"api_key\": {},{}", &text[..=brace], rendered, &text[brace + 1..])
-        }
-    };
-    write_config_raw(path, &next)
+    update_config(path, |text| {
+        Ok(
+            match top_level_values(text).into_iter().find(|(name, ..)| name == "api_key") {
+                Some((_, start, end)) => format!("{}{}{}", &text[..start], rendered, &text[end..]),
+                None => {
+                    // 没有这个键：插在开头的 `{` 之后，缩进对齐顶层其它键（1 空格）。
+                    let brace = text.find('{').context("config 原文不是 JSON 对象")?;
+                    format!("{}\n \"api_key\": {},{}", &text[..=brace], rendered, &text[brace + 1..])
+                }
+            },
+        )
+    })
 }
 
 /// 把 API Key 写进全部 Strata config（`<根>\strata-*.json`），返回（已写, 失败）。
@@ -2551,25 +2672,25 @@ pub fn set_api_key_all(root: &Path, key: Option<&str>) -> (Vec<String>, Vec<Stri
 ///
 /// 只换数组中括号那一段，其余字节原样保留（同 [`top_level_values`] 的理由）。
 pub fn write_config_args(path: &Path, args: &[String]) -> Result<()> {
-    let text = fs::read_to_string(path).with_context(|| format!("读 config 失败: {}", path.display()))?;
-    let (start, end) = top_level_values(&text)
-        .into_iter()
-        .find(|(name, ..)| name == "args")
-        .map(|(_, start, end)| (start, end))
-        .context("config 缺少顶层 args 数组，已取消写入")?;
-    let mut rendered = String::from("[");
-    if args.is_empty() {
-        rendered.push_str("\n ]");
-    } else {
-        for (index, item) in args.iter().enumerate() {
-            // 与上游 `json.dumps(cfg, indent=1)` 一致：数组元素缩进 2 空格、闭合括号 1 空格。
-            rendered.push_str(if index == 0 { "\n  " } else { ",\n  " });
-            rendered.push_str(&serde_json::to_string(item)?);
+    update_config(path, |text| {
+        let (start, end) = top_level_values(text)
+            .into_iter()
+            .find(|(name, ..)| name == "args")
+            .map(|(_, start, end)| (start, end))
+            .context("config 缺少顶层 args 数组，已取消写入")?;
+        let mut rendered = String::from("[");
+        if args.is_empty() {
+            rendered.push_str("\n ]");
+        } else {
+            for (index, item) in args.iter().enumerate() {
+                // 与上游 `json.dumps(cfg, indent=1)` 一致：数组元素缩进 2 空格、闭合括号 1 空格。
+                rendered.push_str(if index == 0 { "\n  " } else { ",\n  " });
+                rendered.push_str(&serde_json::to_string(item)?);
+            }
+            rendered.push_str("\n ]");
         }
-        rendered.push_str("\n ]");
-    }
-    let next = format!("{}{}{}", &text[..start], rendered, &text[end..]);
-    write_config_raw(path, &next)
+        Ok(format!("{}{}{}", &text[..start], rendered, &text[end..]))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2603,7 +2724,7 @@ pub struct StrataEngineState {
 ///
 /// `ok=false` 当成失败往上抛，错误消息原样带出控制端的说法（例如
 /// "there is no previous engine to return to …"），前端直接展示。
-fn run_components(args: &[&str]) -> Result<serde_json::Value> {
+fn run_components(args: &[&str], timeout: Duration) -> Result<serde_json::Value> {
     let root = crate::strata::root()
         .filter(|root| root.is_dir())
         .context("未找到 Strata 目录（设置 → 通用 → Strata 目录 可指定）")?;
@@ -2634,9 +2755,14 @@ fn run_components(args: &[&str]) -> Result<serde_json::Value> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     winfix::hide_console(&mut cmd);
-    let out = cmd
-        .output()
-        .with_context(|| format!("调用 {} 失败", python.display()))?;
+    // 控制端 python 也是外部进程：卡住（缺组件、等待输入）时不能无限期等着把界面拖死（审查发现）
+    let Some(out) = winfix::output_with_timeout(&mut cmd, timeout) else {
+        anyhow::bail!(
+            "strata components {} 超过 {} 秒没有结果，已放弃",
+            args.first().copied().unwrap_or(""),
+            timeout.as_secs()
+        );
+    };
     let stdout = String::from_utf8_lossy(&out.stdout);
     // 控制端会先打几行人读日志；JSON 是最后一行以 `{` 开头的输出。
     let line = stdout
@@ -2671,7 +2797,7 @@ fn run_components(args: &[&str]) -> Result<serde_json::Value> {
 
 /// 读控制器眼里的引擎状态（`strata components engine --output json`）。
 pub fn engine_state() -> Result<StrataEngineState> {
-    let value = run_components(&["engine", "--output", "json"])?;
+    let value = run_components(&["engine", "--output", "json"], Duration::from_secs(120))?;
     let text = |source: Option<&serde_json::Value>, key: &str| {
         source
             .and_then(|item| item.get(key))
@@ -2721,7 +2847,8 @@ fn release_version(root: Option<&str>) -> Option<String> {
 ///
 /// 回退只是把上一版 pin 住、把「当前」挪过去，引擎文件不动；下次成功更新会清掉 pin。
 pub fn rollback_engine() -> Result<String> {
-    let value = run_components(&["rollback", "--output", "json"])?;
+    // 回退要下载 / 解包组件包，给足时间（但仍有上限）
+    let value = run_components(&["rollback", "--output", "json"], Duration::from_secs(900))?;
     // 成功时 CLI 包成 `{ok: true, result: {...}}`（也有版本直接平铺），两种都认。
     let result = value.get("result").unwrap_or(&value);
     let to = result

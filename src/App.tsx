@@ -88,7 +88,7 @@ export default function App() {
 
   // 所有「正在跑」的模型：用户可以同时开好几个（用户 m05740）。
   const loadedModels = routerModels
-    .filter((m) => m.status.value === "loaded")
+    .filter((m) => m.status?.value === "loaded")
     .map((m) => m.id)
     .sort((a, b) => a.localeCompare(b));
   // 状态栏 / 监控页看的是「正在跑的那个模型」，不是聊天里选的那个：
@@ -96,11 +96,16 @@ export default function App() {
   // 同时跑多个时让用户自己切，选中项掉了就退回列表第一个。
   const [monitorModel, setMonitorModel] = useState("");
   const activeModel = loadedModels.includes(monitorModel) ? monitorModel : loadedModels[0] ?? "";
-  const routeState = routerModels.find((m) => m.id === activeModel)?.status.value;
+  const routeState = routerModels.find((m) => m.id === activeModel)?.status?.value;
   const modelState: "loaded" | "loading" | "unloaded" | "unknown" =
     routeState === "loaded" ? "loaded" : routeState === "loading" ? "loading" : activeModel ? "unloaded" : "unknown";
   // 监控页的引擎指标（/metrics、/slots）：只在监控页且模型已加载时轮询。
   // **不能对未加载的模型调 /metrics?model=**，否则前门会把模型拉起来。
+  // 监控页的通道：当前模型是 Strata 条目就直连引擎，否则是 llama.cpp 子实例。
+  // 监控页用它决定「上游有、llama.cpp 没有」的列要不要渲染，不再从引擎指标反推。
+  const monitorChannel = strataEntries.some((item) => item.model_name === activeModel)
+    ? "strata"
+    : "llamacpp";
   const [engine, setEngine] = useState<MonitorEngine | null>(null);
   const [engineError, setEngineError] = useState<string | null>(null);
   /** 引擎指标拿不到但不该报红时的说明（例如实例没开 --metrics）。 */
@@ -125,7 +130,10 @@ export default function App() {
         // Strata 模型直连引擎自己的端口：上游就是这么拿的（用户 m06557）。
         // 直连拿不到时回退走前门 —— Strata 配了 api_key 的话，密钥只在 Rust 侧，
         // 前端拿不到（只有 has_api_key 布尔），直连会 401；前门会替我们加上鉴权头。
-        const strataEntry = strataEntries.find((item) => item.model_name === activeModel) ?? null;
+        // 条目从 store 现取：这个 effect 的依赖里没有 strataEntries（加进去会让 2 秒轮询
+        // 被扫描节奏反复重置），闭包里的旧数组会让「扫描完成后才出现的条目」永远拿不到。
+        const strataEntriesNow = useApp.getState().strataEntries;
+        const strataEntry = strataEntriesNow.find((item) => item.model_name === activeModel) ?? null;
         const proxyPort = strataStatus.proxy_port ?? 9090;
         let next = await monitorEngine(
           strataEntry?.port ?? proxyPort,
@@ -247,7 +255,8 @@ export default function App() {
       else if (command === "stop-service") void store.stopStrataProxy();
     });
     return () => {
-      void pending.then((off) => off());
+      // onTrayCommand 在浏览器里（无 Tauri）会 reject：清理失败不该冒成 unhandled rejection
+      void pending.then((off) => off()).catch(() => undefined);
     };
   }, []);
 
@@ -333,7 +342,9 @@ export default function App() {
     : strataStatus.external
       ? `${strataFootText} · 非本 GUI 启动，无法启/停`
       : strataFootText;
-  const toastText = error ?? notice ?? "";
+  // error 与 notice 可能同时存在（如「已停止模型」+ 一条引擎报错）：两条都要露出来，
+  // 错误排在前面。以前 `error ?? notice` 会把 notice 整条吞掉（审查发现）
+  const toastText = [error, notice].filter((text): text is string => Boolean(text)).join("\n");
   const toastLines = toastText.split("\n");
   const toastTitle = error ? "错误" : toastLines.length > 1 ? toastLines[0] : "";
   const toastMessage = toastTitle && toastLines.length > 1 ? toastLines.slice(1).join("\n") : toastText;
@@ -428,6 +439,7 @@ export default function App() {
           live={liveMetric}
           snapshot={monitor}
           engine={engine}
+          channel={monitorChannel}
           engineError={engineError}
           engineNote={engineNote}
           recentTurns={recentTurns}

@@ -105,6 +105,12 @@ const LOG_LIMIT = 10_000;
  * 填一次就存在浏览器里。每个子实例端口不同、localStorage 各存一份，所以这句提示按需给一次即可。
  */
 let chatKeyHintShown = false;
+
+/**
+ * 监控采集失败只在上报一次同类原因：`refreshMonitor` 每秒一轮，
+ * 采集端点坏掉时会把同一句错误刷进系统日志（审查发现）。
+ */
+let monitorWarned = "";
 function chatKeyHint(apiKey: string | null | undefined): string {
   if (!apiKey?.trim() || chatKeyHintShown) return "";
   chatKeyHintShown = true;
@@ -554,8 +560,8 @@ interface AppStore {
   /** 停止前门代理（引擎进程不动） */
   stopStrataProxy: () => Promise<void>;
   /** 卡片「启动模型」：确保引擎在跑且跑的是这个 config，然后 POST /load */
-  startStrataModel: (configFile?: string | null) => Promise<void>;
-  /** 卡片「停止模型」：POST /unload 卸模型，引擎进程留着 */
+  startStrataModel: (configFile?: string | null) => Promise<boolean>;
+  /** 卡片「停止模型」：POST /unload 卸模型，再把 GUI 起的那份引擎收掉（与 llama.cpp 侧一致） */
   stopStrataModel: (configFile: string) => Promise<void>;
   stopStrata: () => Promise<void>;
   /** 显存互斥（用户 m03160 第 2 点）：卸掉 llama.cpp 侧（前门）已加载的模型，返回被卸的模型名 */
@@ -568,7 +574,7 @@ interface AppStore {
   startStrataPolling: () => void;
   stopStrataPolling: () => void;
 
-  startModel: (id: string) => Promise<void>;
+  startModel: (id: string) => Promise<boolean>;
   stopModel: (id: string) => Promise<void>;
   toggleFavourite: (id: string) => Promise<void>;
   // 返回值 = 是否真的写盘成功。调用方要靠它决定"要不要接着做下一步"
@@ -1237,6 +1243,7 @@ export const useApp = create<AppStore>((set, get) => ({
     const { strataStatus, routerModels } = get();
     if (!strataStatus.proxy) {
       set({ error: "前门未运行，请先在侧栏左下角启动前门" });
+      return false;
     }
     const port = strataStatus.proxy_port ?? 9090;
     const keyHint = chatKeyHint(get().settings?.api_key);
@@ -1247,6 +1254,7 @@ export const useApp = create<AppStore>((set, get) => ({
       !routerModels.some((m) => m.id === id && (m.status?.value ?? "unloaded") === "loaded")
     ) {
       set({ error: `${id} 当前不在运行中，无法打开聊天界面（先在卡片上点「加载」）` });
+      return false;
     }
     const url = id
       ? `http://127.0.0.1:${port}/?model=${encodeURIComponent(id)}`
@@ -1324,6 +1332,9 @@ export const useApp = create<AppStore>((set, get) => ({
         await new Promise((resolve) => setTimeout(resolve, 300));
       }
     }
+    // 失败同样要认序号：这次重试用完 5 次时，可能已有更新的刷新成功并落了表，
+    // 旧请求的失败不该再报一遍错（审查发现）
+    if (seq !== modelsSeq) return;
     if (!modelsFailLogged) {
       modelsFailLogged = true;
       reportFrontendError("error", `读取前门模型列表失败：${errText(lastErr)}`);
@@ -1411,7 +1422,12 @@ export const useApp = create<AppStore>((set, get) => ({
     }
   },
 
-  /** 卸载运行中 Strata 的模型（引擎进程留着，显存释放） */
+  /** 停止运行中的 Strata 模型：先 `/unload` 卸模型，再把 GUI 自己起的引擎收掉。
+   *
+   *  llama.cpp 侧「停止模型」就是前门 `/models/unload` → `scheduler::stop`，子实例进程一起退出；
+   *  Strata 侧原先只 `/unload`、引擎留在端口上，用户看到引擎还在就以为没卸干净（用户 m00373）。
+   *  这里对齐两边：卸完模型顺手停引擎。外部实例（用户自己跑的 run-<model>.bat）不动 ——
+   *  它不归本 GUI 管，`strata_stop` 会点名报错。 */
   async stopStrataModel(configFile) {
     const st = get().strataStatus;
     if (!st.running) {
@@ -1426,7 +1442,29 @@ export const useApp = create<AppStore>((set, get) => ({
     set({ busy: true, error: null, notice: null, strataStopping: configFile });
     try {
       await ipc.strataUnloadModel(configFile);
-      set({ notice: "已卸载 Strata 模型（引擎仍在运行，显存已释放）" });
+      // 卸载后再停引擎：`/unload` 让上游优雅退出、保存 learned expert profile、显存立刻释放，
+      // 然后才杀进程树（顺序与 startStrataModel 的切换分支一致）。
+      // 引擎状态取卸载后的最新快照（卸载期间引擎可能已自行退出；外部实例另算）。
+      let after = get().strataStatus;
+      let engineNote = "";
+      if (after.running && !after.external) {
+        try {
+          after = await ipc.strataStop();
+          set({ strataStatus: after });
+        } catch (err) {
+          // 这里只会接住「本 GUI 起的引擎没停下来」（超时、杀进程失败等）；
+          // 外部实例在上一行的 `!after.external` 就挡掉了，别把两种情况说成同一种。
+          engineNote = `\n已卸载模型，但引擎没有停下来：${errText(err)}`;
+        }
+      }
+      // 文案必须与真实结果一致：外部实例压根没停，不能写「引擎已退出」（用户 m00373）
+      const stopped = !after.running;
+      const notice = stopped
+        ? "已停止 Strata 模型（引擎已退出，显存已释放）"
+        : after.external
+          ? `已卸载 Strata 模型；引擎是外部启动的，仍在 ${after.port ? `:${after.port} ` : ""}运行（在它自己的控制台里停止）`
+          : "已卸载 Strata 模型（引擎仍在运行，显存已释放）";
+      set({ notice: `${notice}${engineNote}` });
       await get().probeStrata();
     } catch (err) {
       set({ error: errText(err) });
@@ -1453,7 +1491,7 @@ export const useApp = create<AppStore>((set, get) => ({
     const file = configFile ?? get().settings?.strata_selected_config ?? null;
     if (!file) {
       set({ error: "请先选择一个 Strata 模型" });
-      return;
+      return false;
     }
     set({ busy: true, error: null, notice: null, strataStarting: file });
     try {
@@ -1499,8 +1537,10 @@ export const useApp = create<AppStore>((set, get) => ({
         notice: `${switching ? `已停止 ${runningName}（同端口互斥）\n` : ""}已加载 Strata 模型\n${name} · :${get().strataStatus.port}${mutexNote}`,
       });
       await get().probeStrata();
+      return true;
     } catch (err) {
       set({ error: errText(err) });
+      return false;
     } finally {
       set({ busy: false, strataStarting: null });
     }
@@ -1549,7 +1589,7 @@ export const useApp = create<AppStore>((set, get) => ({
     // 只卸 llama.cpp 侧占显存的 loaded：strata 那档的 loaded 是引擎自己的状态，
     // 发给前门只会 404（前门只认配置目录里的模型）；sleeping 的显存已释放，loading 中的卸不掉。
     const loaded = routerModels.filter(
-      (m) => m.channel !== "strata" && m.status.value === "loaded",
+      (m) => m.channel !== "strata" && m.status?.value === "loaded",
     );
     if (!loaded.length) return [];
     const port = strataStatus.proxy_port ?? 9090;
@@ -1635,7 +1675,7 @@ export const useApp = create<AppStore>((set, get) => ({
     const { strataStatus } = get();
     if (!strataStatus.proxy) {
       set({ error: "前门未运行，请先在侧栏左下角启动前门" });
-      return;
+      return false;
     }
     // 先给卡片一个立刻的反馈（用户 m03482 第 3 点）：前门的 `/models/load` 要等子实例
     // `/health` 就绪才返回，只靠下面那 1.5 秒的轮询，点下去这一两秒里按钮毫无变化，
@@ -1643,6 +1683,8 @@ export const useApp = create<AppStore>((set, get) => ({
     set({ error: null, modelPending: { id, stop: false } });
     // 显存互斥（用户 m03342 / m03572）：加载模型前先卸掉 Strata 的模型 ——
     // 只卸模型释放显存，引擎进程与 WebUI 留着（卸的是模型，不是停进程）。
+    // 注意与卡片上的「停止」不同：那是用户明说要停，会连引擎一起收（`stopStrataModel`）；
+    // 这里是自动互斥，别把用户可能正在用的 WebUI 停掉。
     // 反方向（先加载 Strata 模型 → 卸 llama.cpp 侧的模型）在 unloadRouterLoaded 里，
     // 两向合起来才是用户 m03160 第 2 点要的「Strata 与 llama.cpp 显存互斥」。
     const st = get().strataStatus;
@@ -1689,8 +1731,10 @@ export const useApp = create<AppStore>((set, get) => ({
         await new Promise((resolve) => setTimeout(resolve, 500));
         await get().refreshRouterModels(false);
       }
+      return true;
     } catch (err) {
       set({ error: errText(err) });
+      return false;
     } finally {
       set({ modelPending: null });
     }
@@ -1902,9 +1946,9 @@ export const useApp = create<AppStore>((set, get) => ({
           const cancelled = controller.signal.aborted;
           const promptTokens = result?.usage.promptTokens ?? null;
           const completion = result?.usage.completionTokens ?? null;
-          const decodeMs = result
-            ? Math.max(1, result.wallMs - (result.firstTokenMs ?? result.wallMs))
-            : 0;
+          // 没有 TTFT（失败，或流式没收到首 token）时按整段墙钟算解码时间。
+          // 旧写法 `?? result.wallMs` 让差值恒为 0、被 clamp 成 1ms，兜底速度会放大 1000 倍。
+          const decodeMs = result ? Math.max(1, result.wallMs - (result.firstTokenMs ?? 0)) : 0;
           // 速度优先用 llama.cpp 自己报的 timings：那是纯计算时间，不含排队、前门转发
           // 与客户端解析；按到达时刻自己估会被这些环节污染（用户 m11542 第 3 点）。
           const timings = result?.timings ?? null;
@@ -1945,6 +1989,45 @@ export const useApp = create<AppStore>((set, get) => ({
             error: failure,
           });
           sync();
+          // 监控页的「最近请求」与速度卡只认 GUI 聊天页的请求（sendChat 收尾里写），
+          // 压测走的是 streamChat，原先一条都不写 —— 于是压测期间监控页整块是空的（用户 m00279）。
+          // 现在每条样本也记一行（场景压测只写 lastTurn，不占这张表）。
+          // 失败/中止的样本不带尝试中残留的数据：attempt0 成功、attempt1 抛错时 `result`
+          // 仍是第一次的值，原样写进去会出现「标着失败却 tokens 齐全」的行。
+          const row: RecentTurn = {
+            id: newId(),
+            model,
+            at: Date.now(),
+            promptTokens: failure ? null : promptTokens,
+            outputTokens: failure ? null : completion,
+            decodeTokS: failure
+              ? null
+              : (timings?.predictedPerSecond ??
+                (completion ? completion / (decodeMs / 1000) : null)),
+            prefillTokS: failure
+              ? null
+              : (timings?.promptPerSecond ??
+                (result?.firstTokenMs && promptTokens
+                  ? promptTokens / (result.firstTokenMs / 1000)
+                  : null)),
+            cacheTokens: failure ? null : (result?.usage.cachedTokens ?? null),
+            elapsedMs: result ? Math.round(result.wallMs) : Date.now() - sampleStart,
+            ok: !failure,
+            error: failure,
+          };
+          set((state) => ({
+            recentTurns: [row, ...state.recentTurns].slice(0, RECENT_TURN_LIMIT),
+            // 速度卡与状态栏读 lastTurn，压测过的条目也要能撑起「最近一次」读数
+            lastTurn: {
+              at: row.at,
+              promptTokens: row.promptTokens,
+              outputTokens: row.outputTokens,
+              decodeTokS: row.decodeTokS,
+              prefillTokS: row.prefillTokS,
+              cacheTokens: row.cacheTokens,
+              elapsedMs: row.elapsedMs,
+            },
+          }));
           if (cancelled) {
             stopReason = "cancelled";
             stop = true;
@@ -2126,6 +2209,19 @@ export const useApp = create<AppStore>((set, get) => ({
                 error: failure,
               };
               samples.push(sample);
+              // 监控页的速度卡与状态栏读 lastTurn：场景压测也撑起「最近一次」读数
+              //（不写 recentTurns —— 那张表只记聊天页与上下文压测，免得几十条样本把它冲空）。
+              set({
+                lastTurn: {
+                  at: sampleStart,
+                  promptTokens: sample.promptTokens,
+                  outputTokens: sample.completionTokens,
+                  decodeTokS: sample.decodeTokS,
+                  prefillTokS: sample.prefillTokS,
+                  cacheTokens: sample.cachedTokens,
+                  elapsedMs: sample.wallMs,
+                },
+              });
               // 多轮对话：把本轮的问答接进去，下一轮才有上下文
               if (scenario === "conversation" && result && !failure) {
                 conversation.push(...messages);
@@ -2635,16 +2731,23 @@ export const useApp = create<AppStore>((set, get) => ({
           },
         }));
         if (target.channel === "strata" && target.strataFile) {
-          await get().startStrataModel(target.strataFile);
+          const ok = await get().startStrataModel(target.strataFile);
+          if (!ok) {
+            patchAssistant((message) => ({
+              ...message,
+              error: get().error ?? `Strata 模型 ${target.name} 启动失败`,
+            }));
+            return;
+          }
         } else {
-          await get().startModel(model);
-        }
-        // startModel / startStrataModel 都以 `error` 报失败（前门没起、引擎起不来等）。
-        // 两者在入口都会先把 error 清空，所以这里读到的必然是本次的失败原因。
-        const failure = get().error;
-        if (failure) {
-          patchAssistant((message) => ({ ...message, error: failure }));
-          return;
+          const ok = await get().startModel(model);
+          if (!ok) {
+            patchAssistant((message) => ({
+              ...message,
+              error: get().error ?? `模型 ${target.name} 启动失败`,
+            }));
+            return;
+          }
         }
       }
       // MCP 工具要现拉：首次打开开关、或刚保存过服务器配置时，store 里还是空的
@@ -2841,7 +2944,9 @@ export const useApp = create<AppStore>((set, get) => ({
         reasoningMs: reasoningMs ?? (reasoningStartedAt === undefined ? undefined : performance.now() - reasoningStartedAt),
         stopped: controller.signal.aborted,
       }));
-      chatAbort = null;
+      // 只清自己持有的那个：排队/快速重发时新一轮可能已经接管 chatAbort，
+      // 这里无条件置空会让新轮的「停止」按钮失效（审查发现）
+      if (chatAbort === controller) chatAbort = null;
       const after = get().chat;
       // 追加一行「最近请求」（监控页 req-card）。失败也记 —— 上游那列有「失败」状态。
       const elapsedMs = performance.now() - started;
@@ -2969,7 +3074,8 @@ export const useApp = create<AppStore>((set, get) => ({
       chat: {
         ...state,
         attachments: [...state.attachments, ...added],
-        error: problems.length ? problems.join("；") : state.error,
+        // 这次全加成功了就把红字清掉：留着上一次的「附件失败」会让用户以为刚加的还是坏的（审查发现）
+        error: problems.length ? problems.join("；") : null,
       },
     });
   },
@@ -3171,21 +3277,30 @@ export const useApp = create<AppStore>((set, get) => ({
   async refreshMonitor() {
     try {
       const snapshot = await monitorSample();
-      // 每秒推一个速度点，给监控页的速度折线兜底（只在生成时有值，与上游 history.tok_s 语义一致）
+      // 每秒推一个速度点，给监控页的速度折线兜底（只在生成时有值，与上游 history.tok_s 语义一致）。
+      // 压测（上下文 / 场景）同样会往 lastTurn 写速度，运行期间折线不能断（用户 m00279）；
+      // decode 与 prefill 两条线用同一个门控 —— 原先 prefill 无门控，空闲期每秒重复推最近值，
+      // 折线走成一条假水平线。
       const turn = get().lastTurn;
-      const streaming = get().chat.streaming;
+      const running =
+        get().chat.streaming || get().contextBench.running || get().scenarioBench.running;
       const prev = get().speedSeries;
       const push = (list: (number | null)[], value: number | null) => [...list, value].slice(-60);
       set({
         monitor: snapshot,
         monitorAt: snapshot.now.at,
         speedSeries: {
-          tokS: push(prev.tokS, streaming ? (turn?.decodeTokS ?? null) : null),
-          prefillTokS: push(prev.prefillTokS, turn?.prefillTokS ?? null),
+          tokS: push(prev.tokS, running ? (turn?.decodeTokS ?? null) : null),
+          prefillTokS: push(prev.prefillTokS, running ? (turn?.prefillTokS ?? null) : null),
         },
       });
+      monitorWarned = "";
     } catch (error) {
-      reportFrontendError("warn", `刷新监控失败：${errText(error)}`);
+      const text = errText(error);
+      if (text !== monitorWarned) {
+        monitorWarned = text;
+        reportFrontendError("warn", `刷新监控失败：${text}`);
+      }
       set({ monitor: null, monitorAt: 0 });
     }
   },

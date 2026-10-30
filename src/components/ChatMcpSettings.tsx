@@ -69,6 +69,8 @@ export function ChatMcpSettings() {
 
   /** 读磁盘上的配置，并把启用的服务器连一遍（没有启用的服务器就不连，省得白等超时） */
   const load = useCallback(async () => {
+    // 连接可能等超时：置 busy 让按钮显示「检测中…」，也挡住连点重复发起（审查发现）
+    setBusy(true);
     setError(null);
     try {
       const servers = await ipc.mcpServers();
@@ -80,6 +82,8 @@ export function ChatMcpSettings() {
       );
     } catch (err) {
       setError(errText(err));
+    } finally {
+      setBusy(false);
     }
   }, []);
 
@@ -109,6 +113,16 @@ export function ChatMcpSettings() {
     setDrafts((list) => list.map((item, at) => (at === index ? { ...item, ...patch } : item)));
 
   const save = async () => {
+    // 名称是工具归属的索引、命令是必填项：空着保存只会让后端连不上还不知道为什么（审查发现）
+    if (drafts.some((draft) => !draft.name.trim() || !draft.command.trim())) {
+      setError("每个 MCP 服务器都要填名称和启动命令");
+      return;
+    }
+    const names = drafts.map((draft) => draft.name.trim());
+    if (new Set(names).size !== names.length) {
+      setError("服务器名称不能重复（后端按名字索引工具归属）");
+      return;
+    }
     setBusy(true);
     setError(null);
     setNotice(null);

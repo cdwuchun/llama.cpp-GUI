@@ -495,13 +495,25 @@ impl SettingsStore {
     /// 持有较旧快照的那次 persist 可能晚于另一次落盘，把新改动从磁盘上抹掉
     /// （内存里还是新的，直到下次重启才暴露"设置回退了"）。
     pub fn update<F: FnOnce(&mut Settings)>(&self, f: F) -> Settings {
+        match self.try_update(f) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                // 兼容旧调用点：磁盘没写成，内存里的改动仍然生效，只是重启后会回退
+                eprintln!("[settings] {err}");
+                self.get()
+            }
+        }
+    }
+
+    /// 与 `update` 相同，但**把落盘失败交回调用方**：设置页的保存命令要能告诉用户
+    /// 「这次没存下来」，而不是显示改成功、重启后悄悄回退（审查发现）。
+    pub fn try_update<F: FnOnce(&mut Settings)>(&self, f: F) -> Result<Settings, String> {
         let mut guard = self.lock();
         f(&mut guard);
         let snapshot = guard.clone();
-        if let Err(err) = self.persist(&snapshot) {
-            eprintln!("[settings] 写入失败 {}: {err}", self.path.display());
-        }
-        snapshot
+        self.persist(&snapshot)
+            .map_err(|err| format!("设置没能写入磁盘（{}）：{err}", self.path.display()))?;
+        Ok(snapshot)
     }
 
     /// 应用来自前端的 patch（`None` 字段保持不变）。
@@ -510,7 +522,18 @@ impl SettingsStore {
     /// 在 `Option<T>` 里和"字段缺省"无法区分，会被当成"不改"）。空串在这里统一映射成
     /// `None`，于是"清掉 API Key / 清掉目录"才能真正生效，而不是静默保留旧值。
     pub fn patch(&self, patch: SettingsPatch) -> Settings {
-        self.update(|s| {
+        match self.patch_checked(patch) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                eprintln!("[settings] {err}");
+                self.get()
+            }
+        }
+    }
+
+    /// `patch` 的可感知失败版：落盘失败时前端能看到错误。
+    pub fn patch_checked(&self, patch: SettingsPatch) -> Result<Settings, String> {
+        self.try_update(move |s| {
             if let Some(v) = patch.llama_cpp_dir {
                 s.llama_cpp_dir = (!v.as_os_str().is_empty()).then_some(v);
             }

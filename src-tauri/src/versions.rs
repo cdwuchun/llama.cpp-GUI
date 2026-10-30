@@ -221,8 +221,9 @@ pub fn probe_router_mode(server_bin: &Path, shared_lib_dirs: &[PathBuf]) -> Opti
     // 不加这个的话，每次冷启动探测都会在屏幕上闪一个黑窗
     crate::winfix::hide_console(&mut cmd);
 
-    match cmd.output() {
-        Ok(out) => {
+    // 探测外部 exe 必须带超时：被杀软拦 / 缺 DLL 时 `output()` 会一直等（审查发现）
+    match crate::winfix::output_with_timeout(&mut cmd, std::time::Duration::from_secs(30)) {
+        Some(out) => {
             let text = String::from_utf8_lossy(&out.stdout).to_string()
                 + &String::from_utf8_lossy(&out.stderr);
             let has_help = text.contains("--help") || text.contains("usage:");
@@ -236,8 +237,11 @@ pub fn probe_router_mode(server_bin: &Path, shared_lib_dirs: &[PathBuf]) -> Opti
             }
             Some(text.contains("--models-dir"))
         }
-        Err(err) => {
-            eprintln!("[versions] 执行 {} --help 失败: {err}", server_bin.display());
+        None => {
+            eprintln!(
+                "[versions] 执行 {} --help 失败或超时（30 秒），本次不缓存探测结果",
+                server_bin.display()
+            );
             None
         }
     }

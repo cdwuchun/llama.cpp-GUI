@@ -105,7 +105,13 @@ pub fn list_devices(version: &LlamaCppVersion) -> Result<Vec<DeviceInfo>> {
     cmd.current_dir(&version.dir);
     cmd.env("PATH", compose_path_env(version, std::env::var_os("PATH")));
     crate::winfix::hide_console(&mut cmd);
-    let out = cmd.output()?;
+    // 外部 exe 必须带超时：被杀软拦 / 缺 DLL 时会一直等（审查发现）
+    let Some(out) = crate::winfix::output_with_timeout(&mut cmd, std::time::Duration::from_secs(30))
+    else {
+        anyhow::bail!(
+            "--list-devices 超过 30 秒没有结果，已放弃（检查共享 CUDA 运行时是否被杀软拦住）"
+        );
+    };
     let text = String::from_utf8_lossy(&out.stdout).to_string()
         + &String::from_utf8_lossy(&out.stderr);
     // 命令失败时（缺 DLL、被拦截）不要拿错误文本去解析成"没有设备"：
@@ -243,7 +249,11 @@ pub fn fit_preview(
     cmd.env("PATH", compose_path_env(version, std::env::var_os("PATH")));
     crate::winfix::hide_console(&mut cmd);
 
-    let out = cmd.output()?;
+    // 大模型的分解要算一会儿，但也不能无限等（审查发现）
+    let Some(out) = crate::winfix::output_with_timeout(&mut cmd, std::time::Duration::from_secs(120))
+    else {
+        anyhow::bail!("llama-fit-params 超过 120 秒没有结果，已放弃");
+    };
     let text = String::from_utf8_lossy(&out.stdout).to_string()
         + &String::from_utf8_lossy(&out.stderr);
     if !out.status.success() {

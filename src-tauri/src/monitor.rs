@@ -1100,6 +1100,10 @@ fn parse_prometheus(text: &str) -> serde_json::Value {
         "tokensPredictedSeconds": pick(&["llamacpp:tokens_predicted_seconds_total"]),
         "promptTokens": pick(&["llamacpp:prompt_tokens_total"]),
         "promptSeconds": pick(&["llamacpp:prompt_seconds_total"]),
+        // 引擎自报的实时速度（gauge，空闲时归 0）。压测与自带 WebUI 的请求不经过
+        // GUI 的聊天 store，本地攒不出速度；但引擎自己知道，监控页拿它兜底。
+        "predictedTokS": pick(&["llamacpp:predicted_tokens_seconds"]),
+        "promptTokS": pick(&["llamacpp:prompt_tokens_seconds"]),
         "kvCacheTokens": pick(&["llamacpp:kv_cache_tokens", "llamacpp:kv_cache_tokens_total"]),
         "kvCacheUsage": pick(&["llamacpp:kv_cache_usage_ratio"]),
     })
@@ -1149,6 +1153,8 @@ llamacpp:requests_deferred 1
 llamacpp:tokens_predicted_total 1234
 llamacpp:prompt_tokens_total 5678
 llamacpp:kv_cache_usage_ratio 0.25
+llamacpp:predicted_tokens_seconds 19.6849
+llamacpp:prompt_tokens_seconds 70.6986
 ";
         let value = parse_prometheus(text);
         assert_eq!(value["requestsProcessing"].as_f64(), Some(2.0));
@@ -1156,6 +1162,29 @@ llamacpp:kv_cache_usage_ratio 0.25
         assert_eq!(value["tokensPredicted"].as_f64(), Some(1234.0));
         assert_eq!(value["promptTokens"].as_f64(), Some(5678.0));
         assert_eq!(value["kvCacheUsage"].as_f64(), Some(0.25));
+        // 引擎自报的实时速度：b11671 实测的 gauge 名（HELP 是 Average ... throughput in tokens/s）
+        assert_eq!(value["predictedTokS"].as_f64(), Some(19.6849));
+        assert_eq!(value["promptTokS"].as_f64(), Some(70.6986));
+    }
+
+    /// 引擎空闲时两个吞吐 gauge 发 0：前端靠「> 0」过滤，所以 0 必须原样读出来，
+    /// 不能被当成「这个指标不存在」。
+    #[test]
+    fn idle_throughput_gauge_keeps_zero() {
+        let value = parse_prometheus(
+            "llamacpp:predicted_tokens_seconds 0\nllamacpp:prompt_tokens_seconds 0\n",
+        );
+        assert_eq!(value["predictedTokS"].as_f64(), Some(0.0));
+        assert_eq!(value["promptTokS"].as_f64(), Some(0.0));
+    }
+
+    /// 没开 `--metrics` 或旧版 llama.cpp 不发这两个 gauge 时，键必须是 null：
+    /// 前端的回落链（引擎 gauge → 本地最近一次请求）靠它判断。
+    #[test]
+    fn missing_throughput_gauge_is_null() {
+        let value = parse_prometheus("llamacpp:requests_processing 0\n");
+        assert!(value["predictedTokS"].is_null());
+        assert!(value["promptTokS"].is_null());
     }
 
     #[test]

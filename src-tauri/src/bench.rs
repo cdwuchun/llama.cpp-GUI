@@ -308,56 +308,67 @@ fn total_ram_gb() -> Option<f64> {
 
 const RECORDS_CAP: usize = 200;
 
+/// 记录文件是整份读改写：并发压测同时追加时，两个线程各自「读 → 合并 → 写」会互相覆盖。
+static RECORDS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn records_path(bench_dir: &str) -> PathBuf {
     PathBuf::from(bench_dir).join("records.json")
 }
 
-/// 读取记录（最新的在前）。
-#[tauri::command]
-pub fn bench_records(bench_dir: String) -> Vec<BenchRecord> {
-    fs::read_to_string(records_path(&bench_dir))
+fn read_records(path: &std::path::Path) -> Vec<BenchRecord> {
+    fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str::<Vec<BenchRecord>>(&text).ok())
         .unwrap_or_default()
 }
 
+fn write_records(path: &std::path::Path, all: &[BenchRecord]) -> Result<(), String> {
+    let text = serde_json::to_string(all).map_err(|e| format!("序列化失败：{e}"))?;
+    // 先写 .tmp 再改名：写到一半崩溃不会把旧记录截断
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, text).map_err(|e| format!("写入失败：{e}"))?;
+    fs::rename(&tmp, path).map_err(|e| format!("写入失败：{e}"))?;
+    Ok(())
+}
+
+/// 读取记录（最新的在前）。
+#[tauri::command]
+pub fn bench_records(bench_dir: String) -> Vec<BenchRecord> {
+    read_records(&records_path(&bench_dir))
+}
+
 /// 追加一批记录（并发压测会一次来多条）。
 #[tauri::command]
 pub fn bench_records_add(bench_dir: String, items: Vec<BenchRecord>) -> Result<Vec<BenchRecord>, String> {
+    let _guard = RECORDS_LOCK.lock().map_err(|_| "压测记录被占用".to_string())?;
     let dir = PathBuf::from(&bench_dir);
     fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败：{e}"))?;
     let path = records_path(&bench_dir);
 
-    let mut all = fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Vec<BenchRecord>>(&text).ok())
-        .unwrap_or_default();
+    let mut all = read_records(&path);
     all.extend(items);
     if all.len() > RECORDS_CAP {
         all.drain(0..all.len() - RECORDS_CAP);
     }
-    let text = serde_json::to_string(&all).map_err(|e| format!("序列化失败：{e}"))?;
-    fs::write(&path, text).map_err(|e| format!("写入失败：{e}"))?;
+    write_records(&path, &all)?;
     Ok(all)
 }
 
 /// 按时间戳删除一条记录。
 #[tauri::command]
 pub fn bench_records_delete(bench_dir: String, ts_ms: u64) -> Result<Vec<BenchRecord>, String> {
+    let _guard = RECORDS_LOCK.lock().map_err(|_| "压测记录被占用".to_string())?;
     let path = records_path(&bench_dir);
-    let mut all = fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Vec<BenchRecord>>(&text).ok())
-        .unwrap_or_default();
+    let mut all = read_records(&path);
     all.retain(|r| r.ts_ms != ts_ms);
-    let text = serde_json::to_string(&all).map_err(|e| format!("序列化失败：{e}"))?;
-    fs::write(&path, text).map_err(|e| format!("写入失败：{e}"))?;
+    write_records(&path, &all)?;
     Ok(all)
 }
 
 /// 清空全部记录。
 #[tauri::command]
 pub fn bench_records_clear(bench_dir: String) -> Result<(), String> {
+    let _guard = RECORDS_LOCK.lock().map_err(|_| "压测记录被占用".to_string())?;
     let _ = fs::remove_file(records_path(&bench_dir));
     Ok(())
 }

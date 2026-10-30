@@ -1,6 +1,6 @@
 [package]
 name = "llamacpp-gui"
-version = "0.3.3"
+version = "0.3.4"
 description = "llama.cpp GUI - Tauri 2 外壳，管理 llama-server router mode"
 authors = ["llamacpp-gui"]
 edition = "2021"
