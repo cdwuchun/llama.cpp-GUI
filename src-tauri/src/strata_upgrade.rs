@@ -16,9 +16,15 @@
 //!
 //! **目录布局**：`--components-dir <Strata 根>`，于是引擎装进 `<根>\engine\<版本>-<平台>-<后端>`
 //! 、控制器装进 `<根>\control\<版本>` —— 与手动解压的安装目录完全一致（用户 m00001）。
+//!
+//! **目录为空时的自举**：控制端自己不能从「没有控制端」开始（`strata.py` 还没解压出来），
+//! 所以 `start()` 在定位失败时先按官方 feed 下载控制器包（windows-x86_64 zip）→ 校验
+//! sha256 → 解压到 `<根>\control\<版本>` → 写 `active.json`；引擎仍交给控制端自己的
+//! `update` 装。feed 的签名由控制端在 update 时校验，自举这一步只用 feed 里的 sha256
+//! 保证下载到的包完整（用户 m00326：目录为空时点「更新」也要能装好）。
 
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -183,6 +189,291 @@ fn locate() -> Result<(PathBuf, PathBuf, PathBuf), String> {
     Ok((root, python, script))
 }
 
+// ---------------------------------------------------------------- 空目录自举
+
+/// 官方更新 feed：控制器 / 引擎包都从这里读。
+const FEED_URL: &str =
+    "https://github.com/Niko1221/Strata/releases/latest/download/strata-feed.json";
+/// feed 里的 `url` 都是文件名，下载根目录是 release 的 `latest/download`。
+const RELEASE_BASE: &str =
+    "https://github.com/Niko1221/Strata/releases/latest/download/";
+
+/// 本机平台标识（与 feed 的 `platform` 字段一致）。本项目只发 Windows x64 构建。
+fn platform_id() -> &'static str {
+    "windows-x86_64"
+}
+
+fn curl_command() -> Command {
+    let mut cmd = Command::new(if cfg!(windows) { "curl.exe" } else { "curl" });
+    crate::winfix::hide_console(&mut cmd);
+    cmd
+}
+
+/// feed 里控制器包的一条。
+#[derive(Debug)]
+struct ControlPackage {
+    version: String,
+    url: String,
+    sha256: String,
+}
+
+/// 从 feed 里挑出本平台的控制器包。
+fn control_package(feed: &serde_json::Value, platform: &str) -> Result<ControlPackage, String> {
+    let packages = feed
+        .get("control")
+        .and_then(|value| value.get("packages"))
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "官方更新 feed 里没有 control.packages".to_string())?;
+    let package = packages
+        .iter()
+        .find(|package| package.get("platform").and_then(|value| value.as_str()) == Some(platform))
+        .ok_or_else(|| format!("官方更新 feed 里没有 {platform} 的控制器包"))?;
+    let field = |key: &str| {
+        package
+            .get(key)
+            .and_then(|value| value.as_str())
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| text.to_string())
+    };
+    Ok(ControlPackage {
+        version: field("version").ok_or_else(|| "控制器包缺 version".to_string())?,
+        url: field("url").ok_or_else(|| "控制器包缺 url".to_string())?,
+        sha256: field("sha256").ok_or_else(|| "控制器包缺 sha256".to_string())?,
+    })
+}
+
+/// 读 feed（只取文本；feed 签名由控制端在 `update` 里校验）。
+fn fetch_feed() -> Result<serde_json::Value, String> {
+    let stamp = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0)
+    );
+    let path = std::env::temp_dir().join(format!("strata-feed-{stamp}.json"));
+    let output = curl_command()
+        .args([
+            "-sS",
+            "-L",
+            "--compressed",
+            "--max-time",
+            "30",
+            "--connect-timeout",
+            "8",
+        ])
+        .arg("-o")
+        .arg(&path)
+        .arg(FEED_URL)
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err("这台机器上没有 curl.exe，无法从官网下载控制器".into());
+        }
+        Err(err) => return Err(format!("起 curl 失败：{err}")),
+    };
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    if !output.status.success() {
+        return Err(format!(
+            "读取官方更新 feed 失败（退出码 {:?}）：{}",
+            output.status.code(),
+            first_lines(&String::from_utf8_lossy(&output.stderr), 3)
+        ));
+    }
+    serde_json::from_str(&text).map_err(|err| format!("官方更新 feed 不是合法 JSON：{err}"))
+}
+
+/// 用 curl 把 `url` 下到 `dest`（覆盖已存在的文件）。
+fn download_file(url: &str, dest: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("创建下载目录失败：{err}"))?;
+    }
+    let _ = std::fs::remove_file(dest);
+    let output = curl_command()
+        .args([
+            "-L",
+            "--fail",
+            "-sS",
+            "--connect-timeout",
+            "15",
+            "--max-time",
+            "1800",
+        ])
+        .arg("-o")
+        .arg(dest)
+        .arg(url)
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err("这台机器上没有 curl.exe，无法从官网下载控制器".into());
+        }
+        Err(err) => return Err(format!("起 curl 失败：{err}")),
+    };
+    if !output.status.success() {
+        let _ = std::fs::remove_file(dest);
+        return Err(format!(
+            "下载控制器失败（退出码 {:?}）：{}",
+            output.status.code(),
+            first_lines(&String::from_utf8_lossy(&output.stderr), 3)
+        ));
+    }
+    Ok(())
+}
+
+/// 算文件的 sha256（走系统 certutil，不引 sha2 依赖）。
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut command = Command::new("certutil.exe");
+    crate::winfix::hide_console(&mut command);
+    let output = command
+        .args(["-hashfile"])
+        .arg(path)
+        .arg("SHA256")
+        .output()
+        .map_err(|err| format!("起 certutil 失败：{err}"))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        let line = line.trim();
+        // certutil 把哈希按 2 字节分组、用空格隔开；只认「整行都是 hex 与空格」的那一行
+        if line.len() >= 64 && line.chars().all(|ch| ch.is_ascii_hexdigit() || ch == ' ') {
+            let hex: String = line.chars().filter(|ch| ch.is_ascii_hexdigit()).collect();
+            if hex.len() == 64 {
+                return Ok(hex.to_ascii_lowercase());
+            }
+        }
+    }
+    Err(format!(
+        "读不出 sha256（certutil 退出码 {:?}）",
+        output.status.code()
+    ))
+}
+
+/// 解压 zip：优先系统自带的 `tar.exe`（Win10 1803+ 都有，zip 也能解），
+/// 失败再退回 PowerShell 的 `Expand-Archive`。
+fn extract_zip(archive: &Path, dest: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dest).map_err(|err| format!("创建解压目录失败：{err}"))?;
+    let mut tar = Command::new("tar.exe");
+    crate::winfix::hide_console(&mut tar);
+    if let Ok(output) = tar.arg("-xf").arg(archive).arg("-C").arg(dest).output() {
+        if output.status.success() {
+            return Ok(());
+        }
+    }
+    let script = format!(
+        "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
+        archive.display(),
+        dest.display()
+    );
+    let mut powershell = Command::new("powershell.exe");
+    crate::winfix::hide_console(&mut powershell);
+    let output = powershell
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|err| format!("解压控制器包失败：{err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "解压控制器包失败（退出码 {:?}）：{}",
+            output.status.code(),
+            first_lines(&String::from_utf8_lossy(&output.stderr), 3)
+        ));
+    }
+    Ok(())
+}
+
+fn write_active_control(root: &Path, package: &ControlPackage) -> Result<(), String> {
+    let control = root.join("control");
+    std::fs::create_dir_all(&control).map_err(|err| format!("创建 control 目录失败：{err}"))?;
+    let pointer = control.join("active.json");
+    let temp = control.join("active.json.tmp");
+    let value = serde_json::json!({
+        "version": package.version,
+        "folder": package.version,
+        "sha256": package.sha256,
+    });
+    let bytes = serde_json::to_vec(&value)
+        .map_err(|err| format!("序列化 active.json 失败：{err}"))?;
+    std::fs::write(&temp, bytes).map_err(|err| format!("写 active.json 失败：{err}"))?;
+    std::fs::rename(&temp, &pointer).map_err(|err| format!("替换 active.json 失败：{err}"))
+}
+
+/// 目录为空时的自举：下载 + 校验 + 解压官方控制器包，写 `active.json`。
+///
+/// 只装控制器；引擎留给控制端自己的 `update`（它按显卡挑包、试启动、失败回滚）。
+pub fn bootstrap_control(root: &Path, hub: &Arc<LogHub>) -> Result<PathBuf, String> {
+    let platform = platform_id();
+    hub.push(
+        "strata-upgrade",
+        "[gui] 未找到 Strata 控制端，开始从官网下载控制器…".to_string(),
+    );
+    let feed = fetch_feed()?;
+    let package = control_package(&feed, platform)?;
+    let final_dir = root.join("control").join(&package.version);
+    let python = final_dir.join("python").join(crate::strata_tune::python_name());
+    // 上次自举解压到一半（比如取消过）时，别再下一遍
+    if final_dir.join("strata.py").is_file() && python.is_file() {
+        hub.push(
+            "strata-upgrade",
+            format!("[gui] 复用已下载的控制器 {}", package.version),
+        );
+        write_active_control(root, &package)?;
+        return Ok(final_dir);
+    }
+    let updates = root.join(".updates");
+    std::fs::create_dir_all(&updates).map_err(|err| format!("创建 .updates 目录失败：{err}"))?;
+    let archive = updates.join(format!("strata-control-{}.zip", package.version));
+    hub.push(
+        "strata-upgrade",
+        format!("[gui] 下载控制器 {}（{}）…", package.version, package.url),
+    );
+    download_file(&format!("{RELEASE_BASE}{}", package.url), &archive)?;
+    hub.push("strata-upgrade", "[gui] 校验控制器包…".to_string());
+    let got = sha256_file(&archive)?;
+    if !got.eq_ignore_ascii_case(&package.sha256) {
+        let _ = std::fs::remove_file(&archive);
+        return Err(format!(
+            "控制器包 sha256 不匹配（feed {} / 实际 {}）",
+            package.sha256, got
+        ));
+    }
+    let staging = updates.join(format!("control-{}-staging", package.version));
+    let _ = std::fs::remove_dir_all(&staging);
+    hub.push("strata-upgrade", "[gui] 解压控制器…".to_string());
+    extract_zip(&archive, &staging)?;
+    // 官方包把内容直接放根；万一以后带顶层目录，这里兜一下
+    let mut content = staging.clone();
+    if !content.join("strata.py").is_file() {
+        if let Some(dir) = std::fs::read_dir(&content).ok().and_then(|mut entries| {
+            entries.find_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.is_dir() && path.join("strata.py").is_file()).then_some(path)
+            })
+        }) {
+            content = dir;
+        }
+    }
+    let python = content.join("python").join(crate::strata_tune::python_name());
+    if !content.join("strata.py").is_file() || !python.is_file() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err("控制器包不完整（缺 strata.py 或 python\\python.exe）".into());
+    }
+    if let Some(parent) = final_dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("创建 control 目录失败：{err}"))?;
+    }
+    let _ = std::fs::remove_dir_all(&final_dir);
+    std::fs::rename(&content, &final_dir).map_err(|err| format!("移动控制器目录失败：{err}"))?;
+    let _ = std::fs::remove_dir_all(&staging);
+    let _ = std::fs::remove_file(&archive);
+    write_active_control(root, &package)?;
+    hub.push(
+        "strata-upgrade",
+        format!("[gui] 控制器 {} 已就绪", package.version),
+    );
+    Ok(final_dir)
+}
+
 fn base_command(python: &PathBuf, script: &PathBuf, terminal_cwd: &PathBuf) -> Command {
     let mut cmd = Command::new(python);
     cmd.arg(script)
@@ -323,11 +614,24 @@ pub fn describe(report: &serde_json::Value, scope: Scope) -> String {
 
 /// 起一个升级进程。**先跑一次 `--check`**：没有新版本就不下载（几百 MB 的包不该白拉）。
 ///
+/// 目录为空时先 `bootstrap_control` 装控制器（否则连 `update` 都跑不了），引擎仍交给控制端。
+///
 /// 返回 `(是否有需要下载的东西, 一句话说明)`；`true` 时任务已挂上全局槽位、可以轮询进度。
 pub fn start(
     hub: Arc<LogHub>,
     scope: Scope,
 ) -> Result<(Option<UpgradeJob>, String), String> {
+    // 目录为空（或目录里还没有控制端）时先装控制器：`update` 本身跑在控制端里，
+    // 引擎也必须由控制端按显卡挑包安装，所以这里只能先自举控制端，不能直接下载引擎。
+    let configured = crate::strata::root()
+        .ok_or_else(|| "未找到 Strata 目录（设置 → 通用 → Strata 目录 可指定）".to_string())?;
+    if !configured.is_dir() {
+        std::fs::create_dir_all(&configured)
+            .map_err(|err| format!("创建 Strata 目录失败：{err}"))?;
+    }
+    if locate().is_err() {
+        bootstrap_control(&configured, &hub)?;
+    }
     let report = check()?;
     let engine_out = scope.wants_engine() && side_outdated(&report, "engine");
     let control_out = scope.wants_control() && side_outdated(&report, "control");
@@ -574,6 +878,44 @@ mod tests {
         assert_eq!(describe(&report, Scope::Control), "已是最新（控制器 0.1.51）");
         // `app`（Strata 桌面应用）不归这个按钮管
         assert!(!side_outdated(&report, "engine"));
+    }
+
+    /// feed 里按平台挑控制器包（不联网，纯解析）。
+    #[test]
+    fn control_package_picks_the_matching_platform() {
+        let feed = serde_json::json!({
+            "schema_version": 1,
+            "sequence": 122,
+            "control": {
+                "version": "0.1.58",
+                "packages": [
+                    {"platform": "linux-x86_64", "version": "0.1.58",
+                     "url": "strata-control-0.1.58-linux-x86_64.zip", "sha256": "abc"},
+                    {"platform": "windows-x86_64", "version": "0.1.58",
+                     "url": "strata-control-0.1.58-windows-x86_64.zip",
+                     "sha256": "5a927d2b2ac61a9d6963fb17b46819f0bbd779875d1f9a6ba0e07834b350077b"}
+                ]
+            }
+        });
+        let package = control_package(&feed, "windows-x86_64").expect("应当挑到 Windows 包");
+        assert_eq!(package.version, "0.1.58");
+        assert_eq!(package.url, "strata-control-0.1.58-windows-x86_64.zip");
+        assert_eq!(
+            package.sha256,
+            "5a927d2b2ac61a9d6963fb17b46819f0bbd779875d1f9a6ba0e07834b350077b"
+        );
+    }
+
+    /// 没有本平台包时报错，而不是悄悄挑一个别的平台。
+    #[test]
+    fn control_package_rejects_a_missing_platform() {
+        let feed = serde_json::json!({
+            "control": {"packages": [
+                {"platform": "linux-x86_64", "version": "0.1.58", "url": "x", "sha256": "y"}
+            ]}
+        });
+        let err = control_package(&feed, "windows-x86_64").expect_err("缺 Windows 包应报错");
+        assert!(err.contains("windows-x86_64"), "{err}");
     }
 
     /// 真实安装实测（联网）：定位解释器、跑 `--check`、翻译成一句话。

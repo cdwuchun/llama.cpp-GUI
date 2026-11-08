@@ -274,10 +274,10 @@ export interface ApplyControllerResult {
 }
 
 /**
- * 一次 Strata 一键升级的进度快照（`strata_upgrade_status`，前端每秒轮询）。
+ * 一次 Strata 一键更新的进度快照（`strata_upgrade_status`，前端每秒轮询）。
  *
- * 升级本身由控制端跑（`strata.py update`：读签名 feed → 下载 → 校验 → 试启动 → 切换），
- * GUI 只翻译它的 jsonl 事件流。
+ * 更新本身由控制端跑（`strata.py update`：读签名 feed → 下载 → 校验 → 试启动 → 切换），
+ * GUI 只翻译它的 jsonl 事件流；目录为空时 GUI 先自举下载控制器。
  */
 export interface StrataUpgradeSnapshot {
   /** 子进程还在跑 */

@@ -282,6 +282,22 @@
       "defaultEnabled": false
     },
     {
+      "key": "repeat-last-n",
+      "flag": "--repeat-last-n",
+      "abbr": "",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "64",
+      "values": [],
+      "label": "重复惩罚回看窗口",
+      "desc": "--repeat-last-n N：重复惩罚回看的 token 数（默认 64）。0 表示只看当前 token，负值通常表示整段上下文。",
+      "group": "page.params.group.sampling",
+      "order": 20,
+      "sort": 12.5,
+      "defaultEnabled": false
+    },
+    {
       "key": "frequency-penalty",
       "flag": "--frequency-penalty",
       "abbr": "--frequency-penalty",
@@ -359,6 +375,22 @@
       "group": "page.params.group.sampling",
       "order": 20,
       "sort": 15.6,
+      "defaultEnabled": false
+    },
+    {
+      "key": "n-predict",
+      "flag": "--n-predict",
+      "abbr": "-n",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "-1",
+      "values": [],
+      "label": "最大生成 token 数",
+      "desc": "--n-predict / -n：单次生成的最大 token 数。默认 -1 表示生成到上下文满或模型停止；设为正整数可限制回复长度。",
+      "group": "page.params.group.sampling",
+      "order": 20,
+      "sort": 16,
       "defaultEnabled": false
     },
     {
@@ -497,6 +529,22 @@
       "defaultEnabled": false
     },
     {
+      "key": "cache-reuse",
+      "flag": "--cache-reuse",
+      "abbr": "",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "KV 缓存复用块大小",
+      "desc": "--cache-reuse N：通过 KV 移位复用缓存的最小块大小（token 数），默认 0 表示关闭。开启后多轮对话可复用前缀中段已计算的 KV，减少重复计算；需要开启 prompt caching。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 4.5,
+      "defaultEnabled": false
+    },
+    {
       "key": "fit",
       "flag": "--fit",
       "abbr": "--fit",
@@ -583,6 +631,22 @@
       "group": "page.params.group.performance",
       "order": 30,
       "sort": 7.5,
+      "defaultEnabled": false
+    },
+    {
+      "key": "no-kv-offload",
+      "flag": "--no-kv-offload",
+      "abbr": "-nkvo",
+      "type": "LOGIC",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "禁用 KV 卸载",
+      "desc": "--no-kv-offload / -nkvo：关闭 KV cache 卸载到 GPU（默认开启）。勾选后 KV 放在 CPU 内存，可省显存但 attention 计算变慢，适合显存不足时换稳定。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 7.6,
       "defaultEnabled": false
     },
     {
@@ -903,6 +967,22 @@
       "group": "page.params.group.performance",
       "order": 30,
       "sort": 14.1,
+      "defaultEnabled": false
+    },
+    {
+      "key": "moe-cache-cpu-share",
+      "flag": "--moe-cache-cpu-share",
+      "abbr": "",
+      "type": "FLOAT",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0.00",
+      "values": [],
+      "label": "MoE 缓存未命中 CPU 分担比例",
+      "desc": "--moe-cache-cpu-share F：当 --moe-cache-mib 的缓存已满、专家不在缓存里时，由 CPU 直接用主机内存里的专家权重计算、而不是先上传到 GPU 的比例（0–1，默认 0）。调高可减少 PCIe 往返，代价是 CPU 侧计算变多。需要 b12196+ 版本。",
+      "group": "page.params.group.performance",
+      "order": 30,
+      "sort": 14.15,
       "defaultEnabled": false
     },
     {
@@ -1527,6 +1607,22 @@
       "defaultEnabled": false
     },
     {
+      "key": "mtmd-batch-max-tokens",
+      "flag": "--mtmd-batch-max-tokens",
+      "abbr": "",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "1024",
+      "values": [],
+      "label": "多模态单批最大 token 数",
+      "desc": "--mtmd-batch-max-tokens N：图像/视频编码时单个 batch 的最大 token 数（默认 1024）。调小可降低多模态编码的显存峰值，代价是编码更慢。",
+      "group": "page.params.group.multimodal",
+      "order": 60,
+      "sort": 34.5,
+      "defaultEnabled": false
+    },
+    {
       "key": "video-fps",
       "flag": "--video-fps",
       "abbr": "",
@@ -1712,6 +1808,22 @@
       "defaultEnabled": false
     },
     {
+      "key": "spec-draft-cpu-moe",
+      "flag": "--spec-draft-cpu-moe",
+      "abbr": "-cmoed",
+      "type": "LOGIC",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "草稿模型 CPU MoE",
+      "desc": "--spec-draft-cpu-moe / -cmoed：把草稿模型的全部 MoE expert 权重放 CPU（仅草稿模型为 MoE 时生效）。草稿模型显存不够时可用。⚠ 如果你不明白这些参数的具体含义，请不要使用。这些参数需要你有相当丰富的专业知识以及足够的耐心去测试。",
+      "group": "page.params.group.draft_model",
+      "order": 70,
+      "sort": 6.5,
+      "defaultEnabled": false
+    },
+    {
       "key": "spec-draft-device",
       "flag": "--spec-draft-device",
       "abbr": "--device-draft",
@@ -1728,6 +1840,22 @@
       "defaultEnabled": false
     },
     {
+      "key": "spec-draft-n-cpu-moe",
+      "flag": "--spec-draft-n-cpu-moe",
+      "abbr": "-ncmoed",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "草稿模型 N 层 CPU MoE",
+      "desc": "--spec-draft-n-cpu-moe / -ncmoed N：把草稿模型前 N 层的 MoE expert 权重放 CPU（仅草稿模型为 MoE 时生效）。⚠ 如果你不明白这些参数的具体含义，请不要使用。这些参数需要你有相当丰富的专业知识以及足够的耐心去测试。",
+      "group": "page.params.group.draft_model",
+      "order": 70,
+      "sort": 7.5,
+      "defaultEnabled": false
+    },
+    {
       "key": "spec-draft-threads",
       "flag": "--spec-draft-threads",
       "abbr": "--threads-draft",
@@ -1741,6 +1869,22 @@
       "group": "page.params.group.draft_model",
       "order": 70,
       "sort": 8,
+      "defaultEnabled": false
+    },
+    {
+      "key": "spec-draft-n-ubatch",
+      "flag": "--spec-draft-n-ubatch",
+      "abbr": "",
+      "type": "INTEGER",
+      "uiType": null,
+      "delimiter": null,
+      "default": "0",
+      "values": [],
+      "label": "草稿模型物理批大小",
+      "desc": "--spec-draft-n-ubatch N：草稿上下文的物理 batch 上限（默认 0 = 与 --ubatch 相同）。调小可降低投机解码的显存峰值。⚠ 如果你不明白这些参数的具体含义，请不要使用。这些参数需要你有相当丰富的专业知识以及足够的耐心去测试。",
+      "group": "page.params.group.draft_model",
+      "order": 70,
+      "sort": 8.1,
       "defaultEnabled": false
     },
     {

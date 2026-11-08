@@ -131,12 +131,12 @@ export const ipc = {
   strataEngineRollback: () => invoke<string>("strata_engine_rollback"),
   /** 检查官网 feed 有没有新版本（只读，不下载），返回控制端的原始报告 */
   strataUpgradeCheck: () => invoke<unknown>("strata_upgrade_check"),
-  /** 起一次升级：`scope` = all / engine / control；`started=false` 表示已是最新 */
+  /** 起一次更新：`scope` = all / engine / control；`started=false` 表示已是最新 */
   strataUpgradeStart: (scope: "all" | "engine" | "control") =>
     invoke<StrataUpgradeStart>("strata_upgrade_start", { scope }),
-  /** 升级进度（每秒轮询） */
+  /** 更新进度（每秒轮询） */
   strataUpgradeStatus: () => invoke<StrataUpgradeSnapshot>("strata_upgrade_status"),
-  /** 取消升级（连同解压 / 校验的子进程一起杀） */
+  /** 取消更新（连同解压 / 校验的子进程一起杀） */
   strataUpgradeStop: () => invoke<void>("strata_upgrade_stop"),
 
   /** 模型下载页：起一次非交互安装（官方 `setup.py --yes --no-start`） */

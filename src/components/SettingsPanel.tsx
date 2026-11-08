@@ -37,7 +37,7 @@ export function SettingsPanel() {
   const [controllers, setControllers] = useState<StrataController[]>([]);
   /** 切换控制器 / 引擎在跑：禁用表格里的 radio，避免连点 */
   const [strataBusy, setStrataBusy] = useState(false);
-  /** 一键升级（`strata.py update`）：只有这一个升级按钮（用户 m02946），scope 固定 `all` = 控制器与引擎一起检查；每秒轮询进度 */
+  /** 一键更新（`strata.py update`）：只有这一个更新按钮（用户 m02946），scope 固定 `all` = 控制器与引擎一起检查；每秒轮询进度 */
   const [upgrading, setUpgrading] = useState<{
     scope: "all" | "engine" | "control";
     snap: StrataUpgradeSnapshot;
@@ -196,16 +196,20 @@ export function SettingsPanel() {
   }
 
   /**
-   * 一键升级：交给控制端自己跑（`strata.py update`）。
+   * 一键更新：交给控制端自己跑（`strata.py update`）。
    *
    * 它读签名 feed、按显卡挑包、下载校验、**试启动**，通过了才切换，失败保留旧版 ——
    * GUI 不碰下载协议，只把它的 jsonl 进度翻译成界面文字。
    *
    * 后端会先跑一次 `--check`：已是最新就直接回报，不白拉几百 MB。
+   * **目录为空**（没有控制器）时，后端先从官方 feed 下载控制器包解压到
+   * `<根>\control\<版本>`，再让控制端接手装引擎 —— 首次点这个按钮就是「装好全部」。
    */
   async function startUpgrade(scope: "all" | "engine" | "control") {
     if (upgrading?.snap.running || strataBusy) return;
     setStrataBusy(true);
+    // 空目录首次更新要先下载控制器（几十 MB），这段时间没有进度事件，先给一行提示
+    setNotice("正在检查更新…");
     try {
       const result = await ipc.strataUpgradeStart(scope);
       if (!result.started) {
@@ -215,13 +219,13 @@ export function SettingsPanel() {
       }
       setUpgrading({ scope, snap: await ipc.strataUpgradeStatus() });
     } catch (err) {
-      setError(`升级失败：${errText(err)}`);
+      setError(`更新失败：${errText(err)}`);
     } finally {
       setStrataBusy(false);
     }
   }
 
-  /** 升级中每秒拉一次进度；结束时重扫版本表（引擎 / 控制器目录已经被换掉了）。 */
+  /** 更新中每秒拉一次进度；结束时重扫版本表（引擎 / 控制器目录已经被换掉了）。 */
   useEffect(() => {
     if (!upgrading || !upgrading.snap.running) return;
     let alive = true;
@@ -234,12 +238,12 @@ export function SettingsPanel() {
           if (snap.running) return;
           window.clearInterval(timer);
           const cancelled = snap.message.startsWith("已取消");
-          if (snap.ok === false && !cancelled) setError(snap.message || "升级失败");
-          else setNotice(snap.message || "升级完成");
+          if (snap.ok === false && !cancelled) setError(snap.message || "更新失败");
+          else setNotice(snap.message || "更新完成");
           await loadStrataLists();
           await refreshStrata();
         } catch {
-          // 轮询偶发失败不打断升级，下一秒再试
+          // 轮询偶发失败不打断更新，下一秒再试
         }
       })();
     }, 1000);
@@ -644,11 +648,11 @@ export function SettingsPanel() {
                       type="button"
                       className="st-btn st-btn--secondary st-btn--sm"
                       disabled={busy || strataBusy || !!upgrading?.snap.running}
-                      title="从官网 feed 检查并安装最新的控制器与引擎（官方签名校验 + 试启动，失败保留旧版）"
+                      title="从官网 feed 检查并安装最新的控制器与引擎（官方签名校验 + 试启动，失败保留旧版）；目录为空时会先下载控制器再装引擎"
                       onClick={() => void startUpgrade("all")}
                     >
                       <i className={`fas ${upgrading?.snap.running ? "fa-spinner fa-spin" : "fa-cloud-arrow-down"}`} />
-                      升级
+                      更新
                     </button>
                   </div>
                   <div className="st-card__body">
@@ -672,7 +676,7 @@ export function SettingsPanel() {
                             className="st-btn st-btn--danger st-btn--sm"
                             onClick={() => void ipc.strataUpgradeStop()}
                           >
-                            取消升级
+                            取消更新
                           </button>
                         )}
                       </div>
@@ -683,7 +687,7 @@ export function SettingsPanel() {
                     </div>
                     {controllers.length === 0 ? (
                       <div className="st-hint">
-                        未发现控制器版本，请先在「Strata 目录」里指定根目录（<span className="mono">control\&lt;版本&gt;</span>）。
+                        未发现控制器版本。先确认上面的「Strata 目录」已指定，再点右上角「更新」——目录为空时会自动从官网下载控制器（再装引擎）。
                       </div>
                     ) : (
                       <div className="st-scroll">
@@ -743,7 +747,7 @@ export function SettingsPanel() {
                     </div>
                     {engines.length === 0 ? (
                       <div className="st-hint">
-                        未发现引擎版本，请先在「Strata 目录」里指定根目录（<span className="mono">engine\&lt;版本&gt;-&lt;平台&gt;-&lt;后端&gt;</span>）。
+                        未发现引擎版本。点右上角「更新」会自动从官网下载并安装（按本机显卡挑包，失败保留旧版）。
                       </div>
                     ) : (
                       <div className="st-scroll">
