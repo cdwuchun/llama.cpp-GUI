@@ -856,15 +856,41 @@ pub fn host_info() -> HostInfo {
     }
 }
 
-/// 已装引擎的 Strata 发布版本：扫 `<根>/engine/<目录>/engine-component.json`
-/// 的 `notes` 开头（`"0.2.7 NVIDIA cuda13 engine …"`），取组件号最大的那份。
+/// 已装 Strata 的发布版本（`0.2.12` 这条线）。
+///
+/// **先看控制器包**：`<控制端>/strata_cli/__init__.py` 的 `PRODUCT_VERSION = "0.2.12"`
+/// 就是上游 release tag 的号（上游注释：这是「对外告诉用户」的版本，引擎与控制器的
+/// 组件号走 `0.1.58`）。只有控制器目录名与引擎组件号一致（同一次发布装的两份）时才
+/// 采信，免得控制器升了、引擎没升时把发布号说新了。
+///
+/// 读不到控制器才退回引擎清单 `engine-component.json` 的 `notes` 开头
+/// （`"0.2.7 NVIDIA cuda13 engine …"`）：0.2.12 那版引擎包里这段散文仍写着 `0.2.9`
+/// （上游打包时没更新），单靠它会把新装的说成旧发布（用户 m00001）。
 ///
 /// 这条线不能从 `strata components engine` 拿 —— 控制端的组件目录（`%LOCALAPPDATA%`）
 /// 与 `setup.py` 装的 `<根>/engine` 是两个地方，前者在本机恒为空。
 fn engine_release() -> Option<String> {
-    let root = crate::strata::root()?;
-    let entries = std::fs::read_dir(root.join("engine")).ok()?;
-    let mut best: Option<(String, String)> = None;
+    crate::strata::root().and_then(|root| release_of(&root))
+}
+
+fn release_of(root: &Path) -> Option<String> {
+    let (engine, notes) = newest_engine(root);
+    match &engine {
+        Some(version) => controller_release(root, version).or(notes),
+        // 只装了控制器、还没有引擎：控制器的发布号就是 Strata 的号
+        None => crate::strata::list_controllers(root)
+            .first()
+            .and_then(|info| controller_release(root, &info.version))
+            .or(notes),
+    }
+}
+
+/// `<根>/engine/<目录>/engine-component.json` 里组件号最大的那份 →（组件号，notes 开头的发布号）。
+fn newest_engine(root: &Path) -> (Option<String>, Option<String>) {
+    let Ok(entries) = std::fs::read_dir(root.join("engine")) else {
+        return (None, None);
+    };
+    let mut best: Option<(String, Option<String>)> = None;
     for entry in entries.flatten() {
         let Ok(text) = std::fs::read_to_string(entry.path().join("engine-component.json")) else {
             continue;
@@ -877,23 +903,56 @@ fn engine_release() -> Option<String> {
             .and_then(|item| item.as_str())
             .unwrap_or_default()
             .to_string();
+        if version.is_empty() {
+            continue;
+        }
         let head = value
             .get("notes")
             .and_then(|item| item.as_str())
             .and_then(|notes| notes.split_whitespace().next())
-            .unwrap_or_default();
-        if head.is_empty() || !head.chars().next().map_or(false, |first| first.is_ascii_digit()) {
-            continue;
-        }
+            .map(str::to_string)
+            .filter(|head| head.chars().next().map_or(false, |first| first.is_ascii_digit()));
         let better = match &best {
             Some((known, _)) => version > *known,
             None => true,
         };
         if better {
-            best = Some((version, head.to_string()));
+            best = Some((version, head));
         }
     }
-    best.map(|(_, release)| release)
+    match best {
+        Some((version, head)) => (Some(version), head),
+        None => (None, None),
+    }
+}
+
+/// 控制器包里对外公布的发布版本（`strata_cli/__init__.py` 的 `PRODUCT_VERSION`）。
+/// `version` 是控制器目录名（组件号，`0.1.58`）。
+fn controller_release(root: &Path, version: &str) -> Option<String> {
+    let init = crate::strata::controllers_dir(root)
+        .join(version)
+        .join("strata_cli")
+        .join("__init__.py");
+    let text = std::fs::read_to_string(init).ok()?;
+    product_version_in(&text)
+}
+
+/// 从 `strata_cli/__init__.py` 的源码里取 `PRODUCT_VERSION`（`"0.2.12"`）。
+fn product_version_in(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim().split(':').next().unwrap_or_default().trim() != "PRODUCT_VERSION" {
+            continue;
+        }
+        let value = value.split('#').next().unwrap_or_default().trim();
+        let value = value.trim_matches(|letter| letter == '"' || letter == '\'');
+        if value.chars().next().map_or(false, |first| first.is_ascii_digit()) {
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 /// 一个本地 GGUF 文件组（同名多分片合成一条）。
@@ -1083,5 +1142,80 @@ mod tests {
     fn shard_suffix_is_stripped() {
         assert_eq!(shard_base("Qwen3.8-IQ3_XXS-00001-of-00003"), "Qwen3.8-IQ3_XXS");
         assert_eq!(shard_base("plain-name"), "plain-name");
+    }
+
+    #[test]
+    fn product_version_is_read_from_controller_source() {
+        let text = "SCHEMA_VERSION = 1\n#: 对外公布的版本\nPRODUCT_VERSION = \"0.2.12\"\n";
+        assert_eq!(product_version_in(text).as_deref(), Some("0.2.12"));
+        assert_eq!(
+            product_version_in("PRODUCT_VERSION = '0.2.3.1'  # 只在 Terminal 发"),
+            Some("0.2.3.1".into())
+        );
+        assert_eq!(
+            product_version_in("PRODUCT_VERSION: str = \"0.2.13\"").as_deref(),
+            Some("0.2.13")
+        );
+        assert_eq!(product_version_in("SCHEMA_VERSION = 1"), None);
+    }
+
+    /// 真实形状（用户 m00001）：engine 0.1.58 的 notes 还写着 0.2.9，控制器 0.1.58 的
+    /// `PRODUCT_VERSION` 是 0.2.12 —— 发布号要取控制器那份。
+    #[test]
+    fn stale_engine_notes_lose_to_the_controller_release() {
+        let root = std::env::temp_dir().join(format!("llamacpp-gui-release-{}", crate::logs::now_ms()));
+        let _ = std::fs::remove_dir_all(&root);
+        let engine = root.join("engine").join("0.1.58-windows-x86_64-cuda-cuda13");
+        std::fs::create_dir_all(&engine).unwrap();
+        std::fs::write(
+            engine.join("engine-component.json"),
+            r#"{"version":"0.1.58","notes":"0.2.9 NVIDIA cuda13 engine with the CUDA picture reader"}"#,
+        )
+        .unwrap();
+        let controller = root.join("control").join("0.1.58").join("strata_cli");
+        std::fs::create_dir_all(&controller).unwrap();
+        std::fs::write(
+            controller.join("__init__.py"),
+            "SCHEMA_VERSION = 1\nPRODUCT_VERSION = \"0.2.12\"\n",
+        )
+        .unwrap();
+        assert_eq!(release_of(&root).as_deref(), Some("0.2.12"));
+
+        // 控制器换了、引擎没换（目录名对不上）：不采信，退回 notes
+        std::fs::remove_dir_all(root.join("control").join("0.1.58")).unwrap();
+        let other = root.join("control").join("0.1.60");
+        std::fs::create_dir_all(other.join("strata_cli")).unwrap();
+        std::fs::write(other.join("strata.py"), "").unwrap();
+        std::fs::write(
+            other.join("strata_cli").join("__init__.py"),
+            "PRODUCT_VERSION = \"0.2.14\"\n",
+        )
+        .unwrap();
+        assert_eq!(release_of(&root).as_deref(), Some("0.2.9"));
+
+        // 只有控制器、没有引擎：用它的发布号
+        std::fs::remove_dir_all(root.join("engine")).unwrap();
+        assert_eq!(release_of(&root).as_deref(), Some("0.2.14"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 本机探针：`STRATA_PROBE_ROOT=E:\AI\Strata cargo test --lib probe_release_of -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn probe_release_of() {
+        let Ok(root) = std::env::var("STRATA_PROBE_ROOT") else {
+            return;
+        };
+        println!("release of {root} = {:?}", release_of(Path::new(&root)));
+    }
+
+    #[test]
+    fn no_controller_and_no_notes_means_no_release() {
+        let root = std::env::temp_dir().join(format!("llamacpp-gui-norelease-{}", crate::logs::now_ms()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("engine")).unwrap();
+        assert_eq!(release_of(&root), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
