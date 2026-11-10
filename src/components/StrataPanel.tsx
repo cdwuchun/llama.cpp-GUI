@@ -17,7 +17,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useApp } from "../store";
 import { ipc } from "../ipc";
-import type { StrataLaunchPreset, StrataModelEntry, StrataTuneApplyRecord, StrataTuneSnapshot } from "../types";
+import type {
+  StrataDraftingPlan,
+  StrataLaunchPreset,
+  StrataModelEntry,
+  StrataTuneApplyRecord,
+  StrataTuneSnapshot,
+} from "../types";
 import { ParamForm } from "./ParamForm";
 import type { ParamState } from "../utils/paramSchema";
 import {
@@ -82,6 +88,7 @@ function ConfigCard({
   onWebui,
   onTune,
   onConfigure,
+  onReleaseVram,
 
   launchPreset,
 }: {
@@ -103,6 +110,8 @@ function ConfigCard({
   onWebui: () => void;
   onTune: () => void;
   onConfigure: () => void;
+  /** 显存弹性：让运行中的引擎把专家缓存的空闲显存还给别的程序（POST /v1/vram） */
+  onReleaseVram: () => void;
 
   /** 这份模型的 launch 预设：有就按它生成运行配置再启动（与 `strata launch` 一致） */
   launchPreset: StrataLaunchPreset | null;
@@ -252,6 +261,16 @@ function ConfigCard({
       <button type="button" className="btn-icon" title="参数配置" onClick={onConfigure}>
         <i className="fas fa-sliders" />
       </button>
+      {isRunning ? (
+        <button
+          type="button"
+          className="btn-icon"
+          title="把专家缓存里空闲的显存还给别的程序（引擎端点 POST /v1/vram；要 config 顶层开着「显存弹性」的 NVIDIA 引擎才有效，不卸载模型）"
+          onClick={onReleaseVram}
+        >
+          <i className="fas fa-memory" />
+        </button>
+      ) : null}
       <button
         type="button"
         className="btn-icon"
@@ -288,6 +307,71 @@ function ConfigCard({
       {details}
       {badge}
       {actions}
+    </div>
+  );
+}
+
+/**
+ * DFlash2 草稿器状态条。
+ *
+ * 「要不要下、下多大、这台机器跑不跑得动」全由控制端的 `strata drafting plan` 判断
+ * （上游 0.2.13 起 config 顶层 `drafting: "dflash2"` 才需要它，约 0.34 GB）。
+ * 需要时给一个下载按钮，走 `strata drafting fetch --if-needed`：已就绪时控制端直接回
+ * skipped，所以重复点也不会白下第二份。
+ */
+function DraftingNotice({ file }: { file: string }) {
+  const [plan, setPlan] = useState<StrataDraftingPlan | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const refresh = useCallback(async () => {
+    try {
+      setPlan(await ipc.strataDraftingPlan(file));
+      setError("");
+    } catch (err) {
+      setError(String(err));
+    }
+  }, [file]);
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+  const download = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const result = await ipc.strataDraftingFetch(file);
+      if (result.skipped) setError("控制端检查后认为不需要下载（草稿器已就绪，或当前选择用不上它）");
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(false);
+      void refresh();
+    }
+  };
+  if (!plan && !error) return null;
+  const needed = !!plan?.needed;
+  const summary = needed
+    ? `DFlash2 草稿器还没下载${plan?.gb ? `（${plan.gb.toFixed(2)} GB）` : ""}${plan?.line ? ` · ${plan.line}` : ""}`
+    : plan?.line || plan?.drafter || "草稿器状态未知";
+  return (
+    <div className={`notice ${needed ? "warn" : ""}`}>
+      <i className={`fas ${busy ? "fa-spinner fa-spin" : needed ? "fa-download" : "fa-circle-info"} notice-icon`} />
+      <div>
+        <div>{summary}</div>
+        {plan?.note ? <div className="fs-sm">{plan.note}</div> : null}
+        {plan?.serves === false ? <div className="fs-sm">这台机器的引擎不支持 DFlash2 草稿器。</div> : null}
+        {error ? <div className="text-danger fs-sm">{error}</div> : null}
+      </div>
+      {needed ? (
+        <button
+          type="button"
+          className="btn btn-secondary btn-uniform"
+          disabled={busy}
+          title="调用控制端 strata drafting fetch 下载并校验草稿器（已就绪时不会重复下载）"
+          onClick={() => void download()}
+        >
+          {busy ? "下载中…" : "下载草稿器"}
+        </button>
+      ) : null}
     </div>
   );
 }
@@ -422,8 +506,8 @@ function StrataConfigSheet({
       return false;
     }
     // args 只改参数表认识的 flag（顺序不变、未收录的原样保留）；
-    // 顶层只写 vision.mmproj / vision.model / vision.exe / vision.gpu / vision.max_tokens / open_browser
-    // 以及 sampling.{temperature,top_p,top_k,min_p}，其余顶层键不动（R6）
+    // 顶层只写 vision.*、sampling.*、open_browser、drafting / mtp / vram_elastic / vram_segment_mib，
+    // 其余顶层键不动（R6）
     const next = stateToConfig(formConfig, formState, engineExe);
     const ok = await writeStrataConfig(file, JSON.stringify(next, null, 1));
     setFormError(ok ? "" : "写回 config 失败，见右上角错误");
@@ -490,7 +574,18 @@ function StrataConfigSheet({
 
   const right = (
     <div>
-<ParamForm
+      <DraftingNotice file={file} />
+      {launchPreset && (
+        <div className="notice">
+          <i className="fas fa-rocket" />
+          <div>
+            「草稿器」与「显存弹性」是 config 顶层字段；这个模型启动时按 launch 预设「
+            {launchPreset.name}」重新生成 <code>launch\{launchPreset.file}.json</code>
+            ，预设有自己的一份参数，这几项不保证跟着走（以预设为准）。
+          </div>
+        </div>
+      )}
+      <ParamForm
         state={formState}
         onChange={onFormChange}
         schema={strataParamSchema}
@@ -871,6 +966,7 @@ export function StrataPanel({
   const starting = useApp((s) => s.strataStarting);
   const stopping = useApp((s) => s.strataStopping);
   const busy = useApp((s) => s.busy);
+  const setNotice = useApp((s) => s.setNotice);
   const refreshStrata = useApp((s) => s.refreshStrata);
   const toggleFavourite = useApp((s) => s.toggleFavourite);
   const startStrataModel = useApp((s) => s.startStrataModel);
@@ -1054,6 +1150,12 @@ export function StrataPanel({
                   onTune={() => {
                     setConfigFile(null);
                     setTuneFile(fileOf(e));
+                  }}
+                  onReleaseVram={() => {
+                    void ipc
+                      .strataReleaseVram(fileOf(e))
+                      .then((text) => setNotice(text.trim() || "已让引擎归还空闲显存"))
+                      .catch((err) => setNotice(String(err)));
                   }}
                   onConfigure={() => {
                     setConfigFile(fileOf(e));

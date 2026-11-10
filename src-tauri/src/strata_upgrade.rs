@@ -548,14 +548,48 @@ fn first_lines(text: &str, limit: usize) -> String {
     }
 }
 
-/// `--check` 报告里这一侧是否需要升级（`status` 不是 `current`）。
-fn side_outdated(report: &serde_json::Value, side: &str) -> bool {
-    let status = report
+/// `--check` 报告里这一侧的状态（控制端 updater 的 status 字符串）
+fn side_status<'a>(report: &'a serde_json::Value, side: &str) -> Option<&'a str> {
+    report
         .get(side)
         .and_then(|v| v.get("status"))
         .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    !matches!(status, "current" | "not-in-feed")
+}
+
+/// 引擎/控制器这一侧是否有**可安装**的更新。
+///
+/// 只有 `install` / `available` 是真的有新包能装；其余状态都不是「有更新」：
+/// - `current` / `not-in-feed`：已是最新 / 这版 feed 不带它
+/// - `none-for-this-pc` / `wrong-make`：这台机器没有对应构建（不是更新）
+/// - `failed-before` / `skipped`：控制端自己跳过或上次装失败，`update` 不加 `--force` 不会动
+///
+/// 旧实现只排除 `current`/`not-in-feed`，于是 `failed-before`/`skipped` 之类也被当成
+/// 「有新版本」：界面提示可更新，点下去却什么都没发生。
+fn side_outdated(report: &serde_json::Value, side: &str) -> bool {
+    matches!(side_status(report, side), Some("install") | Some("available"))
+}
+
+/// 该侧「没有可装更新」时的中文原因（有 `note` 就一起显示），给 `describe` 拼提示用。
+fn side_hint(report: &serde_json::Value, side: &str) -> Option<String> {
+    let value = report.get(side)?;
+    let what = match side_status(report, side)? {
+        "failed-before" => "上次安装失败，控制端默认不再重试",
+        "skipped" => "控制端跳过了这一版",
+        "wrong-make" => "feed 里的包不适合这台机器（构建或驱动不符）",
+        "none-for-this-pc" => "feed 里没有这台机器对应的包",
+        _ => return None,
+    };
+    let note = value
+        .get("note")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let label = if side == "engine" { "引擎" } else { "控制器" };
+    let mut text = format!("{label}：{what}");
+    if !note.is_empty() {
+        text.push_str(&format!("（{note}）"));
+    }
+    Some(text)
 }
 
 /// 检查报告压成一句话，给界面直接显示。
@@ -600,7 +634,19 @@ pub fn describe(report: &serde_json::Value, scope: Scope) -> String {
             if scope.wants_control() {
                 parts.push(format!("控制器 {}", installed("control")));
             }
-            return format!("已是最新（{}）", parts.join(" / "));
+            let mut text = format!("已是最新（{}）", parts.join(" / "));
+            // 没有可装更新时，把「为什么没有」也说出来（上次失败 / 跳过 / 不适配）
+            if scope.wants_engine() {
+                if let Some(hint) = side_hint(report, "engine") {
+                    text.push_str(&format!("；{hint}"));
+                }
+            }
+            if scope.wants_control() {
+                if let Some(hint) = side_hint(report, "control") {
+                    text.push_str(&format!("；{hint}"));
+                }
+            }
+            return text;
         }
         (true, false) => vec![format!("引擎 {} → {}", installed("engine"), offered("engine"))],
         (false, true) => vec![format!("控制器 {} → {}", installed("control"), offered("control"))],
@@ -878,6 +924,41 @@ mod tests {
         assert_eq!(describe(&report, Scope::Control), "已是最新（控制器 0.1.51）");
         // `app`（Strata 桌面应用）不归这个按钮管
         assert!(!side_outdated(&report, "engine"));
+    }
+
+    /// 0.2.13 起 `--check` 的引擎侧会报 `skipped` / `failed-before` / `wrong-make` 等状态：
+    /// 这些不是「有更新」（控制端不加 `--force` 根本不会装），描述里要说清原因，
+    /// 不能一边说「可升级」一边点下去什么都不发生。
+    #[test]
+    fn describe_flags_non_installable_statuses() {
+        let report = serde_json::json!({
+            "ok": true,
+            "engine": {
+                "installed": {"version": "0.1.59", "folder": "0.1.59-windows-x86_64-cuda-cuda13"},
+                "offered": {"version": "0.1.59"},
+                "status": "failed-before",
+                "note": "the previous install failed"
+            },
+            "control": {"installed": "0.1.58", "offered": "0.1.59", "status": "available"}
+        });
+        assert!(!side_outdated(&report, "engine"));
+        assert!(side_outdated(&report, "control"));
+        let text = describe(&report, Scope::All);
+        assert!(text.contains("控制器 0.1.58 → 0.1.59"), "实际：{text}");
+        assert!(!text.contains("引擎 0.1.59 →"), "实际：{text}");
+        let engine_only = describe(&report, Scope::Engine);
+        assert!(engine_only.starts_with("已是最新"), "实际：{engine_only}");
+        assert!(engine_only.contains("上次安装失败"), "实际：{engine_only}");
+        assert!(engine_only.contains("the previous install failed"), "实际：{engine_only}");
+
+        // `none-for-this-pc` / `wrong-make` 同理：不是更新，只在说明里出现
+        let report = serde_json::json!({
+            "ok": true,
+            "engine": {"installed": {"version": "0.1.54"}, "offered": null, "status": "none-for-this-pc"},
+            "control": {"installed": "0.1.58", "offered": "0.1.58", "status": "current"}
+        });
+        assert!(!side_outdated(&report, "engine"));
+        assert!(describe(&report, Scope::Engine).contains("没有这台机器对应的包"));
     }
 
     /// feed 里按平台挑控制器包（不联网，纯解析）。

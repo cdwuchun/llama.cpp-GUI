@@ -3849,8 +3849,8 @@ mod tests {
 
 /// 服务地址 + 密钥：全部来自 config 顶层（服务项保存时已写进去）。
 /// api_key 只从 config 读，不下发前端（`StrataModelEntry::api_key` 是 skip_serializing），
-/// 所以启停模型必须由 Rust 侧发起。
-fn service_target(root: &Path, config_file: &str) -> Result<(String, u16, Option<String>), String> {
+/// 所以启停模型必须由 Rust 侧发起。`strata_drafting` 的「归还显存」也用它。
+pub(crate) fn service_target(root: &Path, config_file: &str) -> Result<(String, u16, Option<String>), String> {
     let entry = scan_configs(root, None)
         .into_iter()
         .find(|e| e.config_path.file_name().and_then(|s| s.to_str()) == Some(config_file))

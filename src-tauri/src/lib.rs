@@ -17,6 +17,7 @@ mod state;
 mod strata;
 mod strata_community;
 mod strata_download;
+mod strata_drafting;
 mod strata_orca;
 mod strata_launch;
 mod strata_proxy;
@@ -2448,6 +2449,9 @@ pub fn run() {
         strata_orca_stop,
             strata::strata_unload_model,
             strata::strata_load_model,
+            strata_drafting::strata_drafting_plan,
+            strata_drafting::strata_drafting_fetch,
+            strata_drafting::strata_release_vram,
             logs_snapshot,
             logs_clear,
             logs_info,

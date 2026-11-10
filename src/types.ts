@@ -625,6 +625,35 @@ export interface StrataLaunchPreset {
   last_used: string | null;
 }
 
+/** `strata drafting plan` 的报告（控制端 drafting_cmd.py 的字段原样透传）。 */
+export interface StrataDraftingPlan {
+  ok: boolean;
+  /** 当前选择（auto/mtp/dflash2/off 解析之后）真的要用草稿器、而文件还不在 */
+  needed: boolean;
+  /** 要下载时的大小（GB）；不需要时控制端置 0 */
+  gb?: number;
+  /** 这台机器的引擎能不能跑 DFlash2（不能时界面不提供 dflash2 选项） */
+  serves?: boolean;
+  choice?: string;
+  /** 这份模型实际会用哪种草稿器 */
+  drafter?: string;
+  /** 控制端的一句话说明（为什么选它 / 为什么不适用） */
+  note?: string;
+  /** 给人看的一行结论 */
+  line?: string;
+  support?: string;
+  support_line?: string;
+}
+
+/** `strata drafting fetch` 的结果。 */
+export interface StrataDraftingResult {
+  ok: boolean;
+  event?: string;
+  /** 下载好（或已存在）的 pack 路径；skipped 时为 null */
+  pack?: string | null;
+  skipped?: boolean;
+}
+
 /** Strata 运行状态：进程事实 + 运行时探测（生效上下文、加载状态、token 占用）。 */
 export interface StrataStatus {
   running: boolean;

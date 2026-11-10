@@ -62,12 +62,15 @@ export const STRATA_INSTALL_FACT_FLAGS = [
 const GROUPS = [
   { id: "ctx", label: "上下文与 KV", order: 1, collapsed: false },
   { id: "speed", label: "加速与缓存", order: 2, collapsed: false },
+  // 草稿器是 0.2.13 起的上游主线：--spec 的窗口只是「草稿从哪来」的一半，
+  // 另一半是 config 顶层 drafting（auto / mtp / dflash2 / off）与 mtp（false = 关草稿层）
+  { id: "draft", label: "草稿器", order: 3, collapsed: false },
   // 并发与上面两组是同一层级的启动事实：--batch / --batch-mtp / --batch-groups
   // 是引擎的并发批次开关，--conversation-cache-* 是配套的会话停放预算（用户 m03848）
-  { id: "parallel", label: "并发", order: 3, collapsed: false },
-  { id: "sampling", label: "采样", order: 4, collapsed: false },
-  { id: "vision", label: "多模态", order: 5, collapsed: false },
-  { id: "serve", label: "其它", order: 6, collapsed: true },
+  { id: "parallel", label: "并发", order: 4, collapsed: false },
+  { id: "sampling", label: "采样", order: 5, collapsed: false },
+  { id: "vision", label: "多模态", order: 6, collapsed: false },
+  { id: "serve", label: "其它", order: 7, collapsed: true },
 ];
 
 /** 表单认识的参数（取值域摘自 `strata.exe --help`） */
@@ -525,6 +528,41 @@ const PARAM_META: Omit<ParamDef, "abbr" | "delimiter" | "mergeInto" | "mergeValu
     defaultEnabled: false,
   },
   {
+    // 哨兵 flag：config 顶层 `drafting`（上游 serve/server.py 与 launcher 都从这里读）
+    key: "drafting",
+    flag: "--drafting",
+    type: "STRING",
+    uiType: "dropdown",
+    default: "auto",
+    values: [
+      { value: "auto", label: "auto（按模型与显卡自动选）" },
+      { value: "mtp", label: "mtp（模型自带的 MTP 层）" },
+      { value: "dflash2", label: "dflash2（DFlash2 草稿器，要先下载）" },
+      { value: "off", label: "off（不用草稿器）" },
+    ],
+    label: "草稿来源",
+    desc: "config 顶层 drafting：auto 由上游按模型与显卡自动选（Flash-Next 系在 CUDA/HIP 上选 DFlash2，其余用模型自带的 MTP 层）；dflash2 需要先下载草稿器文件（用配置窗口里的「DFlash2 草稿器」一栏），否则引擎会按 --spec 走 MTP 或直接报错；off 两边都不加载。只在 config 里写这一项就够，不用动 args。改完要重启引擎才生效。",
+    group: "draft",
+    order: 1,
+    sort: 1,
+    defaultEnabled: false,
+  },
+  {
+    // 哨兵 flag：config 顶层 `mtp`（false = 完全不加载 MTP 草稿层）
+    key: "mtp-layer",
+    flag: "--mtp-layer",
+    type: "LOGIC",
+    uiType: null,
+    default: "true",
+    values: [],
+    label: "MTP 草稿层",
+    desc: "config 顶层 mtp：设成 false 就跟启动命令带 `--mtp` 开关的「关」一样，模型自带的 MTP 草稿层完全不加载（省约 0.9 GiB 显存，`--spec` 的推测解码也就一起没了）。不勾「启用」= 不写这个键，引擎按默认加载。",
+    group: "draft",
+    order: 2,
+    sort: 2,
+    defaultEnabled: false,
+  },
+  {
     // 哨兵 flag：config 顶层 open_browser（上游判定 = 启动命令带 --open 且该字段不为 false）
     key: "open-browser",
     flag: "--open-browser",
@@ -537,6 +575,41 @@ const PARAM_META: Omit<ParamDef, "abbr" | "delimiter" | "mergeInto" | "mergeValu
     group: "serve",
     order: 3,
     sort: 3,
+    defaultEnabled: false,
+  },
+  {
+    // 哨兵 flag：config 顶层 vram_elastic（上游 serve/server.py 会补 --vram-elastic）
+    key: "vram-elastic",
+    flag: "--vram-elastic",
+    type: "LOGIC",
+    uiType: null,
+    default: "true",
+    values: [],
+    label: "显存弹性",
+    desc: "config 顶层 vram_elastic：专家缓存按「显存分段」切块，请求之间可以把整段显存还给别的程序（卡片上的「归还显存」调的就是它，POST /v1/vram）。上游只在带 --serve 的 NVIDIA 构建上生效，别的卡上引擎会忽略。分段越小还回去越多，但缓存重建更频繁。改完要重启引擎才生效。",
+    group: "serve",
+    order: 4,
+    sort: 4,
+    defaultEnabled: false,
+  },
+  {
+    // 哨兵 flag：config 顶层 vram_segment_mib（与 --vram-elastic 配对）
+    key: "vram-segment-mib",
+    flag: "--vram-segment-mib",
+    type: "INTEGER",
+    uiType: "dropdown",
+    default: "512",
+    values: [
+      { value: "256", label: "256 MiB" },
+      { value: "512", label: "512 MiB" },
+      { value: "1024", label: "1024 MiB" },
+      { value: "2048", label: "2048 MiB" },
+    ],
+    label: "显存分段",
+    desc: "专家缓存的分段大小（config 顶层 vram_segment_mib，只在勾了「显存弹性」时生效）。引擎按这个粒度把专家槽切成可独立归还的块：512 MiB 是上游默认，显存紧的卡可以调小。",
+    group: "serve",
+    order: 5,
+    sort: 5,
     defaultEnabled: false,
   },
   {
@@ -650,6 +723,10 @@ const TOP_LEVEL_KEYS = new Set([
   "vision-gpu",
   "vision-max-tokens",
   "open-browser",
+  "drafting",
+  "mtp-layer",
+  "vram-elastic",
+  "vram-segment-mib",
   "sampling-temperature",
   "sampling-top-p",
   "sampling-top-k",
@@ -813,6 +890,13 @@ export function checkStrataParamEnable(
     return null;
   }
 
+  if (key === "vram-segment-mib") {
+    if (!on("vram-elastic")) {
+      return "「显存分段」只在「显存弹性」开着时才生效：上游是见到 config 顶层 vram_elastic 为 true 才补 --vram-segment-mib，单独开分段会被忽略";
+    }
+    return null;
+  }
+
   return null;
 }
 
@@ -847,6 +931,17 @@ export function validateStrataParams(
     const v = hostCore.value.trim();
     if (v !== "first" && v !== "last" && v !== "sibling") {
       return `宿主线程核只能是 first、last 或 sibling（现在是「${v || "空"}」）。`;
+    }
+  }
+  // 显存分段：上游按这个粒度切专家缓存，0 / 负数 / 小数都不行（正整数的 MiB）
+  const segment = state["vram-segment-mib"];
+  if (segment?.enabled) {
+    if (!state["vram-elastic"]?.enabled) {
+      return "「显存分段」需要先开「显存弹性」：上游只对 vram_elastic 为 true 的配置补 --vram-segment-mib。";
+    }
+    const n = Number(segment.value.trim());
+    if (!Number.isInteger(n) || n <= 0 || n > 262_144) {
+      return `显存分段必须是 1–262144 之间的整数 MiB（现在是「${segment.value || "空"}」）。`;
     }
   }
   return null;
@@ -919,6 +1014,13 @@ export function stateToArgs(args: unknown[], state: Record<string, ParamState>):
     const key = typeof token === "string" ? FLAG_TO_KEY.get(token) : undefined;
     if (!key) {
       out.push(token);
+      continue;
+    }
+    if (TOP_LEVEL_KEYS.has(key)) {
+      // 顶层字段类参数由 stateToConfig 写顶层：args 里若还留着旧写法（历史 config、
+      // 或上游安装器写的 `--vram-elastic`），连取值一起删掉，避免两处各写一份
+      const next = args[i + 1];
+      if (!FLAG_ONLY.has(key) && next != null && !isFlagToken(String(next))) i += 1;
       continue;
     }
     const entry = state[key];
@@ -996,6 +1098,23 @@ export function configToState(cfg: Record<string, unknown>): Record<string, Para
   const mt = vision?.max_tokens;
   state["vision-max-tokens"] = { enabled: mt != null, value: mt != null ? String(mt) : "768" };
   state["open-browser"] = { enabled: !!cfg.open_browser, value: cfg.open_browser ? "true" : "false" };
+  // 草稿器：顶层 `drafting`（字符串）与 `mtp`（false = 关草稿层）
+  const drafting = typeof cfg.drafting === "string" ? cfg.drafting : "";
+  state["drafting"] = { enabled: drafting !== "", value: drafting || "auto" };
+  state["mtp-layer"] = {
+    enabled: typeof cfg.mtp === "boolean",
+    value: cfg.mtp === false ? "false" : "true",
+  };
+  // 显存弹性：顶层 `vram_elastic`（布尔）与 `vram_segment_mib`（正整数）
+  state["vram-elastic"] = {
+    enabled: typeof cfg.vram_elastic === "boolean",
+    value: cfg.vram_elastic === false ? "false" : "true",
+  };
+  const segment = cfg.vram_segment_mib;
+  state["vram-segment-mib"] = {
+    enabled: typeof segment === "number" && segment > 0,
+    value: typeof segment === "number" ? String(segment) : "512",
+  };
   // 采样默认值：整块缺省 = 没写；某个键缺省 = 未启用，界面显示 schema 里的默认值当占位
   const sampling =
     cfg.sampling && typeof cfg.sampling === "object"
@@ -1116,6 +1235,24 @@ export function stateToConfig(
 
   if (state["open-browser"]?.enabled) next.open_browser = true;
   else if ("open_browser" in cfg) next.open_browser = false;
+
+  // 草稿器：上游 serve/server.py 与 launcher 都从 config 顶层读这两项
+  const drafting = (state["drafting"]?.value || "").trim();
+  if (state["drafting"]?.enabled && drafting) next.drafting = drafting;
+  else delete next.drafting;
+  if (state["mtp-layer"]?.enabled) next.mtp = (state["mtp-layer"].value || "true") !== "false";
+  else delete next.mtp;
+
+  // 显存弹性：同样只写顶层（server.py 见到 true 补 --vram-elastic / --vram-segment-mib）
+  if (state["vram-elastic"]?.enabled) {
+    next.vram_elastic = (state["vram-elastic"].value || "true") !== "false";
+  } else delete next.vram_elastic;
+  const segmentRaw = state["vram-segment-mib"]?.enabled
+    ? state["vram-segment-mib"].value.trim()
+    : "";
+  const segment = segmentRaw === "" ? NaN : Number(segmentRaw);
+  if (Number.isInteger(segment) && segment > 0) next.vram_segment_mib = segment;
+  else delete next.vram_segment_mib;
 
   // env 块：勾选的写 "1"，取消的删掉；GUI 不认识的其他变量原样保留
   const prevEnv =

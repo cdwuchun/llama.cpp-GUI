@@ -3,7 +3,7 @@
 > 面向**接手这个仓库的新会话 / 新维护者**。`README.md` 讲能力与用法，本文讲**怎么接手**：架构与代码地图（§1）、
 > llama.cpp 行为约束（§2）、前端约定（§3）、后端要点（§4）、构建与验证（§5）、运行时数据文件（§6）、未决项（§7）。
 >
-> **现行版本 0.3.6（2026-11-08）**。逐轮实现日志与历史决策不写在这里，去 `docs/archive/`：
+> **现行版本 0.3.7（2026-11-10）**。逐轮实现日志与历史决策不写在这里，去 `docs/archive/`：
 > `ITERATION_LOG.md`（0.1.x → 0.2.0 的起因、实测证据与坑）、`DECISIONS-2026-10.md`（2026-10 关键决策）；
 > 已落地的设计文档：`PROXY_SCHEDULER_PLAN.md`（前门与配置层规格）、`STRATA_INTEGRATION_PLAN.md`（Strata 通道）、
 > `STRATA_MANAGER_PORT_ASSESSMENT.md`（聊天/监控/压测移植）、`WEB_SEARCH_PLAN.md`（五引擎搜索）、
@@ -188,6 +188,9 @@ Strata 的二进制不同名、没有 router mode，config 是 `strata-*.json`�
 **参数表与徽标**
 - **卡片徽标的「支持 MTP」以 `args` 里带 `--mtp` 为准**（`StrataModelEntry.mtp` 只暴露 bool，路径不下沉 WebView，与 `has_api_key` 同口径）：`--mtp` 是安装器写下的安装事实（`STRATA_INSTALL_FACT_FLAGS`，GUI 只读、写回原样保留）。**不要改用模型名正则** —— 模型列表页那条 `/mtp/i.test(name)` 认的是文件名里带 MTP 的外挂草稿场景。`--spec` 是推测解码窗口，写 `0` 时徽标显示虚线压暗的「MTP 关」。
 - **并发参数集中在「并发」组，默认全不配，且有依赖校验**：`--batch`（别名 `--slots`，2..8）、`--batch-mtp`、`--batch-groups`（默认 64，0 = off）、`--conversation-cache-mib`（默认 0）、`--conversation-cache-slots`（默认 4）。规则：`--batch-mtp` 需 `--batch` + `--mtp` + `--spec` 且不能与 `--batch-groups` 同开；`--batch-groups` 需 `--batch`；`--conversation-cache-slots` 需预算 > 0。`strataParams.ts::checkStrataParamEnable` 逐项判定，`validateStrataParams` 写盘前整组兜底（左栏 config 原文可绕过勾选）；`ParamForm` 的 `onBeforeToggle` 拒绝时开关不切换并就地显示原因。
+- **草稿器（DFlash2）与显存弹性的开关在 config 顶层，不进 `args`**：`drafting`（`auto`/`mtp`/`dflash2`/`off`）、`mtp`（`false` = 不加载 MTP 层）、`vram_elastic`（`true` = 允许请求间归还显存）、`vram_segment_mib` 都是 `serve/server.py` 启动时读的顶层字段 —— 它按 `drafting.apply()` 原地**改写** args 再交给引擎，`vram_elastic` 才追加 `--vram-elastic` / `--vram-segment-mib`（0.1.58 `serve/server.py:3788-3852`）。所以 GUI 里这四个是哨兵参数（`--drafting` / `--mtp-layer` / `--vram-elastic` / `--vram-segment-mib`，全在 `TOP_LEVEL_KEYS`，写回时落顶层），**别改成往 args 里塞 flag**：塞进去会被 serve 再删一遍，且 `--drafting` 这种 flag 引擎根本不认。手写 `drafting: dflash2` 前草稿器 pack 必须已下载，否则 serve 起不来并打印 `Run strata drafting fetch`。
+- **草稿器下载走控制端，GUI 不自己拼 URL**：`python <终端>\strata.py drafting plan|fetch --config <config> --output json|jsonl [--if-needed]`，`plan` 回一行 JSON（`needed` / `gb` / `serves` / `drafter` / `note`），`fetch` 回 progress 行 + 最后 result 行，失败退出码 5、`{"ok":false,"error":{"code":"drafting_failed",…}}`。DFlash2 的调优 drafter 约 0.34 GB，按卡选 `*-selq4.pack` / `*-bf16sel.pack`；`--if-needed` 在不需要时直接回 `{"skipped":true}`。后端 `strata_drafting.rs` 三个命令：`strata_drafting_plan`、`strata_drafting_fetch`（3600 s 超时）、`strata_release_vram`（`POST /v1/vram`，只对 `vram_elastic` 开着的 NVIDIA 引擎有效，不卸载模型）。
+- **「有更新」只认 `install` / `available`**（0.2.13 起 `strata.py update --check` 多出几种状态）：`skipped`（控制端跳过了这一版）、`failed-before`（上次装失败，默认不再重试）、`wrong-make`（包与构建/驱动不符）、`none-for-this-pc`（feed 里没这台机器的包）都**不是**可升级 —— 点下去 `updater.py` 直接跳过（除非 `--force`），所以 `strata_upgrade::side_outdated` 只对前两种为真，其余在描述里附原因（`side_hint`）。
 - **引擎与它 spawn 的子进程都加 `CREATE_BREAKAWAY_FROM_JOB`**（`winfix::no_throttle`）：GUI 被后台化时子进程若继承宿主 Job Object 会被 CPU 节流，推理掉到个位数 t/s；父 Job 未开 `BREAKAWAY_OK` 时去掉该 flag 重试。
 
 **参数调优**
@@ -275,13 +278,13 @@ Strata 的二进制不同名、没有 router mode，config 是 `strata-*.json`�
 npm install                        # 受限沙箱里需要 --ignore-scripts
 npm run cargo:proxy                # 另开终端保持运行：本机 crates 代理 http://127.0.0.1:8787
 npx tsc --noEmit                   # 前端类型检查（仓库根）
-cd src-tauri; cargo test --lib      # 后端单测（0.3.6 基线 179 passed / 18 ignored）
+cd src-tauri; cargo test --lib      # 后端单测（当前基线 183 passed / 19 ignored）
 npm test                           # test:web + test:rs
 npm run tauri build                # 打包（exe + NSIS 安装包）
 node scripts/make-icons.mjs        # 重新生成全部图标资产
 ```
 
-- **cargo 要走本机代理**：本机 Windows 原生 TLS（schannel）不可用（`SEC_E_NO_CREDENTIALS`），`.cargo/config.toml` 已把 `crates-io` 指向 `127.0.0.1:8787`；没开代理就是 `Could not connect to server`。
+- **cargo 要走本机代理**：本机 Windows 原生 TLS（schannel）不可用（`SEC_E_NO_CREDENTIALS`），`.cargo/config.toml` 已把 `crates-io` 指向 `127.0.0.1:8787`；没开代理就是 `Could not connect to server`。依赖已在本地缓存时（`Cargo.lock` 未变）也可以直接 `cargo check --offline --lib` / `cargo test --offline --lib` 绕过代理。
 - **沙箱限制**：命名管道被禁 → esbuild 报 `spawn EPERM`，打包需要更宽权限；**GUI 运行验证必须在沙箱外**（WebView2 渲染进程走命名管道）。
 - **构建/测试都要把 `TEMP`/`TMP` 指进工作区**（只提权不够）：
 

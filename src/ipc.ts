@@ -41,6 +41,8 @@ import type {
   StrataCatalogSnapshot,
   StrataLocalGguf,
   StrataMtpCheck,
+  StrataDraftingPlan,
+  StrataDraftingResult,
   StrataCommunityDiscovery,
   StrataOrcaProbe,
   StrataOrcaSnapshot,
@@ -118,6 +120,14 @@ export const ipc = {
   strataUnloadModel: (configFile: string) => invoke<string>("strata_unload_model", { configFile }),
   /** 加载运行中 Strata 的模型（POST /load）：上游会跑 before_load 并检查显存门槛 */
   strataLoadModel: (configFile: string) => invoke<string>("strata_load_model", { configFile }),
+  /** DFlash2 草稿器：问控制端「这份 config 要不要下、下多大」（`strata drafting plan`，只读） */
+  strataDraftingPlan: (configFile: string) =>
+    invoke<StrataDraftingPlan>("strata_drafting_plan", { configFile }),
+  /** DFlash2 草稿器：需要才下载（`strata drafting fetch --if-needed`，约 0.34 GB，阻塞到结束） */
+  strataDraftingFetch: (configFile: string) =>
+    invoke<StrataDraftingResult>("strata_drafting_fetch", { configFile }),
+  /** 显存弹性：让运行中的引擎把专家缓存的空闲显存还给别的程序（POST /v1/vram） */
+  strataReleaseVram: (configFile: string) => invoke<string>("strata_release_vram", { configFile }),
   /** 列出官方安装目录下所有可用的引擎版本（可能多份并存） */
   strataEngines: () => invoke<StrataEngine[]>("strata_engines"),
   /** 把某份 config 的 exe 换成选定的引擎可执行文件 */
