@@ -15,14 +15,14 @@
 //! `vram_elastic: true` 的 NVIDIA 构建上有效，引擎把专家缓存的空闲分段还给别的程序。
 //! 它不卸载模型，也不停引擎。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 /// 控制端目录 + python + strata.py（与 `strata.rs::run_components` 同一套定位）。
-fn locate() -> Result<(PathBuf, PathBuf, PathBuf)> {
+fn locate() -> Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
     let root = crate::strata::root()
         .filter(|root| root.is_dir())
         .context("未找到 Strata 目录（设置 → 通用 → Strata 目录 可指定）")?;
@@ -36,15 +36,15 @@ fn locate() -> Result<(PathBuf, PathBuf, PathBuf)> {
     if !script.is_file() {
         anyhow::bail!("控制端缺少 strata.py：{}", script.display());
     }
-    Ok((terminal, python, script))
+    Ok((root, terminal, python, script))
 }
 
 fn run(config_file: &str, fetch: bool) -> Result<serde_json::Value> {
-    let (terminal, python, script) = locate()?;
-    let config = Path::new(config_file);
-    if !config.is_file() {
-        anyhow::bail!("config 不存在：{}", config.display());
-    }
+    let (root, terminal, python, script) = locate()?;
+    // 前端只传 config 的文件名：必须按文件名回安装目录里找，相对路径会落在 GUI 进程的 cwd 上
+    let config = crate::strata::config_entry(&root, config_file)
+        .map_err(anyhow::Error::msg)?
+        .config_path;
     let action = if fetch { "fetch" } else { "plan" };
     let mut cmd = Command::new(&python);
     cmd.arg(&script)

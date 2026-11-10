@@ -3847,14 +3847,22 @@ mod tests {
     }
 }
 
+/// 按**文件名**在 `<根>\install` 下定位一份 config。
+///
+/// 前端（WebView）只拿到 config 的文件名，凡是「按 config 干活」的后端命令都必须先过这一步：
+/// 直接 `Path::new(file_name).is_file()` 会相对 GUI 进程的 cwd 找，永远报「config 不存在」。
+pub(crate) fn config_entry(root: &Path, config_file: &str) -> Result<StrataModelEntry, String> {
+    scan_configs(root, None)
+        .into_iter()
+        .find(|e| e.config_path.file_name().and_then(|s| s.to_str()) == Some(config_file))
+        .ok_or_else(|| format!("找不到 Strata 配置：{config_file}"))
+}
+
 /// 服务地址 + 密钥：全部来自 config 顶层（服务项保存时已写进去）。
 /// api_key 只从 config 读，不下发前端（`StrataModelEntry::api_key` 是 skip_serializing），
 /// 所以启停模型必须由 Rust 侧发起。`strata_drafting` 的「归还显存」也用它。
 pub(crate) fn service_target(root: &Path, config_file: &str) -> Result<(String, u16, Option<String>), String> {
-    let entry = scan_configs(root, None)
-        .into_iter()
-        .find(|e| e.config_path.file_name().and_then(|s| s.to_str()) == Some(config_file))
-        .ok_or_else(|| format!("找不到 Strata 配置：{config_file}"))?;
+    let entry = config_entry(root, config_file)?;
     let host = if entry.host.trim().is_empty() {
         "127.0.0.1".to_string()
     } else {
