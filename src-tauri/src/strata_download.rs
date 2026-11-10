@@ -858,14 +858,17 @@ pub fn host_info() -> HostInfo {
 
 /// 已装 Strata 的发布版本（`0.2.12` 这条线）。
 ///
-/// **先看控制器包**：`<控制端>/strata_cli/__init__.py` 的 `PRODUCT_VERSION = "0.2.12"`
+/// **只问控制器包**：`<控制端>/strata_cli/__init__.py` 的 `PRODUCT_VERSION = "0.2.12"`
 /// 就是上游 release tag 的号（上游注释：这是「对外告诉用户」的版本，引擎与控制器的
-/// 组件号走 `0.1.58`）。只有控制器目录名与引擎组件号一致（同一次发布装的两份）时才
-/// 采信，免得控制器升了、引擎没升时把发布号说新了。
+/// 组件号走 `0.1.58`）。
 ///
-/// 读不到控制器才退回引擎清单 `engine-component.json` 的 `notes` 开头
-/// （`"0.2.7 NVIDIA cuda13 engine …"`）：0.2.12 那版引擎包里这段散文仍写着 `0.2.9`
-/// （上游打包时没更新），单靠它会把新装的说成旧发布（用户 m00001）。
+/// 不能要求「控制器目录名 == 引擎组件号」：上游 0.2.13 起 Windows/Mac 的发布只升引擎，
+/// 执行 `strata update` 后引擎是 0.1.59、控制器仍是 0.1.58（release notes 原文
+/// "Control not part of this feed"），旧写法在这个组合下会退回引擎 notes。
+///
+/// 引擎清单 `engine-component.json` 的 `notes` 开头只作兜底（`"0.2.9 NVIDIA cuda13
+/// engine …"`：上游打包时这段散文没跟着版本更新，单靠它会把 0.2.12/0.2.13 说成 0.2.9，
+/// 用户 m00001、m01137）。
 ///
 /// 这条线不能从 `strata components engine` 拿 —— 控制端的组件目录（`%LOCALAPPDATA%`）
 /// 与 `setup.py` 装的 `<根>/engine` 是两个地方，前者在本机恒为空。
@@ -874,15 +877,24 @@ fn engine_release() -> Option<String> {
 }
 
 fn release_of(root: &Path) -> Option<String> {
-    let (engine, notes) = newest_engine(root);
-    match &engine {
-        Some(version) => controller_release(root, version).or(notes),
-        // 只装了控制器、还没有引擎：控制器的发布号就是 Strata 的号
-        None => crate::strata::list_controllers(root)
-            .first()
-            .and_then(|info| controller_release(root, &info.version))
-            .or(notes),
+    let (_, notes) = newest_engine(root);
+    controller_release_of(root).or(notes)
+}
+
+/// 控制器对外公布的发布号：当前该用的控制器优先（用户选的 → 最新可用 → `active.json`），
+/// 其次按目录名从新到旧试，都读不到才返回 `None`。
+fn controller_release_of(root: &Path) -> Option<String> {
+    let preferred = crate::strata::preferred_controller(root)
+        .and_then(|dir| dir.file_name().map(|name| name.to_string_lossy().to_string()));
+    let candidates = preferred
+        .into_iter()
+        .chain(crate::strata::list_controllers(root).into_iter().map(|info| info.version));
+    for version in candidates {
+        if let Some(release) = controller_release(root, &version) {
+            return Some(release);
+        }
     }
+    None
 }
 
 /// `<根>/engine/<目录>/engine-component.json` 里组件号最大的那份 →（组件号，notes 开头的发布号）。
@@ -1174,6 +1186,8 @@ mod tests {
         .unwrap();
         let controller = root.join("control").join("0.1.58").join("strata_cli");
         std::fs::create_dir_all(&controller).unwrap();
+        // 控制器目录要能被 `list_controllers` 认出来（带 `strata.py` 或 `serve/server.py`）
+        std::fs::write(root.join("control").join("0.1.58").join("strata.py"), "").unwrap();
         std::fs::write(
             controller.join("__init__.py"),
             "SCHEMA_VERSION = 1\nPRODUCT_VERSION = \"0.2.12\"\n",
@@ -1181,7 +1195,8 @@ mod tests {
         .unwrap();
         assert_eq!(release_of(&root).as_deref(), Some("0.2.12"));
 
-        // 控制器换了、引擎没换（目录名对不上）：不采信，退回 notes
+        // 控制器换了、引擎没换（目录名对不上）：发布号仍取控制器的 —— 上游 0.2.13 对
+        // Windows 只升引擎不升控制器，旧逻辑在这里会退回 notes 里的 0.2.9（用户 m01137）
         std::fs::remove_dir_all(root.join("control").join("0.1.58")).unwrap();
         let other = root.join("control").join("0.1.60");
         std::fs::create_dir_all(other.join("strata_cli")).unwrap();
@@ -1191,7 +1206,7 @@ mod tests {
             "PRODUCT_VERSION = \"0.2.14\"\n",
         )
         .unwrap();
-        assert_eq!(release_of(&root).as_deref(), Some("0.2.9"));
+        assert_eq!(release_of(&root).as_deref(), Some("0.2.14"));
 
         // 只有控制器、没有引擎：用它的发布号
         std::fs::remove_dir_all(root.join("engine")).unwrap();
