@@ -3,7 +3,7 @@
 > 面向**接手这个仓库的新会话 / 新维护者**。`README.md` 讲能力与用法，本文讲**怎么接手**：架构与代码地图（§1）、
 > llama.cpp 行为约束（§2）、前端约定（§3）、后端要点（§4）、构建与验证（§5）、运行时数据文件（§6）、未决项（§7）。
 >
-> **现行版本 0.3.9（2026-11-10）**。逐轮实现日志与历史决策不写在这里，去 `docs/archive/`：
+> **现行版本 0.3.10（2026-11-12）**。逐轮实现日志与历史决策不写在这里，去 `docs/archive/`：
 > `ITERATION_LOG.md`（0.1.x → 0.2.0 的起因、实测证据与坑）、`DECISIONS-2026-10.md`（2026-10 关键决策）；
 > 已落地的设计文档：`PROXY_SCHEDULER_PLAN.md`（前门与配置层规格）、`STRATA_INTEGRATION_PLAN.md`（Strata 通道）、
 > `STRATA_MANAGER_PORT_ASSESSMENT.md`（聊天/监控/压测移植）、`WEB_SEARCH_PLAN.md`（五引擎搜索）、
@@ -278,7 +278,7 @@ Strata 的二进制不同名、没有 router mode，config 是 `strata-*.json`�
 npm install                        # 受限沙箱里需要 --ignore-scripts
 npm run cargo:proxy                # 另开终端保持运行：本机 crates 代理 http://127.0.0.1:8787
 npx tsc --noEmit                   # 前端类型检查（仓库根）
-cd src-tauri; cargo test --lib      # 后端单测（当前基线 183 passed / 19 ignored）
+cd src-tauri; cargo test --lib      # 后端单测（当前基线 184 passed / 19 ignored）
 npm test                           # test:web + test:rs
 npm run tauri build                # 打包（exe + NSIS 安装包）
 node scripts/make-icons.mjs        # 重新生成全部图标资产
@@ -352,6 +352,11 @@ Strata 侧：`strata_root`、`strata_controller`、`strata_auto_controller`(true
 **已知边界**（现状如此，不是缺陷）：
 2. **纯前端渲染的页面 `web_fetch` 抓不到正文**：不跑 JS，SPA 站点只能拿到几百字符占位，模型只能吃搜索摘要。
 3. **聊天历史受 localStorage 配额限制**：`CHAT_CONVERSATION_LIMIT = 30`、`CHAT_MESSAGE_LIMIT = 200`、`TOOL_RESULT_KEEP = 2_000`（`src/store.ts`）。`web_fetch` 单页最多 1.2 万字符，落盘时按 `TOOL_RESULT_KEEP` 截断 —— 不截断会把约 5 MB 配额写满，设置与主题随后静默存不进去。
+   - **工具卡片跨轮回填是摘要，不是原文**（`src/utils/chat.ts::summarizeToolResult`，≤800 字符/条）：搜索结果留「标题 —— 摘要 + URL」，正文抓取留「原文地址 + 正文开头」，末尾写明完整结果在哪张卡片上。整段回填会让长会话每轮多几万 tokens（部署版实测 prompt 冲到 12 万）。
+   - **工具循环最多 5 轮，用尽必答**：`sendChat` 里 `hitToolLimit` 记下「第 5 轮还在要工具」，循环后无论这一轮是否已写了过渡语都补一次收尾请求（`tools=[]`、`reasoning_effort: none`）。整轮工具调用全被去重拦下（一个新资料都没拿到）时提前收尾，不再空转。
+   - **上次打开的会话会恢复**：`CHAT_ACTIVE_KEY = "llamacpp-gui-chat-active"` 记 activeId；记着的会话被删了才退回最近更新的一条。不恢复的话，重启/刷新后聊天页是空白新会话，用户会以为上下文被重置。
+    - **本机事实靠一个 local-first 的 MCP 服务器**（`tools/llamacpp-mcp.mjs`，stdio，MCP 2024-11-05）：暴露 `list_dir` / `llama_help` / `read_text_file` / `run_readonly_command` 四个只读工具。`llama_help` 直接跑该版本 `llama-*.exe --help` 拿真实参数表（这是「b12196 支持哪些 MoE 参数」这类问题的唯一可靠来源，网上查不到）。部署版配在 `E:\AI\llama.cpp-gui\mcp.json`（脚本复制到 `E:\AI\llama.cpp-gui\tools\`），聊天设置里勾选「MCP 工具」后生效。
+      - 安全边界（**路径不限、命令只读**）：`read_text_file` / `list_dir` 可读任意路径（二进制与 256 KB / 400 行上限）；`run_readonly` **不经 shell**（`shell: false`，`>`、`|`、`;` 不被解释），程序与参数双白名单 —— 只允许 `llama-*.exe` 的 `--help/-h/--version/-v/--list-devices`、`nvidia-smi` 显存查询、`tasklist`、`where`、`node -v`；其余一律拒绝，任何写文件、删文件、改配置的意图都被拦下。另外两条约束保留：读文本时把 `api_key` 之类字段与 `sk-…` 打码；输出限长（20 000 字符、文件 256 KB / 400 行）。`selectedVersion()` 内部读部署目录的 `settings.json` 只为拿版本目录名，不向模型暴露内容。GBK 控制台输出（`tasklist` 等）先按 UTF-8 解，出现替换字符再回退 GBK。
 4. **`models_max = 1` 时每次换模型都要停旧起新**：切模型有 3–6 秒冷启动，不是卡住；要并行驻留就调大 `models_max`。
 
 ---

@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -360,11 +361,20 @@ fn curl_command() -> Command {
 }
 
 fn unique_stamp() -> String {
+    // 纳秒时钟在 Windows 上的实际分辨率可能只有 100ns 甚至更粗，一次多查询并发
+    // （4~8 个 curl 同时起）会撞出同一个 stamp，几个请求共用同一份临时文件 ——
+    // 实测表现为 AnySearch 收到残缺 JSON 回 400（`invalid character 'p' after top-level value`）
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|value| value.as_nanos())
         .unwrap_or(0);
-    format!("{}-{}", std::process::id(), nanos)
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        nanos,
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// POST 一个 JSON，返回状态码 + 响应体。
@@ -380,7 +390,7 @@ fn http_post_json(url: &str, headers: &[(&str, String)], body: &Value) -> Result
 
     let payload = serde_json::to_vec(body)
         .map_err(|error| Fail::new(FailureClass::Unknown, format!("拼请求体失败：{error}")))?;
-    fs::write(&body_path, payload)
+    fs::write(&body_path, &payload)
         .map_err(|error| Fail::new(FailureClass::Transient, format!("写临时文件失败：{error}")))?;
 
     let mut command = curl_command();
@@ -389,7 +399,9 @@ fn http_post_json(url: &str, headers: &[(&str, String)], body: &Value) -> Result
         "-L",
         "--compressed",
         "--max-time",
-        "20",
+        // Tavily 的 include_raw_content 一次能回 20 万字符以上（10 条整页 markdown），
+        // 20s 会在响应中途被 curl 掐断，解析出来是 `EOF while parsing a string at line 1 column 236946`
+        "45",
         "--connect-timeout",
         "8",
         "--max-filesize",
@@ -420,7 +432,6 @@ fn http_post_json(url: &str, headers: &[(&str, String)], body: &Value) -> Result
         .arg(url);
 
     let output = command.output();
-    let _ = fs::remove_file(&body_path);
     // cfg 里有密钥，curl 退出后立刻删，别留在 %TEMP% 里
     let _ = fs::remove_file(&cfg_path);
     let output = match output {
@@ -447,6 +458,13 @@ fn http_post_json(url: &str, headers: &[(&str, String)], body: &Value) -> Result
         .unwrap_or(0);
     let text = fs::read_to_string(&out_path).unwrap_or_default();
     let _ = fs::remove_file(&out_path);
+    // 服务端说 body 不合法（实测 AnySearch 偶发 `invalid character 'p' after top-level value`）
+    // 时把发出去的字节留一份，否则只能瞎猜
+    if status >= 400 {
+        let keep = dir.join(format!("llamacpp-search-fail-{stamp}.json"));
+        let _ = fs::write(&keep, &payload);
+    }
+    let _ = fs::remove_file(&body_path);
 
     if status == 0 {
         let stderr = String::from_utf8_lossy(&output.stderr);

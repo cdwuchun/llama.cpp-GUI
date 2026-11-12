@@ -522,6 +522,151 @@ function apiMessage(message: ChatTurn, supportsImages: boolean): Record<string, 
   return { role: message.role, content: parts, ...extra };
 }
 
+/**
+ * 联网搜索的查询拆解规则，作为 system 消息注入（用户自写 system prompt 时不注入）。
+ *
+ * 部署版实测：模型拿到「b12196 加载 MiniCPM-V、12G 显存怎么调参」这种问题，
+ * 会搜「llama.cpp b12196 新参数有哪些」这类整句泛问，搜回来的都是无关博客，
+ * 然后自己编参数名（`--moe-offload` / `--tensor-size-split-method` 都不存在）。
+ * 这里把「实体拆开、版本号查 release/docs/PR、参数名原样引用」写成硬规则。
+ */
+const TOOL_SEARCH_POLICY = [
+  "需要联网时，先把用户的问题拆成实体再搜，不要把整句问题当查询词。",
+  "1. 版本号、模型名、硬件型号、参数名各成一条查询；例如「llama.cpp --moe-cache-mib」「MiniCPM-V 4.7 35B A3B GGUF 层数 专家数」。",
+  "2. 问「某个版本新增了什么」时，查该版本的 release 页、docs 目录和相关 PR，不要用「新参数有哪些」这种泛问。",
+  "3. 每条查询不超过 12 个词；同一轮不要重复含义相同的查询。",
+  "4. 搜到的页面里出现具体参数名（-- 开头的名字）时，原样引用并说明用途；资料里没有的参数不要写进答案。",
+  "5. 查不到就直说「没查到」，不要用常识补、不要编参数名或数值，也不要用「可能」「大概」伪装成结论。",
+].join("\n");
+
+/** 回填历史时每条工具结果压到的字符数：卡片里留的是 2000 字原文，喂模型只给摘要 */
+const TOOL_REPLAY_CHARS = 2400;
+/** 网页正文回填的长度：比搜索条目宽一点，模型要据此回答细节 */
+const TOOL_REPLAY_PAGE_CHARS = 1600;
+/** 搜索摘要最多列几条、每条摘要留多少字 */
+const TOOL_REPLAY_ITEMS = 8;
+const TOOL_REPLAY_ITEM_CHARS = 320;
+
+function clip(text: string, limit: number): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > limit ? `${flat.slice(0, limit)}…` : flat;
+}
+
+/**
+ * 从工具结果里捡出 llama.cpp 风格的参数名（`--moe-cache-mib` 这种）。
+ *
+ * 摘要按「条目 + 前 N 字」截断，参数名常常落在被截掉的后半段；但用户问的偏偏就是
+ * 「新版加了哪些参数」（m00806 那轮摘要里没露出 `--moe-cache-mib`，模型就自己编）。
+ * 参数名本身很短，单独扫全文收进摘要，代价几十个字符。
+ */
+function extractFlags(text: string): string {
+  const found = new Set<string>();
+  for (const flag of text.match(/(?<![-\w])--[a-z][a-z0-9-]{3,}/g) ?? []) {
+    if (flag.length >= 6 && flag.length <= 40) found.add(flag);
+    if (found.size >= 16) break;
+  }
+  return [...found].join(" ");
+}
+
+/**
+ * 把工具结果压成回填用的摘要。
+ *
+ * 回填是为了让模型记得上一轮搜到了什么，不是重读原文：整段塞回去会让长会话
+ * 每轮多几万 tokens（部署版实测 prompt 冲到 12 万），摘要只留条目骨架就够。
+ * 但摘要必须能指回原文：搜索结果每条留 URL，正文抓取留原始地址，末尾写明
+ * 完整结果在哪张卡片上 —— 模型要细节时可以据此引用，而不是凭空编。
+ * 不可信内容边界与后端加的那句说明是套话，这里去掉（说明里的地址留下来当指针）。
+ */
+export function summarizeToolResult(name: string, result: string, id?: string): string {
+  const pointer = `（完整结果见会话里的工具卡片 ${name}${id ? ` #${id}` : ""}）`;
+  const text = result.replace(/<\/?untrusted-web-content>/g, "").trim();
+  if (!text) return `（工具没有返回内容）${pointer}`;
+  // 后端块首的说明：`（以下来自 … 的搜索结果…）` / `（以下是 <url> 的网页正文…）`；
+  // 多条查询时一块一段说明，所以全局摘掉，同时把里面的原文地址留下来
+  const notes = text.match(/^（以下[^\n]*）$/gm) ?? [];
+  const source = notes.join(" ").match(/https?:\/\/[^\s）]+/)?.[0] ?? "";
+  const body = notes.length
+    ? text
+        .split("\n")
+        .filter((line) => !/^（以下[^\n]*）$/.test(line.trim()))
+        .join("\n")
+        .trim()
+    : text;
+  if (name === "web_search") {
+    // 单条查询：`1. 标题` 换行 URL 换行摘要；多条查询：先按 `### 查询词` 分节
+    const sections = body.split(/\n(?=###\s)/).filter((section) => section.trim() !== "");
+    const parts = sections.map((section) => {
+      const label = section.match(/^###\s+(.+)$/m)?.[1]?.trim() ?? "";
+      const inner = label ? section.replace(/^###\s+.+$/m, "").trim() : section;
+      const items = inner.split(/\n(?=\d{1,2}\.\s)/).filter((item) => item.trim() !== "");
+      const picked = items.slice(0, TOOL_REPLAY_ITEMS).map((item) => {
+        const [head, ...rest] = item.split("\n");
+        const url = rest.map((line) => line.trim()).find((line) => /^https?:\/\//i.test(line)) ?? "";
+        const detail = clip(
+          rest
+            .map((line) => line.trim())
+            // 「（另有 N 条结果因为超出本次长度预算没有列出…）」是后端的总数说明，不算某一条的摘要
+            .filter(
+              (line) =>
+                line !== "" && !/^https?:\/\//i.test(line) && !/^（另有 \d+ 条/.test(line),
+            )
+            .join(" "),
+          TOOL_REPLAY_ITEM_CHARS,
+        );
+        const title = head.replace(/^\d{1,2}\.\s+/, "").trim();
+        const tail = url ? `（${url}）` : "";
+        return detail ? `${title} —— ${detail}${tail}` : `${title}${tail}`;
+      });
+      const more = items.length - picked.length;
+      return `${label ? `【${label}】` : ""}${picked.join("；")}${more > 0 ? `；另有 ${more} 条未展开` : ""}`;
+    });
+    const flags = extractFlags(body);
+    return `${clip(parts.join(" "), TOOL_REPLAY_CHARS)}${flags ? `；资料里出现的参数：${flags}` : ""}${pointer}`;
+  }
+  const head = source ? `原文 ${source}。` : "";
+  const flags = extractFlags(body);
+  return `${head}${clip(body, TOOL_REPLAY_PAGE_CHARS)}${flags ? `（本页提到的参数：${flags}）` : ""}${pointer}`;
+}
+
+/**
+ * 把历史消息挂着的工具卡片还原成 `tool_calls` + `tool` 消息对。
+ *
+ * 会话里只存卡片（`tools`），不存当时那条带 `tool_calls` 的消息；不还原的话，
+ * 后续轮次发给模型的上下文里没有上次搜到的资料，模型只能重新搜索 —— 用户看到的
+ * 「每轮都像重置了上下文」。回填内容一律走 `summarizeToolResult` 压成摘要。
+ */
+export function expandToolHistory(messages: ChatTurn[]): ChatTurn[] {
+  return messages.flatMap((message) => {
+    if (message.role !== "assistant") return [message];
+    const finished = (message.tools ?? []).filter(
+      (tool): tool is ChatToolEvent & { id: string; result: string } =>
+        typeof tool.id === "string" &&
+        (tool.status === "done" || tool.status === "error") &&
+        typeof tool.result === "string" &&
+        tool.result !== "",
+    );
+    if (finished.length === 0) return [message];
+    return [
+      {
+        ...message,
+        toolCalls: finished.map((tool) => ({
+          id: tool.id,
+          name: tool.name,
+          // 参数是解析过的对象；原样序列化回去，模型按 `tool_call_id` 对结果即可
+          arguments: typeof tool.arguments === "string" ? tool.arguments : JSON.stringify(tool.arguments ?? {}),
+        })),
+      },
+      ...finished.map((tool) => ({
+        id: `${tool.id}:result`,
+        role: "tool" as const,
+        content: summarizeToolResult(tool.name, tool.result, tool.id),
+        createdAt: message.createdAt,
+        toolCallId: tool.id,
+      })),
+    ];
+  });
+}
+
 /** 组装 `/v1/chat/completions` 的请求体（上游 `buildChatRequest` 的本工程版） */
 export function buildChatRequest(
   messages: ChatTurn[],
@@ -534,6 +679,9 @@ export function buildChatRequest(
   if (!options.model.trim()) throw new Error("请先选择模型");
   const api: Record<string, unknown>[] = [];
   if (options.systemPrompt.trim()) api.push({ role: "system", content: options.systemPrompt.trim() });
+  // 联网搜索的查询拆解规则（用户 m00874：搜索要「紧扣提问拆解方向」）。
+  // 模型自己写 system prompt 时不覆盖，避免和用户指令打架。
+  else if (tools.length > 0) api.push({ role: "system", content: TOOL_SEARCH_POLICY });
   const advanced: Record<string, unknown> = strata ? buildAdvancedChatFields(options) : {};
   if (strata && options.advanced.responseFormat !== "text" && tools.length > 0) {
     throw new Error("JSON 输出与工具调用互斥，请先关闭联网搜索 / MCP");

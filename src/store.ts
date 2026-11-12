@@ -35,10 +35,12 @@ import {
   advanceChatExecution,
   buildChatRequest,
   conversationTitle,
+  expandToolHistory,
   finishChatExecution,
   newChatExecution,
   newId,
   normalizeChatOptions,
+  summarizeToolResult,
   type ChatAttachment,
   type ChatDelta,
   type ChatOptions,
@@ -319,6 +321,8 @@ function saveLadderHistory(history: LadderRun[]): LadderRun[] {
 
 const CHAT_CONVERSATIONS_KEY = "llamacpp-gui-chat-conversations";
 const CHAT_OPTIONS_KEY = "llamacpp-gui-chat-options";
+/** 上次打开的会话 id：不记的话，刷新/重启后聊天页回到空白新会话，用户会以为「上下文被重置」 */
+const CHAT_ACTIVE_KEY = "llamacpp-gui-chat-active";
 
 /** 会话条数上限与单会话消息上限：聊天记录是便利功能，不能让 localStorage 无限涨 */
 const CHAT_CONVERSATION_LIMIT = 30;
@@ -367,6 +371,33 @@ function saveConversations(conversations: Conversation[]): Conversation[] {
   }
   return kept;
 }
+
+function loadActiveId(): string | null {
+  try {
+    return localStorage.getItem(CHAT_ACTIVE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+/** 记下「用户当前在看哪个会话」：新建会话时传 null，把它清掉 */
+function rememberActiveId(id: string | null): void {
+  try {
+    if (id) localStorage.setItem(CHAT_ACTIVE_KEY, id);
+    else localStorage.removeItem(CHAT_ACTIVE_KEY);
+  } catch {
+    // 隐私模式：不打扰
+  }
+}
+
+/** 启动时恢复会话列表与上次打开的会话：记着的那个被删了就退回最近更新的一条 */
+const initialConversations = loadConversations();
+const initialActiveId = (() => {
+  const saved = loadActiveId();
+  if (saved && initialConversations.some((item) => item.id === saved)) return saved;
+  const recent = [...initialConversations].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+  return recent?.id ?? null;
+})();
 
 function loadChatOptions(): ChatOptions {
   try {
@@ -892,8 +923,8 @@ export const useApp = create<AppStore>((set, get) => ({
     error: null,
   },
   chat: {
-    conversations: loadConversations(),
-    activeId: null,
+    conversations: initialConversations,
+    activeId: initialActiveId,
     draft: "",
     attachments: [],
     streaming: false,
@@ -2611,6 +2642,7 @@ export const useApp = create<AppStore>((set, get) => ({
         error: null,
       },
     });
+    rememberActiveId(conversationId);
 
     const controller = new AbortController();
     chatAbort = controller;
@@ -2758,7 +2790,10 @@ export const useApp = create<AppStore>((set, get) => ({
       }
       const tools = buildToolSpecs(state.options.webSearch, mcpTools);
       // 模型可以连续要工具：每要一次就执行、回填，再要一次，最多 5 轮（防死循环）
-      let history = [...previous.filter((m) => !m.error), user];
+      // 历史里的工具卡片先还原成 tool_calls/tool 消息，否则模型在追问时看不到上次搜到的资料
+      let history = [...expandToolHistory(previous.filter((m) => !m.error)), user];
+      /** 5 轮用尽时模型还在要工具：此时必须补一次收尾请求，哪怕这一轮已经写了过渡语 */
+      let hitToolLimit = false;
       let calls: ToolCall[] = [];
       /** 本轮回答的正文（含工具轮之间的过渡文字），用来判断要不要收尾 */
       let answer = "";
@@ -2814,6 +2849,9 @@ export const useApp = create<AppStore>((set, get) => ({
         );
         // 没有工具调用就结束了
         if (calls.length === 0 || controller.signal.aborted) break;
+        // 最后一轮还在要工具：结果已经用不上了，但这一轮的过渡语也可能让 answer 非空，
+        // 必须记下来，循环结束后无条件补一次收尾请求（用户 m00001「搜完不给回答」）
+        if (round === 4) hitToolLimit = true;
 
         // 先把「要调用什么」画出来（状态 running），再一个个执行
         for (const call of calls) {
@@ -2836,6 +2874,8 @@ export const useApp = create<AppStore>((set, get) => ({
         }
 
         const results: ChatTurn[] = [];
+        // 这一轮有没有拿到新资料：全是被去重拦下的重复调用就没有，再问下去只是白等
+        let progressed = false;
         for (const call of calls) {
           // 按查询去重（照 DSH 的口径：完全相同的查询只执行一次）。
           // 模型换词重搜要放行；已搜过的词只跑新词，全搜过就整张卡跳过
@@ -2866,6 +2906,7 @@ export const useApp = create<AppStore>((set, get) => ({
             for (const item of fresh) searched.add(item);
           }
           if (call.name === "web_fetch" && target !== "" && !repeated) fetched.add(target);
+          if (!repeated) progressed = true;
           patchAssistant((message) => ({
             ...message,
             tools: (message.tools ?? []).map((item) =>
@@ -2883,7 +2924,9 @@ export const useApp = create<AppStore>((set, get) => ({
           results.push({
             id: newId(),
             role: "tool",
-            content: outcome.text,
+            // 回填给模型的是摘要（用户 m00306）；卡片里仍是完整结果，界面上可回查原文。
+            // 整段回填会把 prompt 每轮抬高三四万 token，最后爆 KV 显存（m00561）。
+            content: summarizeToolResult(call.name, outcome.text, call.id),
             createdAt: Date.now(),
             toolCallId: call.id,
           });
@@ -2895,11 +2938,17 @@ export const useApp = create<AppStore>((set, get) => ({
           { id: newId(), role: "assistant", content: "", createdAt: Date.now(), toolCalls: calls },
           ...results,
         ];
+        // 整轮都在重复「已经搜过」的调用：它不会自愈，继续循环只是把 8 分钟拖成 15 分钟
+        if (!progressed) {
+          hitToolLimit = true;
+          break;
+        }
       }
 
       // 轮次用尽还在要工具时，正文是空的 —— 再发一次「不许再调工具」的收尾请求，
-      // 否则界面上只有一串工具卡片、没有答案（用户 m07347「没有回答」）
-      if (!controller.signal.aborted && answer.trim() === "") {
+      // 否则界面上只有一串工具卡片、没有答案（用户 m07347「没有回答」）。
+      // 用尽工具轮次时哪怕这一轮已经写了过渡语（answer 非空）也要补：过渡语不是答案。
+      if (!controller.signal.aborted && (answer.trim() === "" || hitToolLimit)) {
         calls = [];
         await streamChatTurn(
           port,
@@ -2909,11 +2958,15 @@ export const useApp = create<AppStore>((set, get) => ({
               {
                 id: newId(),
                 role: "user",
-                content: "工具调用次数已经用完了。请直接根据上面拿到的资料回答问题，不要再调用任何工具。",
+                content:
+                  "工具调用次数已经用完了。请直接根据上面拿到的资料回答问题，不要再调用任何工具。" +
+                  "资料里出现的每一个具体 llama.cpp 参数（-- 开头的名字）都要原样列出并说明用途；" +
+                  "资料里没有的东西不要凭印象补：查不到就直说「没查到」，不要编参数名、数值或用「可能」含糊过去。",
                 createdAt: Date.now(),
               },
             ],
-            { ...state.options, model },
+            // 收尾这一次临时关掉思考：长上下文里它可能又写几分钟 reasoning 才出正文
+            { ...state.options, model, reasoningEffort: "off" },
             false,
             [],
             target.channel === "strata",
@@ -2996,11 +3049,13 @@ export const useApp = create<AppStore>((set, get) => ({
   newConversation() {
     const state = get().chat;
     set({ chat: { ...state, activeId: null, draft: "", attachments: [], error: null } });
+    rememberActiveId(null);
   },
 
   selectConversation(id) {
     const state = get().chat;
     set({ chat: { ...state, activeId: id, draft: "", attachments: [], error: null } });
+    rememberActiveId(id);
   },
 
   renameConversation(id, title) {
@@ -3028,6 +3083,7 @@ export const useApp = create<AppStore>((set, get) => ({
         activeId: state.activeId === id ? null : state.activeId,
       },
     });
+    if (state.activeId === id) rememberActiveId(null);
   },
 
   setChatDraft(value) {
@@ -3205,6 +3261,7 @@ export const useApp = create<AppStore>((set, get) => ({
           error: lost || null,
         },
       });
+      rememberActiveId(next.id);
       return;
     }
     const changed: Conversation = { ...conversation, messages: plan.keep, updatedAt: Date.now() };
