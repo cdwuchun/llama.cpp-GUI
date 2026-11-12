@@ -890,10 +890,17 @@ async fn strata_pick(state: State<'_, AppState>, config_file: String) -> Result<
 }
 
 /// 读 config 原文（参数编辑 L2）。
+///
+/// 直接按文件名读文件本身：这里要的就是「磁盘上这份 config 现在是什么」。
+/// 走 `find_strata_entry` 会顺带整目录扫描并做引擎版本对齐改写（`parse_config` 的
+/// `engine_stale` 分支），读参数顺手改文件是副作用，还会多一次缓慢的全目录扫描。
 #[tauri::command]
-async fn strata_config_read(state: State<'_, AppState>, config_file: String) -> Result<String, String> {
-    let entry = find_strata_entry(&state, &config_file)?;
-    strata::read_config_raw(&entry.config_path).map_err(|err| format!("{err:#}"))
+async fn strata_config_read(_state: State<'_, AppState>, config_file: String) -> Result<String, String> {
+    let root = strata::root()
+        .filter(|root| root.is_dir())
+        .ok_or_else(|| "未找到 Strata 目录（设置 → 通用 → Strata 目录 可指定）".to_string())?;
+    let path = strata::config_path_for(&root, &config_file).map_err(|err| format!("{err:#}"))?;
+    strata::read_config_raw(&path).map_err(|err| format!("{err:#}"))
 }
 
 /// 写 config（参数编辑 L2；备份 + 校验 + 原子写在 `strata::write_config_raw` 里）。
@@ -903,8 +910,34 @@ async fn strata_config_write(
     config_file: String,
     text: String,
 ) -> Result<strata::StrataModelEntry, String> {
-    let entry = find_strata_entry(&state, &config_file)?;
-    strata::write_config_raw(&entry.config_path, &text).map_err(|err| format!("{err:#}"))?;
+    let root = strata::root()
+        .filter(|root| root.is_dir())
+        .ok_or_else(|| "未找到 Strata 目录（设置 → 通用 → Strata 目录 可指定）".to_string())?;
+    // 写之前不扫描：扫描会做引擎版本对齐改写，等于在用户提交的内容之外再动一次文件；
+    // 路径直接由文件名解析（`config_path_for` 挡路径穿越）。
+    let path = strata::config_path_for(&root, &config_file).map_err(|err| format!("{err:#}"))?;
+    strata::write_config_raw(&path, &text).map_err(|err| {
+        state
+            .logs
+            .push("system", format!("[gui] 写回 {config_file} 失败：{err:#}"));
+        format!("{err:#}")
+    })?;
+    // 落盘后立刻读回比对：前端显示「已写入」的前提是磁盘上真的就是这份文本。
+    // 不一致只可能是写完之后又被别的进程/别的写者改掉（端口同步、引擎改写、外部编辑器），
+    // 这时直接报错，别让界面显示成功、用户重开却看到旧参数。
+    let written = strata::read_config_raw(&path).map_err(|err| format!("{err:#}"))?;
+    if written != text {
+        let msg = format!(
+            "写回 {} 后读回的内容与提交的不一致（写入被其它进程改动了），请重试",
+            path.display()
+        );
+        state.logs.push("system", format!("[gui] {msg}"));
+        return Err(msg);
+    }
+    state.logs.push(
+        "system",
+        format!("[gui] 已写回 {}（{} 字节）", path.display(), text.len()),
+    );
     // 写回后重新解析，让前端立刻拿到新的生效值（含"需重启生效"对比所需字段）。
     find_strata_entry(&state, &config_file)
 }

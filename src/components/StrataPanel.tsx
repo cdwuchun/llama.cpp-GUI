@@ -516,6 +516,9 @@ function StrataConfigSheet({
       initialFormRef.current = JSON.stringify(formState);
       setRawText(JSON.stringify(next, null, 1));
       setRawError("");
+      // 落盘成功 → 基线换成刚写的那份：之后右栏再改、再写回时，未知顶层键以最新落盘内容为底，
+      // 不会拿打开弹层时的旧对象反复重建（视觉/采样块里的派生字段尤其明显）。
+      setFormConfig(next);
     }
     return ok;
   };

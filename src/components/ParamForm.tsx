@@ -112,7 +112,9 @@ function DropdownInput({
   }, [open, options.length]);
 
   const pick = (value: string) => {
-    onChange({ ...state, value });
+    // 改值即启用，与普通输入框（`set` 里带 enabled:true）保持一致：否则在未勾选的参数上
+    // 选了一档，界面显示新值、写回却因 enabled=false 被丢掉，看起来就是「改了没生效」。
+    onChange({ ...state, value, enabled: true });
     setOpen(false);
   };
 
@@ -125,7 +127,7 @@ function DropdownInput({
           className="form-control ctx-cb-input"
           placeholder={def.default}
           value={state.value}
-          onChange={(e) => onChange({ ...state, value: e.target.value })}
+          onChange={(e) => onChange({ ...state, value: e.target.value, enabled: true })}
         />
         <button
           type="button"
@@ -243,7 +245,7 @@ function PathControl({
           cfg?.placeholder ?? (isDir ? "留空 = 在 PATH 中搜索" : "留空 = 自动检测同目录文件")
         }
         value={state.value}
-        onChange={(e) => onChange({ ...state, value: e.target.value })}
+        onChange={(e) => onChange({ ...state, value: e.target.value, enabled: true })}
       />
       <datalist id={listId}>
         {options.map((o) => (

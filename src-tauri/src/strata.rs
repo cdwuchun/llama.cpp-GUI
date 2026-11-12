@@ -271,7 +271,20 @@ fn parse_config(path: &Path, preferred: Option<&Path>) -> Option<StrataModelEntr
         let edits = engine_edits(&value, &engine, &next_exe, &engine_path);
         if !edits.is_empty() {
             let refs: Vec<(&str, &str)> = edits.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
-            let _ = rewrite_config_strings(path, &refs);
+            // 改写是扫描的副作用：写个日志，别让「我改的参数怎么变了」变成无头案。
+            // 写失败时保留原值，下次扫描再试（与改动前一致）。
+            if rewrite_config_strings(path, &refs).is_ok() {
+                if let Some(hub) = crate::logs::global() {
+                    hub.push(
+                        "system",
+                        format!(
+                            "[gui] {} 的引擎路径与设置不一致，已改写 exe 为 {}",
+                            path.display(),
+                            next_exe
+                        ),
+                    );
+                }
+            }
         }
     }
     let model_path = arg_value(&args, "--native").map(PathBuf::from);
@@ -522,6 +535,24 @@ fn configs_dir_with(root: &Path, configured: bool) -> PathBuf {
     } else {
         root.to_path_buf()
     }
+}
+
+/// 按文件名定位一份 config：只接受纯文件名（挡路径穿越），且必须真的存在。
+///
+/// 读/写单个 config 不需要整目录扫描 —— 扫描会顺带做「引擎版本对齐」改写
+/// （[`parse_config`] 的 `engine_stale` 分支）：读参数时顺手改文件是副作用，
+/// 写参数时更没必要在写之前多扫一遍并再改一次文件。
+pub fn config_path_for(root: &Path, config_file: &str) -> Result<PathBuf> {
+    let pure_name =
+        Path::new(config_file).components().count() == 1 && !config_file.contains('/') && !config_file.contains('\\');
+    if !pure_name || !is_config_file(config_file) {
+        anyhow::bail!("不是合法的 Strata config 文件名：{config_file}");
+    }
+    let path = configs_dir(root).join(config_file);
+    if !path.is_file() {
+        anyhow::bail!("config 不存在：{}", path.display());
+    }
+    Ok(path)
 }
 
 /// 用户在设置页选中的控制器版本目录名（`settings.json` 的 `strata_controller`）。
@@ -2547,6 +2578,38 @@ where
     write_config_raw_locked(path, &next)
 }
 
+/// Windows 上「文件被别的进程短暂握着」的可重试错误：
+/// 5 = ERROR_ACCESS_DENIED、32 = ERROR_SHARING_VIOLATION、33 = ERROR_LOCK_VIOLATION。
+fn io_retryable(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(5) | Some(32) | Some(33))
+}
+
+/// 对共享冲突重试几次（杀毒/索引器/引擎刚退出的瞬间都会短暂锁住 config）。
+///
+/// 只重试 [`io_retryable`] 的错误，磁盘满、路径不存在之类立即返回，不拖慢失败路径。
+fn fs_with_retry<T, F>(mut op: F) -> std::io::Result<T>
+where
+    F: FnMut() -> std::io::Result<T>,
+{
+    const ATTEMPTS: u32 = 10;
+    let mut last: Option<std::io::Error> = None;
+    for n in 0..ATTEMPTS {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(err) => {
+                if !io_retryable(&err) {
+                    return Err(err);
+                }
+                last = Some(err);
+                if n + 1 < ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                }
+            }
+        }
+    }
+    Err(last.expect("至少试过一次"))
+}
+
 /// 已持锁时的落盘：备份 → 写临时文件 → rename。
 fn write_config_raw_locked(path: &Path, text: &str) -> Result<()> {
     // W3：备份固定一份 `<config>.json.bak`，每次覆盖（用户 m03392：不要堆积带时间戳的多份，
@@ -2555,15 +2618,18 @@ fn write_config_raw_locked(path: &Path, text: &str) -> Result<()> {
     // 备份失败就取消写入：这层备份是「改坏了能回滚」的唯一凭据，静默吞掉等于在磁盘满 /
     // 文件被占用时直接毁掉原 config（审查发现，原实现是 `let _ = fs::copy(..)`）。
     let backup = path.with_extension("json.bak");
-    if let Err(err) = fs::copy(path, &backup) {
+    if let Err(err) = fs_with_retry(|| fs::copy(path, &backup)) {
         anyhow::bail!("备份 {} 失败，已取消写入: {err}", backup.display());
     }
 
     // W4：原子写（临时文件名唯一，见 `temp_config_path`）。rename 失败时清掉临时文件，
     // 别在 config 目录里留半份垃圾。
+    //
+    // rename 也重试：Windows 上替换已存在文件时，只要目标被读打开（引擎刚停、杀毒扫描）
+    // 就会报共享冲突，表现为「写回偶发失败、再点一次就成了」。
     let tmp = temp_config_path(path);
     fs::write(&tmp, &text).with_context(|| format!("写入临时文件失败: {}", tmp.display()))?;
-    if let Err(err) = fs::rename(&tmp, path) {
+    if let Err(err) = fs_with_retry(|| fs::rename(&tmp, path)) {
         let _ = fs::remove_file(&tmp);
         return Err(err).with_context(|| format!("替换 config 失败: {}", path.display()));
     }
@@ -3168,6 +3234,27 @@ mod tests {
         // 布尔 flag 后面没有值时不能把下一个 flag 当值吃掉越界取。
         assert_eq!(arg_value(&args, "--native"), None);
         assert_eq!(arg_value(&args, "--missing"), None);
+    }
+
+    #[test]
+    fn config_path_for_rejects_traversal_and_missing() {
+        let dir = std::env::temp_dir().join(format!("dsh-strata-path-{}", now_ms()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("strata-a.json"), r#"{"exe":"a.exe","args":[]}"#).unwrap();
+
+        assert_eq!(
+            config_path_for(&dir, "strata-a.json").unwrap(),
+            configs_dir(&dir).join("strata-a.json")
+        );
+        // 带目录成分的名字一律拒绝（挡 `../` 与子目录路径）。
+        assert!(config_path_for(&dir, "../strata-a.json").is_err());
+        assert!(config_path_for(&dir, "sub/strata-a.json").is_err());
+        assert!(config_path_for(&dir, r"sub\strata-a.json").is_err());
+        // 不是 config 的命名（上游不会认）也拒绝。
+        assert!(config_path_for(&dir, "other.json").is_err());
+        // 文件不存在：报「config 不存在」，而不是给出一个写不进去的路径。
+        let err = config_path_for(&dir, "strata-missing.json").unwrap_err();
+        assert!(err.to_string().contains("不存在"), "{err}");
     }
 
     #[test]
