@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 
 import { useApp } from "../store";
 import type { Conversation } from "../utils/chat";
 import { mergeModels } from "../utils/models";
+import { ChatHistoryItem } from "./ChatHistoryItem";
 import { ChatIcon } from "./ChatIcons";
-import { ChatMessageView } from "./ChatMessageView";
+import { ChatMessageView, type ChatMessageActions } from "./ChatMessageView";
 import { ChatSamplingSheet } from "./ChatSamplingSheet";
 
 type Bucket = "today" | "yesterday" | "week" | "earlier";
@@ -14,6 +15,30 @@ const CHAT_WIDTH_KEY = "llamacpp-gui-chat-width";
 const CHAT_WIDTH_DEFAULT = 860;
 const CHAT_WIDTH_MIN = 520;
 const CHAT_WIDTH_MAX = 1600;
+
+/** 滚动跟随（照 Strata `follow-scroll.ts`）：距底 ≤24 才算「在底部」，离底 >400 放手，
+ *  读者自己滚动后 400ms 内不强行拉回 —— 一个滚轮约 100px，旧的 120px 阈值等于「刚滚上去就被拽回来」。 */
+const FOLLOW_SLACK = 24;
+const PILL_DISTANCE = 400;
+const READER_INPUT_WINDOW = 400;
+/** 右侧轮次跳转：点击后目标消息距滚动区顶部留这么多像素 */
+const TURN_OFFSET = 12;
+/** 选词引用最多带这么多字（照 Strata quotes 的 4000 上限砍到正文里够用的量，避免把整段贴进输入框） */
+const QUOTE_CHARS = 400;
+
+/** 空态示例（P1）：点一下填进输入框，不直接发送 —— 用户经常要改两个字再问 */
+const CHAT_EXAMPLES = [
+  "帮我把这段 JSON 改成 YAML",
+  "解释一下大模型的 KV cache 是什么",
+  "写一个 Python 脚本：按修改时间列出目录里最近的 10 个文件",
+  "用一句话总结下面的报错，并给出修法",
+];
+
+/** 导出文件名：去掉 Windows 非法字符并截断（审查 F8：长标题会让下载失败或被截成怪名字） */
+function exportName(title: string, extension: string): string {
+  const safe = title.replace(/[\\/:*?"<>|]/g, "_").trim().slice(0, 80) || "chat";
+  return `${safe}${extension}`;
+}
 
 const BUCKET_LABEL: Record<Bucket, string> = {
   today: "今天",
@@ -46,6 +71,11 @@ function groupConversations(list: Conversation[]): [Bucket, Conversation[]][] {
   return [...byDate.entries()];
 }
 
+/** token 数的紧凑写法（12.3k / 980），dock 与上下文环共用 */
+function fmtTokCount(value: number): string {
+  return value >= 1000 ? `${(value / 1000).toFixed(1)}k` : `${value}`;
+}
+
 /**
  * 原生聊天页（照上游 `pages/ChatPage.tsx` 搬）。
  *
@@ -64,6 +94,7 @@ export function ChatPanel() {
   const scanned = useApp((s) => s.scanned);
   const configs = useApp((s) => s.configs);
   const settings = useApp((s) => s.settings);
+  const strataStatus = useApp((s) => s.strataStatus);
   const strataEntries = useApp((s) => s.strataEntries);
   const sendChat = useApp((s) => s.sendChat);
   const stopChat = useApp((s) => s.stopChat);
@@ -71,6 +102,7 @@ export function ChatPanel() {
   const selectConversation = useApp((s) => s.selectConversation);
   const renameConversation = useApp((s) => s.renameConversation);
   const deleteConversation = useApp((s) => s.deleteConversation);
+  const restoreConversation = useApp((s) => s.restoreConversation);
   const setChatDraft = useApp((s) => s.setChatDraft);
   const addChatAttachments = useApp((s) => s.addChatAttachments);
   const removeChatAttachment = useApp((s) => s.removeChatAttachment);
@@ -79,10 +111,12 @@ export function ChatPanel() {
   // 编辑回退（用户 m00232 的 A1）
   const regenerateReply = useApp((s) => s.regenerateReply);
   const editAnswerText = useApp((s) => s.editAnswerText);
+  const editUserMessage = useApp((s) => s.editUserMessage);
   const rewindChat = useApp((s) => s.rewindChat);
   const undoChatHistory = useApp((s) => s.undoChatHistory);
   const dismissChatUndo = useApp((s) => s.dismissChatUndo);
   const clearPendingChat = useApp((s) => s.clearPendingChat);
+  const refreshSearchAvailability = useApp((s) => s.refreshSearchAvailability);
 
   const [search, setSearch] = useState("");
   /** 聊天历史默认收起（用户 m00547），工具栏的「展开聊天历史」按钮可展开 */
@@ -92,13 +126,40 @@ export function ChatPanel() {
   const [samplingOpen, setSamplingOpen] = useState(false);
   /** 输入框里的模型下拉是否展开（用户 m07816 第 1 点） */
   const [modelOpen, setModelOpen] = useState(false);
+  /** 刚删除的会话：底部 toast 给 6 秒撤销窗口 */
+  const [deleted, setDeleted] = useState<Conversation | null>(null);
+
+  /** 删除会话并留一份用于撤销（用户 m02858：一次删除，但可撤销） */
+  const handleDelete = (id: string) => {
+    const target = chat.conversations.find((item) => item.id === id);
+    if (!target) return;
+    deleteConversation(id);
+    setDeleted(target);
+  };
+
+  useEffect(() => {
+    if (!deleted) return;
+    const timer = window.setTimeout(() => setDeleted(null), 10000);
+    return () => window.clearTimeout(timer);
+  }, [deleted]);
 
   const files = useRef<HTMLInputElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
   const chatScroll = useRef<HTMLDivElement>(null);
   const mainRef = useRef<HTMLDivElement>(null);
-  const nearBottom = useRef(true);
+  /** 是否「贴底跟随」：流式回答变长时每帧滚到底，只有距底 ≤24 才继续跟随 */
+  const pinned = useRef(true);
+  /** 上一次读者自己滚动/触摸的时间：400ms 内的滚动不强行拉回底部（Strata follow-scroll） */
+  const readerInput = useRef(0);
+  /** 中文输入法 compositionend 的时间：WKWebView 里回车选词会先触发 compositionend 再冒泡 keydown */
+  const imeCommitAt = useRef(0);
+  /** 输入 @ 打开了文件选择：选完要把草稿末尾那个 @ 去掉 */
+  const atPending = useRef(false);
   const scrolledConversation = useRef("");
+  /** 当前视口里最靠上的那一轮（右侧轮次跳转的高亮项） */
+  const [activeTurn, setActiveTurn] = useState(0);
+  /** 选中文字后的「引用」浮层（照 Strata 的选区引用，P1） */
+  const [quote, setQuote] = useState<{ top: number; left: number; text: string } | null>(null);
 
   /** 内容区/输入框的宽度：居中显示，拖右侧手柄可调，记住上次的值（用户 m07390） */
   const [chatWidth, setChatWidth] = useState(() => {
@@ -209,54 +270,261 @@ export function ChatPanel() {
     }
   }, [allModels.length, runningModel, chat.options.model, setChatOptions]);
 
+  /** 联网搜索可用性：进页面先问一次，设置面板保存后也会重新判（灰字提示用） */
+  useEffect(() => {
+    void refreshSearchAvailability();
+  }, [refreshSearchAvailability]);
+
   const groups = useMemo(() => {
     const term = search.trim().toLocaleLowerCase("zh-CN");
     const recent = chat.conversations.filter(
-      (item) => !term || item.title.toLocaleLowerCase("zh-CN").includes(term),
+      (item) =>
+        !term ||
+        item.title.toLocaleLowerCase("zh-CN").includes(term) ||
+        // 搜索覆盖消息正文（方案 v2）：标题记不住、只记得聊过某个词时也能找回来
+        item.messages.some((message) => message.content.toLocaleLowerCase("zh-CN").includes(term)),
     );
     return groupConversations(recent);
   }, [chat.conversations, search]);
 
-  // 消息变化时贴底；换会话时强制贴底（上游同）
+  /**
+   * dock / 上下文环的重算键（审查 Q4）：流式时 conversation 每来一个 token 就换一次引用，
+   * 直接把它放进 useMemo 依赖会让 O(n) 统计每 token 重跑一遍。这里只取「会用到的字段」
+   * 拼成字符串，流式中这些值不变（usage 要等一轮结束才写）。
+   */
+  const statsKey = useMemo(() => {
+    const messages = conversation?.messages ?? [];
+    const last = messages[messages.length - 1];
+    return `${conversation?.id ?? ""}|${messages.length}|${last?.id ?? ""}|${last?.usage?.total_tokens ?? 0}|${last?.elapsedMs ?? 0}`;
+  }, [conversation]);
+
+  /** 右侧轮次跳转：每个用户提问一条（照 DSH 的右侧消息导航），点哪条滚到那轮的开头 */
+  const turns = useMemo(() => {
+    const list: { id: string; label: string }[] = [];
+    for (const message of conversation?.messages ?? []) {
+      if (message.role !== "user") continue;
+      const text = message.content.replace(/\s+/g, " ").trim();
+      list.push({ id: message.id, label: text.slice(0, 40) || "（空消息）" });
+    }
+    return list;
+  }, [conversation]);
+
+  /** 跳到某一轮：用消息元素的真实位置算滚动目标，避免 offsetParent 差异 */
+  const jumpToTurn = useCallback((id: string) => {
+    const scroll = chatScroll.current;
+    const element = document.getElementById(`chat-msg-${id}`);
+    if (!scroll || !element) return;
+    pinned.current = false;
+    const top =
+      element.getBoundingClientRect().top - scroll.getBoundingClientRect().top + scroll.scrollTop - TURN_OFFSET;
+    scroll.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
+  }, []);
+
+  /** 滚动时更新右侧导航的高亮：取「顶部已经越过视口上方 80px」的最后一轮 */
+  const syncActiveTurn = useCallback(() => {
+    const scroll = chatScroll.current;
+    if (!scroll) return;
+    const messages = conversation?.messages ?? [];
+    const line = scroll.scrollTop + 80;
+    let current = 0;
+    let turnIndex = 0;
+    for (const message of messages) {
+      if (message.role !== "user") continue;
+      const element = document.getElementById(`chat-msg-${message.id}`);
+      if (element) {
+        const top = element.getBoundingClientRect().top - scroll.getBoundingClientRect().top + scroll.scrollTop;
+        if (top <= line) current = turnIndex;
+      }
+      turnIndex += 1;
+    }
+    setActiveTurn(current);
+  }, [conversation]);
+
+  // 消息数/会话变化时同步一次高亮（渲染后 DOM 才就位）
+  useEffect(() => {
+    syncActiveTurn();
+  }, [statsKey, syncActiveTurn]);
+
+  /**
+   * 输入框下方的一行统计（照 DSH 的 composer dock）：轮次、工具次数、速度、首 token、
+   * token 合计与缓存命中。数据全是会话里已有的 execution/usage，不需要额外请求。
+   */
+  const dock = useMemo(() => {
+    const messages = conversation?.messages ?? [];
+    if (messages.length === 0) return null;
+    const rounds = messages.filter((message) => message.role === "user").length;
+    const tools = messages.reduce((sum, message) => sum + (message.tools?.length ?? 0), 0);
+    const totals = { input: 0, output: 0, cached: 0 };
+    for (const message of messages) {
+      if (message.role !== "assistant") continue;
+      totals.input += message.usage?.prompt_tokens ?? 0;
+      totals.output += message.usage?.completion_tokens ?? message.usage?.output_tokens ?? 0;
+      totals.cached += message.usage?.prompt_tokens_details?.cached_tokens ?? 0;
+    }
+    if (totals.input === 0 && totals.output === 0) return null;
+    const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant");
+    const speed = lastAssistant?.speed?.decodeTokS;
+    const ttft = lastAssistant?.firstTokenMs ?? lastAssistant?.execution?.firstTokenMs;
+    const elapsed = lastAssistant?.elapsedMs;
+    const fmtMs = (value?: number) =>
+      value == null ? null : value < 1000 ? `${Math.round(value)}ms` : `${(value / 1000).toFixed(1)}s`;
+    const fmtTok = (value: number) => (value >= 1000 ? `${(value / 1000).toFixed(1)}k` : `${value}`);
+    const parts = [`${rounds} 轮`, ...(tools > 0 ? [`${tools} 次工具`] : [])];
+    if (speed) parts.push(`${speed.toFixed(1)} tok/s`);
+    const firstToken = fmtMs(ttft);
+    if (firstToken) parts.push(`首 token ${firstToken}`);
+    const total = fmtMs(elapsed);
+    if (total) parts.push(`耗时 ${total}`);
+    parts.push(`输入 ${fmtTok(totals.input)} / 输出 ${fmtTok(totals.output)}`);
+    if (totals.cached > 0 && totals.input > 0) {
+      parts.push(`缓存 ${Math.round((totals.cached / totals.input) * 100)}%`);
+    }
+    if (chat.compacted > 0) parts.push(`早期 ${chat.compacted} 条已压缩`);
+    return parts.join(" · ");
+    // conversation 通过 statsKey 间接依赖：只在这些统计字段变化时重算
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statsKey, chat.compacted]);
+
+  /**
+   * 上下文环（照 Strata 的 ContextRing）：用上一轮请求的 prompt + 输出 token 当「已占」，
+   * 分母是当前模型的 max_context（config 优先，Strata 实例用 /health 报的值兜底）。
+   * 全用会话里已有的 usage，不发额外请求。
+   */
+  const contextUse = useMemo(() => {
+    const messages = conversation?.messages ?? [];
+    const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant");
+    const usage = lastAssistant?.usage;
+    const used = usage
+      ? (usage.prompt_tokens ?? 0) + (usage.completion_tokens ?? usage.output_tokens ?? 0)
+      : 0;
+    if (used <= 0) return null;
+    const model = chat.options.model || activeModel;
+    // 分母是「实际运行的这个模型」的上下文（用户 m02182 第 2 点）：
+    // Strata 模型取 strataEntries 里启动参数写明的 max_context（与压测页同源），
+    // llama.cpp 模型取 config 的 --ctx-size，都没有再用 /health 报的 live_max_context 兜底。
+    const strataEntry = strataEntries.find((entry) => entry.model_name === model);
+    const config = configs.find((item) => item.name === model);
+    const raw = strataEntry?.max_context ?? config?.max_context ?? strataStatus.live_max_context ?? null;
+    const max = typeof raw === "string" ? Number(raw) : raw;
+    const limit = typeof max === "number" && Number.isFinite(max) && max > 0 ? max : null;
+    const pct = limit ? Math.min(100, Math.max(0, Math.round((used / limit) * 100))) : null;
+    return { used, limit, pct };
+    // 同 dock：conversation 通过 statsKey 间接依赖（审查 Q4）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statsKey, configs, strataEntries, chat.options.model, activeModel, strataStatus.live_max_context]);
+
+  // 换会话时强制贴底（上游同）；消息变高由下面的 ResizeObserver / rAF 跟随
+  useEffect(() => {
+    if (scrolledConversation.current === (conversation?.id ?? "")) return;
+    scrolledConversation.current = conversation?.id ?? "";
+    pinned.current = true;
+    const scroll = chatScroll.current;
+    if (scroll) scroll.scrollTop = scroll.scrollHeight;
+  }, [conversation?.id]);
+
+  // 高度变了就补一次贴底：图片、公式、代码块测量后变高，单次 scrollTop 追不上
   useEffect(() => {
     const scroll = chatScroll.current;
     if (!scroll) return;
-    if (scrolledConversation.current !== conversation?.id || nearBottom.current) {
-      scroll.scrollTop = scroll.scrollHeight;
-      nearBottom.current = true;
-    }
-    scrolledConversation.current = conversation?.id ?? "";
-  }, [conversation?.messages, conversation?.id, streaming]);
+    const inner = scroll.firstElementChild;
+    const stick = () => {
+      if (pinned.current) scroll.scrollTop = scroll.scrollHeight;
+    };
+    const observer = new ResizeObserver(stick);
+    observer.observe(scroll);
+    if (inner instanceof HTMLElement) observer.observe(inner);
+    return () => observer.disconnect();
+  }, [conversation?.id]);
+
+  // 流式期间每帧跟进：内容一帧一帧变长，scroll 事件不够密
+  useEffect(() => {
+    const scroll = chatScroll.current;
+    if (!scroll || !streaming) return;
+    let frame = 0;
+    const loop = () => {
+      if (pinned.current) scroll.scrollTop = scroll.scrollHeight;
+      frame = requestAnimationFrame(loop);
+    };
+    frame = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(frame);
+  }, [conversation?.id, streaming]);
 
   // 草稿清空后输入框回到两行高
   useEffect(() => {
     if (!chat.draft && input.current) input.current.style.height = "";
   }, [chat.draft]);
 
-  const copy = useCallback(async (value: string) => {
-    try {
-      await navigator.clipboard.writeText(value);
-      setNotice("已复制");
-    } catch {
-      setNotice("复制失败：浏览器拒绝了剪贴板权限");
-    }
-    setTimeout(() => setNotice(null), 1600);
+  const copy = useCallback((value: string) => {
+    void (async () => {
+      try {
+        await navigator.clipboard.writeText(value);
+        setNotice("已复制");
+      } catch {
+        setNotice("复制失败：浏览器拒绝了剪贴板权限");
+      }
+      setTimeout(() => setNotice(null), 1600);
+    })();
   }, []);
 
   const exportConversation = useCallback((item: Conversation) => {
     const lines: string[] = [`# ${item.title}`, "", `模型：${item.model}`, ""];
     for (const message of item.messages) {
+      // 工具消息不进 Markdown 导出（审查 F8：原来被写成「## 助手」，内容还是 tool 结果）
+      if (message.role === "tool") continue;
       lines.push(message.role === "user" ? "## 你" : "## 助手");
       if (message.reasoning) lines.push(`> 思考：${message.reasoning.replace(/\n/g, "\n> ")}`, "");
       lines.push(message.content || "（空）", "");
     }
-    const blob = new Blob([lines.join("\n")], { type: "text/markdown;charset=utf-8" });
+    download(
+      new Blob([lines.join("\n")], { type: "text/markdown;charset=utf-8" }),
+      exportName(item.title, ".md"),
+    );
+  }, []);
+
+  /** 触发一次浏览器下载（Markdown / JSON / PNG 共用） */
+  const download = (blob: Blob, name: string) => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${item.title.replace(/[\\/:*?"<>|]/g, "_")}.md`;
+    a.download = name;
     a.click();
-    URL.revokeObjectURL(url);
+    // 立即 revoke 在部分 WebView 里会把下载掐断（审查 F8）：等它开始下载再释放
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  /** 导出 JSON（P1）：比 Markdown 多带工具调用、来源、用量与执行信息，方便备份/排查 */
+  const exportJson = useCallback((item: Conversation) => {
+    const payload = {
+      schema: "llamacpp-gui-chat/1",
+      exportedAt: new Date().toISOString(),
+      conversation: item,
+    };
+    download(
+      new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" }),
+      exportName(item.title, ".json"),
+    );
+  }, []);
+
+  /** 导出整段对话为 PNG（P1）：html2canvas 动态加载，按 .chat 的完整高度渲染 */
+  const exportImage = useCallback(async (item: Conversation) => {
+    const node = chatScroll.current?.querySelector(".chat");
+    if (!(node instanceof HTMLElement)) return;
+    setNotice("正在生成长图…");
+    try {
+      const { default: html2canvas } = await import("html2canvas");
+      const canvas = await html2canvas(node, {
+        backgroundColor: getComputedStyle(document.body).backgroundColor || "#ffffff",
+        scale: Math.min(2, window.devicePixelRatio || 1),
+        logging: false,
+      });
+      const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+      if (!blob) throw new Error("画布为空");
+      download(blob, exportName(item.title, ".png"));
+      setNotice("长图已导出");
+    } catch (error) {
+      setNotice(`长图导出失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+    setTimeout(() => setNotice(null), 2600);
   }, []);
 
   const submit = () => {
@@ -268,6 +536,97 @@ export function ChatPanel() {
 
   /** 生成中：忙时锁住输入框与附件按钮的模式只有「等待」（排队 / 打断要能继续打字） */
   const composerLocked = streaming && chat.options.busyMode === "wait";
+
+  /** 消息上的操作：必须 useMemo 包住 —— 每次渲染新建对象会让 ChatMessageView 的 memo 永远不命中，
+   *  流式时每来一个 token 都把整屏消息重渲染一遍（方案 v2 第 6 项）。 */
+  const messageActions = useMemo<ChatMessageActions | null>(
+    () =>
+      chat.options.chatEdit
+        ? {
+            editable: true,
+            busy: streaming,
+            onRewind: (at) => rewindChat(at, false),
+            onBranch: (at) => rewindChat(at, true),
+            onRegenerate: (at) => regenerateReply(at),
+            onEditAnswer: (at, text) => editAnswerText(at, text),
+            onEditUser: (at, text) => editUserMessage(at, text),
+          }
+        : null,
+    [chat.options.chatEdit, streaming, rewindChat, regenerateReply, editAnswerText, editUserMessage],
+  );
+
+  /** 选中消息正文后浮出「引用」按钮：点一下把选中的文字以「…」追加到草稿（照 Strata 的选区引用） */
+  useEffect(() => {
+    const onSelection = () => {
+      const selection = window.getSelection();
+      const text = selection?.toString().trim() ?? "";
+      const scroll = chatScroll.current;
+      if (!selection || !scroll || selection.rangeCount === 0 || text.length < 2) {
+        setQuote(null);
+        return;
+      }
+      const range = selection.getRangeAt(0);
+      const node = range.commonAncestorContainer;
+      const element = node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
+      // 只认消息正文里的选区：工具栏、按钮、输入框里的文字不弹引用
+      if (!element || !scroll.contains(element) || !element.closest(".st-msg")) {
+        setQuote(null);
+        return;
+      }
+      const rect = range.getBoundingClientRect();
+      setQuote({
+        top: Math.max(8, rect.top - 38),
+        left: Math.min(window.innerWidth - 96, Math.max(8, rect.left + rect.width / 2 - 40)),
+        text: text.slice(0, QUOTE_CHARS),
+      });
+    };
+    const hide = (event: Event) => {
+      const target = event.target as Element | null;
+      if (target?.closest?.(".chat-quote-btn")) return;
+      setQuote(null);
+    };
+    document.addEventListener("selectionchange", onSelection);
+    window.addEventListener("scroll", hide, true);
+    document.addEventListener("pointerdown", hide);
+    return () => {
+      document.removeEventListener("selectionchange", onSelection);
+      window.removeEventListener("scroll", hide, true);
+      document.removeEventListener("pointerdown", hide);
+    };
+  }, []);
+
+  const insertQuote = useCallback(
+    (text: string) => {
+      const quoted = `「${text}」`;
+      setChatDraft(chat.draft ? `${chat.draft}\n\n${quoted}` : quoted);
+      setQuote(null);
+      window.getSelection()?.removeAllRanges();
+      input.current?.focus();
+    },
+    [chat.draft, setChatDraft],
+  );
+
+  /** P1 快捷键：Ctrl/⌘+Shift+N 新建会话，Esc 收起采样设置 / 模型菜单 */
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        if (samplingOpen) {
+          setSamplingOpen(false);
+          return;
+        }
+        if (modelOpen) {
+          setModelOpen(false);
+          return;
+        }
+      }
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "n") {
+        event.preventDefault();
+        if (!streaming) newConversation();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [samplingOpen, modelOpen, streaming, newConversation]);
 
   /** 分支会话的「打开原会话」：原会话还在就切过去，被删了就给个提示 */
   const openParent = () => {
@@ -286,7 +645,9 @@ export function ChatPanel() {
       <div className="top-bar">
         <h1 className="page-title">聊天</h1>
       </div>
-    <section className={`chat-workspace${historyOpen && chat.options.chatList ? "" : " chat-workspace--collapsed"}`}>
+    <section
+      className={`chat-workspace chat-fs-${chat.options.chatFont}${historyOpen && chat.options.chatList ? "" : " chat-workspace--collapsed"}`}
+    >
       {historyOpen && chat.options.chatList && <aside className="chat-history" aria-label="聊天历史">
         <div className="chat-history-heading">
           <strong>聊天历史</strong>
@@ -327,20 +688,43 @@ export function ChatPanel() {
               <div className="chat-history-group" key={bucket}>
                 <h2>{BUCKET_LABEL[bucket]}</h2>
                 {items.map((item) => (
-                  <HistoryItem
+                  <ChatHistoryItem
                     key={item.id}
                     item={item}
                     active={item.id === chat.activeId}
                     disabled={streaming}
                     onSelect={() => selectConversation(item.id)}
                     onRename={(title) => renameConversation(item.id, title)}
-                    onDelete={() => deleteConversation(item.id)}
+                    onDelete={() => handleDelete(item.id)}
                   />
                 ))}
               </div>
             ))
           )}
         </div>
+        {deleted && (
+          <div className="chat-toast" role="status">
+            <span className="chat-toast__text">已删除「{deleted.title || "未命名会话"}」</span>
+            <button
+              type="button"
+              className="chat-toast__undo"
+              onClick={() => {
+                restoreConversation(deleted);
+                setDeleted(null);
+              }}
+            >
+              撤销
+            </button>
+            <button
+              type="button"
+              className="chat-toast__close"
+              aria-label="关闭提示"
+              onClick={() => setDeleted(null)}
+            >
+              <i className="fas fa-xmark" />
+            </button>
+          </div>
+        )}
       </aside>}
 
       <div className="chat-main" ref={mainRef}>
@@ -402,7 +786,18 @@ export function ChatPanel() {
           ref={chatScroll}
           onScroll={(event) => {
             const scroll = event.currentTarget;
-            nearBottom.current = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 120;
+            const distance = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight;
+            const recent = Date.now() - readerInput.current < READER_INPUT_WINDOW;
+            // 距底 ≤24 才算在底部；读者刚滚过（400ms 内）或离底 >400 就放手，不再每帧拽回来
+            if (distance <= FOLLOW_SLACK) pinned.current = true;
+            else if (recent || distance > PILL_DISTANCE) pinned.current = false;
+            syncActiveTurn();
+          }}
+          onWheel={(event) => {
+            if (event.deltaY < 0) readerInput.current = Date.now();
+          }}
+          onTouchMove={() => {
+            readerInput.current = Date.now();
           }}
         >
           <div className="chat">
@@ -412,6 +807,23 @@ export function ChatPanel() {
                 <div className="chat-empty__sub">
                   {activeModel ? `当前模型 ${activeModel}` : "请选择模型"}
                 </div>
+                <div className="chat-empty__examples">
+                  {CHAT_EXAMPLES.map((example) => (
+                    <button
+                      key={example}
+                      type="button"
+                      className="st-btn st-btn--secondary st-btn--sm"
+                      disabled={composerLocked}
+                      onClick={() => {
+                        setChatDraft(example);
+                        input.current?.focus();
+                      }}
+                    >
+                      {example}
+                    </button>
+                  ))}
+                </div>
+                <p className="chat-empty__hint">Ctrl/⌘+Shift+N 新建会话 · Esc 收起设置面板</p>
               </div>
             ) : (
               conversation.messages.map((message, index) => (
@@ -421,25 +833,33 @@ export function ChatPanel() {
                   index={index}
                   showReasoning={chat.options.showReasoning}
                   showMath={chat.options.showMath}
+                  processMode={chat.options.processMode}
                   streaming={streaming && index === conversation.messages.length - 1}
-                  actions={
-                    chat.options.chatEdit
-                      ? {
-                          editable: true,
-                          busy: streaming,
-                          onRewind: (at) => rewindChat(at, false),
-                          onBranch: (at) => rewindChat(at, true),
-                          onRegenerate: (at) => regenerateReply(at),
-                          onEditAnswer: (at, text) => editAnswerText(at, text),
-                        }
-                      : null
-                  }
-                  onCopy={(value) => void copy(value)}
+                  actions={messageActions}
+                  onCopy={copy}
                 />
               ))
             )}
           </div>
         </div>
+        {turns.length > 1 && (
+          <nav className="chat-turns" aria-label="轮次跳转">
+            {turns.map((turn, turnIndex) => {
+              const busy = streaming && turnIndex === turns.length - 1;
+              return (
+                <button
+                  key={turn.id}
+                  type="button"
+                  className={`chat-turns__mark${turnIndex === activeTurn ? " is-on" : ""}${busy ? " is-busy" : ""}`}
+                  title={`第 ${turnIndex + 1} 轮：${turn.label}`}
+                  aria-label={`跳到第 ${turnIndex + 1} 轮：${turn.label}`}
+                  aria-current={turnIndex === activeTurn ? "true" : undefined}
+                  onClick={() => jumpToTurn(turn.id)}
+                />
+              );
+            })}
+          </nav>
+        )}
 
         {/* 内容宽度的拖拽手柄：贴在内容区右边缘，居中（用户 m07390） */}
         <div
@@ -463,6 +883,11 @@ export function ChatPanel() {
               <button type="button" className="st-btn st-btn--ghost" onClick={clearPendingChat}>
                 取消
               </button>
+            </div>
+          )}
+          {chat.options.webSearch && !chat.searchAvailable && (
+            <div className="chat-search-hint" role="status">
+              联网搜索暂不可用：引擎都在冷却或没配 key，本条消息不会自动搜索。
             </div>
           )}
           <form
@@ -517,9 +942,16 @@ export function ChatPanel() {
               value={chat.draft}
               disabled={composerLocked}
               onChange={(event) => {
-                setChatDraft(event.target.value);
+                const value = event.target.value;
+                setChatDraft(value);
                 event.target.style.height = "";
                 event.target.style.height = `${Math.min(event.target.scrollHeight, window.innerHeight * 0.4)}px`;
+                // @ 引用文件（P1）：行首或空白后输入 @ 直接打开文件选择，与回形针按钮等价；
+                // 选到文件后把那个 @ 去掉（取消选择时 input 不触发，@ 留着由用户自己删）
+                if (!streaming && value.endsWith("@") && (value.length === 1 || /\s$/.test(value.slice(0, -1)))) {
+                  atPending.current = true;
+                  files.current?.click();
+                }
               }}
               onKeyDown={(event) => {
                 // 发送键可在采样设置里切换（用户 m07816 第 3 点）：默认 Enter 发送，
@@ -528,10 +960,19 @@ export function ChatPanel() {
                 const hit = chat.options.enterSends
                   ? event.key === "Enter" && !event.shiftKey && !withCtrl
                   : event.key === "Enter" && withCtrl;
-                if (hit && !event.nativeEvent.isComposing) {
+                // 中文/日文输入法：除了 isComposing，还要认 keyCode 229 与 compositionend 后 50ms 内的
+                // 那个回车（WKWebView 的顺序不同），否则选词回车会被当成发送（照 Strata `ime-enter.ts`）
+                const ime =
+                  event.nativeEvent.isComposing ||
+                  event.nativeEvent.keyCode === 229 ||
+                  Date.now() - imeCommitAt.current < 50;
+                if (hit && !ime) {
                   event.preventDefault();
                   submit();
                 }
+              }}
+              onCompositionEnd={() => {
+                imeCommitAt.current = Date.now();
               }}
               onPaste={(event) => {
                 const list = [...event.clipboardData.files];
@@ -558,10 +999,16 @@ export function ChatPanel() {
                 multiple
                 hidden
                 aria-label="附件"
-                accept="image/*,text/*,.md,.json,.csv,.yaml,.yml,.py,.js,.ts,.tsx,.rs,.log,.sql"
+                accept="image/*,text/*,.md,.json,.csv,.yaml,.yml,.py,.js,.ts,.tsx,.rs,.log,.sql,.pdf,.docx,.xlsx,.pptx"
                 onChange={(event) => {
-                  void addChatAttachments([...(event.target.files ?? [])]);
+                  const picked = [...(event.target.files ?? [])];
                   event.target.value = "";
+                  if (picked.length === 0) return;
+                  void addChatAttachments(picked);
+                  if (atPending.current) {
+                    atPending.current = false;
+                    if (chat.draft.endsWith("@")) setChatDraft(chat.draft.slice(0, -1));
+                  }
                 }}
               />
               <button
@@ -583,6 +1030,26 @@ export function ChatPanel() {
                 onClick={() => conversation && exportConversation(conversation)}
               >
                 <ChatIcon name="download" />
+              </button>
+              <button
+                type="button"
+                className="st-btn st-btn--icon"
+                title="导出为 JSON（含工具调用、来源与用量）"
+                aria-label="导出为 JSON"
+                disabled={!conversation || !conversation.messages.length || streaming}
+                onClick={() => conversation && exportJson(conversation)}
+              >
+                <i className="fas fa-file-code" />
+              </button>
+              <button
+                type="button"
+                className="st-btn st-btn--icon"
+                title="导出整段对话长图（PNG）"
+                aria-label="导出长图"
+                disabled={!conversation || !conversation.messages.length || streaming}
+                onClick={() => conversation && void exportImage(conversation)}
+              >
+                <i className="fas fa-image" />
               </button>
               <button
                 type="button"
@@ -668,6 +1135,37 @@ export function ChatPanel() {
               </button>
             </div>
           </form>
+          {contextUse && (
+            <div
+              className="chat-context"
+              title="已用 = 上一轮 prompt + 输出 token；分母是这个模型实际运行的上下文（--ctx-size）"
+            >
+              <span>
+                上下文 {fmtTokCount(contextUse.used)}
+                {contextUse.limit
+                  ? ` / ${fmtTokCount(contextUse.limit)}（${contextUse.pct ?? 0}%）`
+                  : ""}
+              </span>
+            </div>
+          )}
+          {dock && (
+            <div className="composer-dock" title="本次会话累计：轮次、工具次数、上一次回答的速度与首 token、token 与缓存">
+              {dock}
+            </div>
+          )}
+          {quote && (
+            <button
+              type="button"
+              className="chat-quote-btn"
+              // 位置是运行时量出来的（选区坐标），样式本身全在 components.css 里
+              style={{ "--quote-top": `${quote.top}px`, "--quote-left": `${quote.left}px` } as CSSProperties}
+              onPointerDown={(event) => event.preventDefault()}
+              onClick={() => insertQuote(quote.text)}
+              title="把选中的文字引用进输入框"
+            >
+              <i className="fas fa-quote-left" /> 引用
+            </button>
+          )}
         </div>
       </div>
 
@@ -686,94 +1184,4 @@ export function ChatPanel() {
   );
 }
 
-/** 历史栏里的一条：点主体切换会话，行内改名，点两次删除 */
-function HistoryItem({
-  item,
-  active,
-  disabled,
-  onSelect,
-  onRename,
-  onDelete,
-}: {
-  item: Conversation;
-  active: boolean;
-  disabled: boolean;
-  onSelect: () => void;
-  onRename: (title: string) => void;
-  onDelete: () => void;
-}) {
-  const [renaming, setRenaming] = useState(false);
-  const [title, setTitle] = useState(item.title);
-
-  useEffect(() => {
-    setTitle(item.title);
-  }, [item.title]);
-
-  if (renaming) {
-    return (
-      <div className={`chat-history-item${active ? " is-active" : ""}`}>
-        <input
-          className="st-input chat-history-rename"
-          autoFocus
-          value={title}
-          onChange={(event) => setTitle(event.target.value)}
-          onBlur={() => {
-            onRename(title);
-            setRenaming(false);
-          }}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") {
-              onRename(title);
-              setRenaming(false);
-            }
-            if (event.key === "Escape") {
-              setTitle(item.title);
-              setRenaming(false);
-            }
-          }}
-        />
-      </div>
-    );
-  }
-
-  return (
-    <div className={`chat-history-item${active ? " is-active" : ""}`}>
-      <button
-        type="button"
-        className="chat-history-select"
-        aria-current={active ? "true" : undefined}
-        title={item.title}
-        disabled={disabled}
-        onClick={onSelect}
-      >
-        <span>{item.title || "未命名会话"}</span>
-        <small>
-          {new Date(item.updatedAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })} ·{" "}
-          {item.messages.length} 条消息
-        </small>
-      </button>
-      <div className="chat-history-actions">
-        <button
-          type="button"
-          className="st-btn st-btn--icon"
-          disabled={disabled}
-          title="重命名"
-          aria-label={`重命名：${item.title}`}
-          onClick={() => setRenaming(true)}
-        >
-          <i className="fas fa-pen" />
-        </button>
-        <button
-          type="button"
-          className="st-btn st-btn--icon chat-history-delete"
-          disabled={disabled}
-          title="删除"
-          aria-label={`删除：${item.title}`}
-          onClick={onDelete}
-        >
-          <i className="fas fa-trash-can" />
-        </button>
-      </div>
-    </div>
-  );
-}
+/** 历史栏里的一条：点主体切换会话，行内改名，点按钮删除（实现在 ChatHistoryItem.tsx，审查 Q1 拆出） */

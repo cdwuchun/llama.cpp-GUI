@@ -2,7 +2,7 @@ import { Children, isValidElement, memo, useEffect, useRef, useState, type React
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-import type { ChatToolEvent, ChatTurn } from "../utils/chat";
+import type { ChatProcessMode, ChatToolEvent, ChatTurn } from "../utils/chat";
 import { ipc } from "../ipc";
 import { describeToolCall, toolTitle } from "../utils/tools";
 import { canPreview, previewFrameDoc, type PreviewKind } from "../utils/chatPreview";
@@ -21,6 +21,8 @@ export interface ChatMessageActions {
   onBranch: (index: number) => void;
   onRegenerate: (index: number) => void;
   onEditAnswer: (index: number, text: string) => void;
+  /** 编辑用户消息：正文放回输入框，它和后面的消息隐藏（方案 v2） */
+  onEditUser: (index: number, text: string) => void;
 }
 
 /** 代码块：右上角带语言名与复制按钮（照上游 `CodeBlock`） */
@@ -188,6 +190,7 @@ export const ChatMessageView = memo(function ChatMessageView({
   index,
   showReasoning,
   showMath,
+  processMode,
   streaming,
   actions,
   onCopy,
@@ -198,33 +201,50 @@ export const ChatMessageView = memo(function ChatMessageView({
   showReasoning: boolean;
   /** 渲染 KaTeX 公式（聊天设置里的「显示数学」） */
   showMath: boolean;
+  /** 过程区默认展开方式（聊天设置里的「过程展示」） */
+  processMode: ChatProcessMode;
   streaming: boolean;
   /** null = 不显示操作按钮（比如导出、只读场景） */
   actions: ChatMessageActions | null;
   onCopy: (value: string) => void;
 }) {
-  const reasoning = useRef<HTMLDetailsElement>(null);
+  /** 过程区（思考 + 工具调用）的 details */
+  const processRef = useRef<HTMLDetailsElement>(null);
   const touched = useRef(false);
   const thinkingNow = streaming && !message.content;
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(message.content);
+  /** 用户消息的编辑态：与助手回答的「改写」分开，保存后是把正文放回输入框而不是直接改历史 */
+  const [userEditing, setUserEditing] = useState(false);
+  const [userDraft, setUserDraft] = useState(message.content);
   const locked = !actions || actions.busy || streaming;
+
+  const commitUserEdit = () => {
+    if (!actions) return;
+    const text = userDraft.trim();
+    if (!text) return;
+    setUserEditing(false);
+    actions.onEditUser(index, text);
+  };
 
   useEffect(() => {
     if (!editing) setDraft(message.content);
   }, [message.content, editing]);
 
-  // 思考块自动开合：用户手动点过之后就不再托管（上游同）
+  // 过程区自动开合（照 DSH 的工作步骤展示模式）：简洁恒收、标准生成中展开、详细恒开；
+  // 用户手动点过之后就不再托管
   useEffect(() => {
-    if (reasoning.current && !touched.current) reasoning.current.open = thinkingNow && showReasoning;
-  }, [thinkingNow, showReasoning]);
+    if (!processRef.current || touched.current) return;
+    processRef.current.open =
+      processMode === "detailed" ? true : processMode === "compact" ? false : streaming || (thinkingNow && showReasoning);
+  }, [processMode, streaming, thinkingNow, showReasoning]);
 
   const fmt = (value: number, digits = 1) =>
     value.toLocaleString("zh-CN", { maximumFractionDigits: digits });
 
   if (message.role === "user") {
     return (
-      <div className="st-msg st-msg--user">
+      <div className="st-msg st-msg--user" id={`chat-msg-${message.id}`}>
         {Boolean(message.attachments?.length) && (
           <div className="msg-images">
             {message.attachments!.map((file) =>
@@ -239,14 +259,73 @@ export const ChatMessageView = memo(function ChatMessageView({
             )}
           </div>
         )}
-        <div className="st-bubble">{message.content}</div>
+        {userEditing ? (
+          <div className="msg-edit">
+            <textarea
+              className="st-input"
+              rows={3}
+              aria-label="编辑消息"
+              autoFocus
+              value={userDraft}
+              disabled={locked}
+              onChange={(event) => setUserDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+                  event.preventDefault();
+                  commitUserEdit();
+                }
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  setUserEditing(false);
+                  setUserDraft(message.content);
+                }
+              }}
+            />
+            <div className="msg-edit__bar">
+              <span className="muted small">保存后这条和后面的消息会隐藏，内容放回输入框</span>
+              <button
+                type="button"
+                className="st-btn st-btn--ghost"
+                onClick={() => {
+                  setUserEditing(false);
+                  setUserDraft(message.content);
+                }}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                className="st-btn st-btn--primary"
+                disabled={!userDraft.trim() || locked}
+                onClick={commitUserEdit}
+              >
+                保存
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="st-bubble">{message.content}</div>
+        )}
         <div className="st-msg__meta">
           <span className="meta-text">
             你 ·{" "}
             {new Date(message.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}
           </span>
-          {actions?.editable && (
+          {actions?.editable && !userEditing && (
             <span className="msg-actions">
+              <button
+                type="button"
+                className="st-btn st-btn--icon"
+                title="编辑这条消息（放回输入框，后面的消息隐藏）"
+                aria-label="编辑消息"
+                disabled={locked}
+                onClick={() => {
+                  setUserDraft(message.content);
+                  setUserEditing(true);
+                }}
+              >
+                <ChatIcon name="edit" size={16} />
+              </button>
               <button
                 type="button"
                 className="st-btn st-btn--icon"
@@ -298,49 +377,40 @@ export const ChatMessageView = memo(function ChatMessageView({
   if (ran) segments.push(`${ran} 次工具调用`);
   const meta = streaming ? "" : segments.join(" · ");
 
-  // 正文按工具调用位置切开：文字 → 工具 → 文字 → …
-  const answer: ReactNode[] = [];
-  let position = 0;
-  for (const [order, tool] of (message.tools ?? []).entries()) {
-    const at = Math.min(Math.max(tool.at ?? 0, position), message.content.length);
-    if (at > position) {
-      answer.push(
-        <Markdown
-          key={`text-${order}`}
-          text={message.content.slice(position, at)}
-          onCopy={onCopy}
-          showMath={showMath}
-        />,
-      );
-    }
-    answer.push(<ToolCall key={tool.id ?? order} tool={tool} />);
-    position = at;
-  }
-  if (position < message.content.length) {
-    answer.push(<Markdown key="tail" text={message.content.slice(position)} onCopy={onCopy} showMath={showMath} />);
-  }
+  // 过程分组（照 DSH）：思考与工具调用统一收进上面的过程区，
+  // 正文只渲染文本，不再按 tool.at 插卡片——否则长回答里卡片和文字交替铺开，翻起来很累。
+  const steps = message.tools?.length ?? 0;
+  const hasProcess = Boolean(message.reasoning) || steps > 0;
+  const answer = <Markdown key="body" text={message.content} onCopy={onCopy} showMath={showMath} />;
 
   return (
-    <div className="st-msg st-msg--assistant">
+    <div className="st-msg st-msg--assistant" id={`chat-msg-${message.id}`}>
       {message.execution && <ChatExecutionStatus execution={message.execution} streaming={streaming} />}
-      <details ref={reasoning} className="st-collapse think" hidden={!message.reasoning}>
-        <summary
-          onClick={() => {
-            touched.current = true;
-          }}
-        >
-          <ChatIcon name="think" size={16} />
-          <span className="think-title">
-            {thinkingNow
-              ? "正在思考…"
-              : message.reasoningMs != null
-                ? `思考了 ${fmt(message.reasoningMs / 1000)} 秒`
-                : "思考过程"}
-          </span>
-          <ChatIcon name="chevron" size={16} className="st-chev" />
-        </summary>
-        <div className="st-collapse__body thinking">{message.reasoning}</div>
-      </details>
+      {hasProcess && (
+        <details ref={processRef} className="st-collapse think st-process">
+          <summary
+            onClick={() => {
+              touched.current = true;
+            }}
+          >
+            <ChatIcon name="think" size={16} />
+            <span className="think-title">
+              {thinkingNow
+                ? "正在思考…"
+                : `过程${steps > 0 ? ` · ${steps} 次工具` : ""}${
+                    message.reasoningMs != null ? ` · ${fmt(message.reasoningMs / 1000)} 秒` : ""
+                  }`}
+            </span>
+            <ChatIcon name="chevron" size={16} className="st-chev" />
+          </summary>
+          <div className="st-process__body">
+            {message.reasoning && <div className="st-collapse__body thinking">{message.reasoning}</div>}
+            {(message.tools ?? []).map((tool, order) => (
+              <ToolCall key={tool.id ?? order} tool={tool} />
+            ))}
+          </div>
+        </details>
+      )}
       {editing ? (
         <div className="st-bubble msg-edit">
           <textarea
@@ -388,6 +458,28 @@ export const ChatMessageView = memo(function ChatMessageView({
           ) : (
             <>{answer}</>
           )}
+        </div>
+      )}
+      {Boolean(message.sources?.length) && (
+        <div className="chat-sources">
+          <div className="chat-sources__title">
+            <i className="fas fa-link" />
+            <span>参考来源</span>
+          </div>
+          <ul>
+            {message.sources!.map((item) => (
+              <li key={item.url}>
+                <button
+                  type="button"
+                  className="chat-sources__link"
+                  title={item.url}
+                  onClick={() => void ipc.openExternal(item.url)}
+                >
+                  {item.title}
+                </button>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
       <div className="st-msg__meta">

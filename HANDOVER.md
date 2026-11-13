@@ -3,7 +3,7 @@
 > 面向**接手这个仓库的新会话 / 新维护者**。`README.md` 讲能力与用法，本文讲**怎么接手**：架构与代码地图（§1）、
 > llama.cpp 行为约束（§2）、前端约定（§3）、后端要点（§4）、构建与验证（§5）、运行时数据文件（§6）、未决项（§7）。
 >
-> **现行版本 0.3.10（2026-11-12）**。逐轮实现日志与历史决策不写在这里，去 `docs/archive/`：
+> **现行版本 0.3.11（2026-11-13）**。逐轮实现日志与历史决策不写在这里，去 `docs/archive/`：
 > `ITERATION_LOG.md`（0.1.x → 0.2.0 的起因、实测证据与坑）、`DECISIONS-2026-10.md`（2026-10 关键决策）；
 > 已落地的设计文档：`PROXY_SCHEDULER_PLAN.md`（前门与配置层规格）、`STRATA_INTEGRATION_PLAN.md`（Strata 通道）、
 > `STRATA_MANAGER_PORT_ASSESSMENT.md`（聊天/监控/压测移植）、`WEB_SEARCH_PLAN.md`（五引擎搜索）、
@@ -84,6 +84,10 @@ llama.cpp 的 router mode 已于 2026-10-15 退役（`router.rs` → `logs.rs`�
 | `src/utils/modelPerformance.ts` | 速度 / 首字延迟估算表（上游 `model-performance.ts` 的实测数据） | 按家族 + 量化 + 硬件查表 |
 | `src/utils/communityCatalog.ts` | 社区内置三条 + `mergeCommunityModels` + 风险与类型中文标签 | 发现结果来自 `strata_community_discover` |
 | `src/utils/tools.ts` | 聊天工具定义（`web_search` / `web_fetch` / `mcp__*`）与工具调用片段合并 | 执行在 `store.ts::sendChat` |
+| `src/utils/chatStore.ts` | 会话的 IndexedDB 存储（500 条上限），`localStorage` 降级保留 | 全量重写、按 `updatedAt` 裁剪；IDB 打不开时界面照常工作 |
+| `src/utils/chatDocs.ts` + `chatDocs.worker.ts` | 文档附件抽文本（PDF 走 pdfjs-dist、Word/Excel/PPT 走 jszip），解析在 worker、解析库动态 `import` | 构建要求 `worker.format: "es"`（§5） |
+| `src/utils/searchCache.ts` | 跨轮搜索缓存（30 分钟 / 120 条，查询归一化） | 命中时 `SearchResponse.cached = true`，工具卡片据此标注 |
+| `src/components/ChatHistoryItem.tsx` | 历史栏单条：切换 / 行内改名 / 二次确认删除 / 自绘标题提示 | 从 `ChatPanel.tsx` 拆出（降低重渲染成本） |
 | `src/components/ParamForm.tsx` | 参数表单控件（下拉、路径选择、JSON 编辑） | 下拉菜单用 portal |
 | `src/components/ModelSheets.tsx` | 模型配置 / 详情弹窗；Strata 侧左栏是 config 原文（可编辑） | |
 | `src/components/ModelDownloadPage.tsx` | **模型下载页**：官方 / 社区两档 + 本地 GGUF + ORCA 面板，四个弹窗 | 照搬上游同名页面结构与文案 |
@@ -257,6 +261,13 @@ Strata 的二进制不同名、没有 router mode，config 是 `strata-*.json`�
 ### 3.5 文案与交互口味
 简体中文、简洁；用户明确否定过的方向不要重提；改动前先说清楚"要改什么"。
 
+### 3.6 会话、附件与搜索缓存（0.3.11）
+
+- **会话存 IndexedDB，不再只靠 localStorage**：`src/utils/chatStore.ts` 用原生 IndexedDB（库 `llamacpp-gui-chat`、表 `conversations`、`keyPath: "id"`）存全量会话，上限 500 条；`localStorage` 那份**降级保留** —— IDB 打不开（隐私模式、旧内核、配额满）时界面照常工作，只是回到 30 条。写入是「一个事务里 clear + 批量 put」的全量重写，几百条量级比逐条 diff 简单，也不会删漏。
+- **附件解析在 worker 里做**：`src/utils/chatDocs.ts` 抽文本，PDF 走 `pdfjs-dist`、Word / Excel / PPT 走 `jszip`（OOXML 本身是 zip + xml），两者都是 `await import(...)` 动态加载 —— 平时不下载，附加文件时才拉 chunk。**构建必须 `worker.format: "es"`**（见 §5），否则 `iife` 不支持 code splitting，构建直接失败。
+- **搜索有 30 分钟 / 120 条的跨轮缓存**：`src/utils/searchCache.ts` 照 Strata `web-search-ddg.mjs` 的阈值，键是「归一化查询 + limit + 时间范围」。同一轮里模型把同一个词换个大小写再来一遍时不再真打引擎（匿名引擎按分钟计额度，重复打容易被冷却）；命中时 `SearchResponse.cached = true`，工具卡片上能看到。
+- **历史栏一条一个组件**：`src/components/ChatHistoryItem.tsx` 从 `ChatPanel.tsx` 拆出来，标题溢出用自绘浮层（portal 到 body，深色小气泡）而不是原生 `title` —— 原生那个是系统灰框，延迟和样式都不可控。
+
 ---
 
 ## 4. 后端要点
@@ -286,6 +297,9 @@ node scripts/make-icons.mjs        # 重新生成全部图标资产
 
 - **cargo 要走本机代理**：本机 Windows 原生 TLS（schannel）不可用（`SEC_E_NO_CREDENTIALS`），`.cargo/config.toml` 已把 `crates-io` 指向 `127.0.0.1:8787`；没开代理就是 `Could not connect to server`。依赖已在本地缓存时（`Cargo.lock` 未变）也可以直接 `cargo check --offline --lib` / `cargo test --offline --lib` 绕过代理。
 - **沙箱限制**：命名管道被禁 → esbuild 报 `spawn EPERM`，打包需要更宽权限；**GUI 运行验证必须在沙箱外**（WebView2 渲染进程走命名管道）。
+- **worker 必须输出 ES 模块**：`vite.config.ts` 里 `worker: { format: "es" }`。默认的 `iife` 不支持 code splitting，而 `src/utils/chatDocs.worker.ts` 要动态 `import("pdfjs-dist")` / `import("jszip")`，构建会直接失败：
+  `[vite:worker-import-meta-url] Invalid value "iife" for option "worker.format" - UMD and IIFE output formats are not supported for code-splitting builds.`
+  WebView2 是 Chromium，`type: "module"` 的 worker 没有问题。（0.3.11 踩过。）
 - **构建/测试都要把 `TEMP`/`TMP` 指进工作区**（只提权不够）：
 
   ```powershell
@@ -355,8 +369,8 @@ Strata 侧：`strata_root`、`strata_controller`、`strata_auto_controller`(true
    - **工具卡片跨轮回填是摘要，不是原文**（`src/utils/chat.ts::summarizeToolResult`，≤800 字符/条）：搜索结果留「标题 —— 摘要 + URL」，正文抓取留「原文地址 + 正文开头」，末尾写明完整结果在哪张卡片上。整段回填会让长会话每轮多几万 tokens（部署版实测 prompt 冲到 12 万）。
    - **工具循环最多 5 轮，用尽必答**：`sendChat` 里 `hitToolLimit` 记下「第 5 轮还在要工具」，循环后无论这一轮是否已写了过渡语都补一次收尾请求（`tools=[]`、`reasoning_effort: none`）。整轮工具调用全被去重拦下（一个新资料都没拿到）时提前收尾，不再空转。
    - **上次打开的会话会恢复**：`CHAT_ACTIVE_KEY = "llamacpp-gui-chat-active"` 记 activeId；记着的会话被删了才退回最近更新的一条。不恢复的话，重启/刷新后聊天页是空白新会话，用户会以为上下文被重置。
-    - **本机事实靠一个 local-first 的 MCP 服务器**（`tools/llamacpp-mcp.mjs`，stdio，MCP 2024-11-05）：暴露 `list_dir` / `llama_help` / `read_text_file` / `run_readonly_command` 四个只读工具。`llama_help` 直接跑该版本 `llama-*.exe --help` 拿真实参数表（这是「b12196 支持哪些 MoE 参数」这类问题的唯一可靠来源，网上查不到）。部署版配在 `E:\AI\llama.cpp-gui\mcp.json`（脚本复制到 `E:\AI\llama.cpp-gui\tools\`），聊天设置里勾选「MCP 工具」后生效。
-      - 安全边界（**路径不限、命令只读**）：`read_text_file` / `list_dir` 可读任意路径（二进制与 256 KB / 400 行上限）；`run_readonly` **不经 shell**（`shell: false`，`>`、`|`、`;` 不被解释），程序与参数双白名单 —— 只允许 `llama-*.exe` 的 `--help/-h/--version/-v/--list-devices`、`nvidia-smi` 显存查询、`tasklist`、`where`、`node -v`；其余一律拒绝，任何写文件、删文件、改配置的意图都被拦下。另外两条约束保留：读文本时把 `api_key` 之类字段与 `sk-…` 打码；输出限长（20 000 字符、文件 256 KB / 400 行）。`selectedVersion()` 内部读部署目录的 `settings.json` 只为拿版本目录名，不向模型暴露内容。GBK 控制台输出（`tasklist` 等）先按 UTF-8 解，出现替换字符再回退 GBK。
+    - **本机事实靠一个 local-first 的通用 MCP 服务器**（`tools/local-tools-mcp.mjs`，stdio，MCP 2024-11-05；旧名 `llamacpp-mcp.mjs` 已改名）：暴露 `list_dir` / `run_help` / `read_text_file` / `run_readonly` 四个只读工具，全部不绑定 llama.cpp。`run_help` 跑任意可执行文件的 `--help` / `--version`（`git`、`python`、`cargo`、`llama-server.exe` 都行）；`read_text_file` 读任意语言的源码、配置、日志；`list_dir` 列用户指定目录（`path` 必填，无参调用直接报错）。部署版配在 `E:\AI\llama.cpp-gui\mcp.json`（脚本复制到 `E:\AI\llama.cpp-gui\tools\`），聊天设置里勾选「MCP 工具」后生效。
+      - 安全边界（**路径不限、命令只读**）：`read_text_file` / `list_dir` 可读任意路径（二进制与 256 KB / 400 行上限）；`run_help` / `run_readonly` **不经 shell**（`shell: false`，`>`、`|`、`;` 不被解释），参数只允许 `--help/-h/-help/--version/-v/-V/-version/--list-devices/--list-*` 这类只读参数，`nvidia-smi` 显存查询 / `tasklist` / `where` / `node -v` 另有各自约束；其余一律拒绝，任何写文件、删文件、改配置的意图都被拦下。另外两条约束保留：读文本时把 `api_key` 之类字段与 `sk-…` 打码；输出限长（20 000 字符、文件 256 KB / 400 行）。**四个工具的描述都写明：路径/程序名只从用户消息或对话里取，用户没给就先问，不许拿默认目录或随便挑程序猜**（模型曾无参调用 `list_dir` 去翻 GUI 安装目录）。GBK 控制台输出（`tasklist` 等）先按 UTF-8 解，出现替换字符再回退 GBK。
 4. **`models_max = 1` 时每次换模型都要停旧起新**：切模型有 3–6 秒冷启动，不是卡住；要并行驻留就调大 `models_max`。
 
 ---

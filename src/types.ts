@@ -775,6 +775,8 @@ export interface SearchEngineView {
   hasKey: boolean;
   /** 刚失败过，正在冷却 */
   cooling: boolean;
+  /** 冷却剩余秒数（0 = 没在冷却）；老后端没这个字段时按 0 处理 */
+  coolingSecs?: number;
 }
 
 /** 联网搜索的配置视图（不含任何 key 明文） */

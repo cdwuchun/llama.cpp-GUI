@@ -1,29 +1,34 @@
 #!/usr/bin/env node
-// llama.cpp GUI 的本地 MCP 服务器（stdio，MCP 2024-11-05）。
+// GUI 的本地 MCP 服务器（stdio，MCP 2024-11-05）—— 通用本机工具，不绑定 llama.cpp。
 //
-// 为什么需要它：GUI 聊天原来只有 web_search / web_fetch 两个工具，问「b12196 支持哪些
-// MoE 参数」时模型只能上网搜，而具体构建号的参数网上基本没有 —— 于是它凭印象编参数。
-// 这台服务器把本机读取与命令执行能力交给模型，让它先取本机事实，再考虑联网。
+// 为什么需要它：GUI 聊天原来只有 web_search / web_fetch 两个工具，问「这个可执行文件支持
+// 哪些参数」「某个版本的帮助文本」「某段源码怎么写的」时模型只能上网搜或凭印象编。这台
+// 服务器把本机读取与只读查询能力交给模型，让它先取本机事实，再考虑联网。
 //
-// 用户明确要求取消路径白名单与命令白名单：现在的边界只剩「默认不写」——`read_text_file`
-// / `list_dir` 不会改任何东西，`run_command` 可以执行任意命令（包括会写文件的命令），
-// 请知悉这一点。密钥打码与输出限长仍然保留。
+// 通用性约定：
+// - `list_dir` 列用户指定的目录（path 必填，不许猜）。
+// - `read_text_file` 读任意文本文件（任何编程语言源码、配置、日志、文档），不限扩展名。
+// - `run_help` 查任意可执行文件的 --help / --version（不限 llama.cpp，python / node /
+//   git / cargo / 任意 .exe 都行），支持按关键字过滤帮助文本。
+// - `run_readonly` 执行只读参数（--help / -h / --version / -v / --list-* 等）；不经 shell，
+//   所以 `>`、`|`、`;` 不会被解释。写文件、删文件、改配置一律拒绝。
+//
+// 行为约定：路径与程序名只从用户消息或对话上下文里取；用户没给就先问，不要拿默认目录或
+// 随便挑一个程序去猜 —— 无参调用 list_dir 会直接报错。
+//
+// 边界：默认不写。`read_text_file` / `list_dir` 只读；`run_help` / `run_readonly` 只跑
+// 只读参数。密钥打码与输出限长保留。
 //
 // 由 GUI 的聊天设置以 stdio 子进程拉起（mcp.json），不要脱离 GUI 单独用。
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { createInterface } from "node:readline";
 
 const PROTOCOL_VERSION = "2024-11-05";
-const SERVER_NAME = "llamacpp-local";
-const SERVER_VERSION = "2.0.0";
-
-/** llama.cpp 版本目录所在（list_dir 的默认目录、llama_help 的默认根）。 */
-const LLAMA_ROOT = "E:\\AI\\llamacpp";
-/** 命令的默认工作目录。 */
-const DEFAULT_CWD = "E:\\AI\\llama.cpp-gui";
+const SERVER_NAME = "local-tools";
+const SERVER_VERSION = "3.1.0";
 
 const READ_MAX_BYTES = 256 * 1024;
 const READ_MAX_LINES = 400;
@@ -32,17 +37,24 @@ const EXEC_MAX_TIMEOUT_MS = 300_000;
 const EXEC_MAX_BUFFER = 32 * 1024 * 1024;
 const OUTPUT_MAX_CHARS = 20_000;
 
-const HELP_TOOLS = {
-  server: "llama-server.exe",
-  cli: "llama-cli.exe",
-  bench: "llama-bench.exe",
-  "fit-params": "llama-fit-params.exe",
-};
+/** 默认工作目录：服务器进程的启动目录（只作为执行程序的 cwd，不用来猜用户想看的目录）。 */
+const DEFAULT_CWD = process.cwd();
 
-/** llama.cpp 自带的只读开关：这五个不会改任何文件。 */
-const LLAMA_FLAGS = new Set(["--help", "-h", "--version", "-v", "--list-devices"]);
+/** 通用的「只读」参数：查帮助、查版本、列设备/列表。 */
+const READONLY_FLAGS = new Set([
+  "--help",
+  "-h",
+  "-help",
+  "--version",
+  "-v",
+  "-V",
+  "-version",
+  "--list-devices",
+  "/?",
+  "-?",
+]);
 
-/** 除 llama-*.exe 外允许的只读程序（按可执行文件名判断，参数另有约束）。 */
+/** 专用只读程序（按可执行文件名判断，参数另有约束）。 */
 const READONLY_PROGRAMS = new Set(["nvidia-smi.exe", "tasklist.exe", "where.exe", "node.exe"]);
 
 // ---------------------------------------------------------------- 路径与文本
@@ -74,7 +86,7 @@ function humanSize(bytes) {
   return `${bytes} B`;
 }
 
-/** 把看起来像密钥的值打码（设置文件里存着 llama.cpp / Strata 的 api_key）。 */
+/** 把看起来像密钥的值打码（设置文件里存着各服务的 api_key）。 */
 function redactSecrets(text) {
   return text
     .replace(/("(?:api[_-]?key|token|secret|password|authorization|key)"\s*:\s*")([^"]{4,})(")/gi, "$1***$3")
@@ -99,38 +111,13 @@ function decodeOutput(buffer) {
   }
 }
 
-/** 读部署目录的 settings.json，取当前选中的 llama.cpp 版本（读不到就退回最新目录）。
- *
- * 这是服务器内部读配置：只取一个版本目录名，不向模型暴露 settings.json 的内容。 */
-function selectedVersion() {
-  try {
-    const text = readFileSync("E:\\AI\\llama.cpp-gui\\settings.json", "utf8");
-    const settings = JSON.parse(text);
-    const name = typeof settings.selected_version === "string" ? settings.selected_version : "";
-    if (name && existsSync(path.join(LLAMA_ROOT, name))) return name;
-  } catch {
-    // 忽略：退回下面的最新目录
-  }
-  return latestVersion();
-}
-
-function latestVersion() {
-  try {
-    const dirs = readdirSync(LLAMA_ROOT, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && entry.name.startsWith("llama-"))
-      .map((entry) => entry.name)
-      .sort();
-    return dirs.length > 0 ? dirs[dirs.length - 1] : "";
-  } catch {
-    return "";
-  }
-}
-
 // ---------------------------------------------------------------- 工具实现
 
 function toolListDir(args) {
-  const absolute = resolvePath(args.path ?? LLAMA_ROOT);
-  if (!absolute) return fail("缺少 path（要列出的目录）。");
+  const absolute = resolvePath(args.path);
+  if (!absolute) {
+    return fail("缺少 path：请先问用户要列出哪个目录（比如项目根目录或具体路径），不要猜目录、也不要用默认目录。");
+  }
   let entries;
   try {
     entries = readdirSync(absolute, { withFileTypes: true });
@@ -175,36 +162,69 @@ function clipHelp(out, filter) {
   return text;
 }
 
-/** 跑只读命令并合并 stdout + stderr（llama.cpp 把 `--version` 写在 stderr 上）。 */
-function runReadonly(absolute, flags) {
+/** 解析 program：带路径分隔符按绝对路径；纯名字交给 PATH 查找。 */
+function resolveProgram(raw) {
+  if (typeof raw !== "string" || raw.trim() === "") return null;
+  const program = raw.trim();
+  const hasSeparator = program.includes("\\") || program.includes("/");
+  if (hasSeparator) {
+    const absolute = path.resolve(program);
+    return existsSync(absolute) ? absolute : null;
+  }
+  // 纯名字：Windows 上补 .exe 再交给 PATH（spawnSync 自己解析）。
+  return program;
+}
+
+/** 跑只读命令并合并 stdout + stderr（不少程序把 --version 写在 stderr 上）。 */
+function runReadonly(absolute, flags, cwd = DEFAULT_CWD, timeout = EXEC_TIMEOUT_MS) {
+  const started = Date.now();
   const result = spawnSync(absolute, flags, {
+    cwd,
+    shell: false,
     encoding: "buffer",
-    timeout: EXEC_TIMEOUT_MS,
+    timeout,
     maxBuffer: EXEC_MAX_BUFFER,
     windowsHide: true,
   });
-  if (result.error) return { error: result.error.message, text: "" };
+  const elapsed = Date.now() - started;
+  if (result.error) return { error: result.error.message, text: "", elapsed, status: null };
   const stdout = result.stdout ?? Buffer.alloc(0);
   const stderr = result.stderr ?? Buffer.alloc(0);
   const text = `${decodeOutput(stdout)}${stdout.length > 0 && stderr.length > 0 ? "\n" : ""}${decodeOutput(stderr)}`;
   if (result.status !== 0 && text.trim() === "") {
-    return { error: `退出码 ${result.status}`, text: "" };
+    return { error: `退出码 ${result.status}`, text: "", elapsed, status: result.status };
   }
-  return { error: "", text };
+  return { error: "", text, elapsed, status: result.status };
 }
 
-function toolLlamaHelp(args) {
-  const tool = typeof args.tool === "string" && HELP_TOOLS[args.tool] ? args.tool : "server";
-  const version = typeof args.version === "string" && args.version.trim() !== "" ? args.version.trim() : selectedVersion();
-  if (!version) return fail(`找不到 llama.cpp 版本目录（${LLAMA_ROOT} 下没有 llama-* 目录）。`);
-  const exe = path.join(LLAMA_ROOT, version, HELP_TOOLS[tool]);
-  const absolute = resolvePath(exe);
-  if (!absolute || !existsSync(absolute)) {
-    return fail(`没有这个可执行文件：${exe}\n可先用 list_dir 看 ${path.join(LLAMA_ROOT, version)} 里有哪些 llama-*.exe。`);
+/** 通用的帮助/版本查询：任意程序 + 只读参数。 */
+function toolRunHelp(args) {
+  const program = resolveProgram(args.program);
+  if (!program) return fail("缺少 program（要查的可执行文件完整路径或名字，例如 git、python、llama-server.exe）。");
+  const flags = Array.isArray(args.args) && args.args.length > 0
+    ? args.args.map((item) => String(item))
+    : ["--help"];
+  if (!isReadonlyInvocation(program, flags)) {
+    return fail(
+      `拒绝执行：${program} ${flags.join(" ")}\n` +
+        "只允许只读参数：--help / -h / --version / -v / -V / --list-* 等。查具体参数请先跑 --help，再传 filter 过滤。",
+    );
   }
-  const { error, text } = runReadonly(absolute, ["--help"]);
-  if (error) return fail(`执行 ${absolute} --help 失败：${error}`);
-  return ok(`${version}\\${HELP_TOOLS[tool]} --help\n\n${clipHelp(text, args.filter)}`);
+  if (!existsSyncProgram(program)) return fail(`找不到可执行文件：${program}`);
+  const cwd = typeof args.cwd === "string" && args.cwd.trim() !== "" ? path.resolve(args.cwd.trim()) : DEFAULT_CWD;
+  const timeout = Number.isInteger(args.timeout_ms) && args.timeout_ms > 0
+    ? Math.min(args.timeout_ms, EXEC_MAX_TIMEOUT_MS)
+    : EXEC_TIMEOUT_MS;
+  const { error, text, status } = runReadonly(program, flags, cwd, timeout);
+  if (error && text.trim() === "") {
+    return fail(`${program} ${flags.join(" ")} 执行失败：${error}`);
+  }
+  return ok(`${path.basename(program)} ${flags.join(" ")}（工作目录 ${cwd} · 退出码 ${status}）\n\n${clipHelp(text, args.filter)}`);
+}
+
+/** 有路径分隔符但不存在时，spawnSync 才会报错；纯名字交给 PATH。 */
+function existsSyncProgram(program) {
+  return program.includes("\\") || program.includes("/") ? existsSync(program) : true;
 }
 
 function toolReadTextFile(args) {
@@ -233,30 +253,26 @@ function toolReadTextFile(args) {
 }
 
 function toolRunReadonly(args) {
-  const program = typeof args.program === "string" ? args.program.trim() : "";
-  if (!program) return fail("缺少 program（要运行的可执行文件，例如 llama-server.exe 的完整路径或 nvidia-smi）。");
+  const raw = typeof args.program === "string" ? args.program.trim() : "";
+  if (!raw) return fail("缺少 program（可执行文件完整路径，或 nvidia-smi / tasklist / where / node 这类名字）。");
+  const program = resolveProgram(raw);
+  if (!program) return fail(`找不到可执行文件：${raw}`);
   const flags = Array.isArray(args.args) ? args.args.map((item) => String(item)) : [];
-  // 带路径分隔符的按绝对路径解析；纯名字（node / nvidia-smi / tasklist）交给 PATH。
-  const hasSeparator = program.includes("\\") || program.includes("/");
-  const target = hasSeparator ? path.resolve(program) : program;
-  const bare = path.basename(target).toLowerCase();
-  const name = /\.exe$/i.test(bare) ? bare : `${bare}.exe`;
-  const check = isReadonlyInvocation(name, flags);
-  if (!check) {
+  if (!existsSyncProgram(program)) return fail(`找不到可执行文件：${program}`);
+  if (!isReadonlyInvocation(program, flags)) {
     return fail(
       `拒绝执行：${program} ${flags.join(" ")}\n` +
-        "只允许只读程序与只读参数：llama.cpp 的 llama-*.exe（--help/-h/--version/-v/--list-devices）、" +
-        "nvidia-smi（-L/-q/--query-gpu=/--format=）、tasklist、where、node -v。任何写文件、删文件、改配置的操作都不允许。",
+        "只允许只读参数：--help / -h / --version / -v / -V / --list-*，以及 nvidia-smi（显存查询）、" +
+        "tasklist（看进程）、where（查路径）、node -v。任何写文件、删文件、改配置的操作都不允许。",
     );
   }
-  if (hasSeparator && !existsSync(target)) return fail(`找不到可执行文件：${target}`);
   const cwd = typeof args.cwd === "string" && args.cwd.trim() !== "" ? path.resolve(args.cwd.trim()) : DEFAULT_CWD;
   const timeout = Number.isInteger(args.timeout_ms) && args.timeout_ms > 0
     ? Math.min(args.timeout_ms, EXEC_MAX_TIMEOUT_MS)
     : EXEC_TIMEOUT_MS;
 
   const started = Date.now();
-  const result = spawnSync(target, flags, {
+  const result = spawnSync(program, flags, {
     cwd,
     shell: false,
     encoding: "buffer",
@@ -265,6 +281,7 @@ function toolRunReadonly(args) {
     windowsHide: true,
   });
   const elapsed = Date.now() - started;
+  const name = path.basename(program);
   if (result.error) {
     return fail(`执行失败（${elapsed} ms，工作目录 ${cwd}）：${result.error.message}`);
   }
@@ -275,21 +292,25 @@ function toolRunReadonly(args) {
   return ok(`${header}\n\n${clipOutput(redactSecrets(body))}`);
 }
 
-/** 只读调用判定：程序名 + 参数都在白名单里，且不经 shell（元字符不会被解释）。 */
-function isReadonlyInvocation(name, flags) {
-  if (/^llama-[a-z0-9-]+\.exe$/.test(name)) return flags.every((flag) => LLAMA_FLAGS.has(flag));
-  if (!READONLY_PROGRAMS.has(name)) return false;
-  if (name === "nvidia-smi.exe") {
+/** 只读调用判定：任意程序 + 只读参数；专用只读程序另有参数约束；不经 shell。 */
+function isReadonlyInvocation(program, flags) {
+  const name = path.basename(program).toLowerCase();
+  const exe = /\.exe$/i.test(name) ? name : `${name}.exe`;
+  if (flags.length === 0) return false;
+  // 通用：任意程序，参数全在通用只读集合（或 --list-* 形式）。
+  if (flags.every((flag) => READONLY_FLAGS.has(flag) || flag.startsWith("--list-"))) return true;
+  if (!READONLY_PROGRAMS.has(exe)) return false;
+  if (exe === "nvidia-smi.exe") {
     return flags.every(
       (flag) => flag === "-L" || flag === "-q" || flag === "--help" || flag === "--version" ||
         flag.startsWith("--query-gpu=") || flag.startsWith("--format="),
     );
   }
-  if (name === "tasklist.exe") {
+  if (exe === "tasklist.exe") {
     return flags.every((flag) => flag.startsWith("/") || /^\S+\s+(eq|ne)\s+/i.test(flag));
   }
-  if (name === "where.exe") return flags.length > 0;
-  if (name === "node.exe") return flags.length === 1 && (flags[0] === "-v" || flags[0] === "--version");
+  if (exe === "where.exe") return flags.length > 0;
+  if (exe === "node.exe") return flags.length === 1 && (flags[0] === "-v" || flags[0] === "--version");
   return false;
 }
 
@@ -297,41 +318,40 @@ const TOOLS = [
   {
     name: "list_dir",
     description:
-      "列出本机任意目录里的条目（只读）。用于查看 llama.cpp 版本目录、模型目录、配置目录里到底有什么。" +
-      "省略 path 时列出 llama.cpp 安装根目录。",
+      "列出用户指定目录里的条目（只读）。path 必填，且只能填用户消息或当前对话里明确出现过的目录 —— " +
+      "不要猜路径、不要用默认目录。用户没说要看哪个目录时，先问清楚再调。",
     inputSchema: {
       type: "object",
       properties: {
-        path: { type: "string", description: "目录绝对路径；省略则列出 llama.cpp 安装根目录" },
+        path: { type: "string", description: "用户给出的目录绝对路径（必填）" },
       },
+      required: ["path"],
     },
   },
   {
-    name: "llama_help",
+    name: "run_help",
     description:
-      "返回某个 llama.cpp 版本里 llama-server / llama-cli / llama-bench / llama-fit-params 的 --help 全文 —— " +
-      "这是该版本真实支持的参数表。回答「某版本支持哪些参数」「MoE / 显存相关参数怎么用」「新版本加了什么开关」之前，" +
-      "先调这个拿事实，不要凭记忆或网上搜索编参数名。version 省略时用设置里当前选中的版本。",
+      "查询任意可执行文件的 --help / --version（只读、通用，不限 llama.cpp）。program 传完整路径或名字（git、python、" +
+      "node、cargo、llama-server.exe…），args 默认 [\"--help\"]。program 只能从用户问题里出现过的程序名或路径取 —— " +
+      "用户没说查哪个程序时，先问，不要随便拿一个程序去查。回答「这个程序/版本支持哪些参数」「某版本加了什么开关」" +
+      "之前先调这个拿事实，不要凭记忆或网上搜索编参数名；帮助文本很长时用 filter 只取相关行。",
     inputSchema: {
       type: "object",
       properties: {
-        version: { type: "string", description: "版本目录名，例如 llama-b12196-bin-win-cuda-13.5-x64；省略用当前选中版本" },
-        tool: {
-          type: "string",
-          enum: ["server", "cli", "bench", "fit-params"],
-          description: "要查哪个程序，默认 server",
-        },
-        filter: {
-          type: "string",
-          description: "可选：只返回包含这段文字的行（不区分大小写），用于查某个参数名而不是整份帮助",
-        },
+        program: { type: "string", description: "可执行文件完整路径，或 PATH 里的名字（git / python / node / cargo / llama-server.exe）" },
+        args: { type: "array", items: { type: "string" }, description: "参数数组，默认 [\"--help\"]；只允许 --help / -h / --version / -v / -V / --list-* 这类只读参数" },
+        filter: { type: "string", description: "可选：只返回包含这段文字的行（不区分大小写），用于查某个参数名而不是整份帮助" },
+        cwd: { type: "string", description: "工作目录，默认服务器进程的当前目录" },
+        timeout_ms: { type: "number", description: "超时毫秒，默认 60000，上限 300000" },
       },
+      required: ["program"],
     },
   },
   {
     name: "read_text_file",
     description:
-      "读本机任意文本文件（只读），返回带行号的内容。用于读 llama.cpp 的配置 JSON、docs、模型 readme、日志。" +
+      "读本机任意文本文件（只读），返回带行号的内容 —— 任何编程语言的源代码（.py/.rs/.ts/.go/.java/.c/.cpp…）、配置、日志、" +
+      "文档都可以，不限扩展名。path 必填，且只能读用户消息或当前对话里出现过的文件；用户没给路径时先问，不要猜。" +
       "文件超过 256 KB 只读前 256 KB，长文件靠 offset / limit 分段。二进制文件会被拒绝。",
     inputSchema: {
       type: "object",
@@ -346,15 +366,16 @@ const TOOLS = [
   {
     name: "run_readonly",
     description:
-      "执行只读命令，返回 stdout / stderr 与退出码。**不能写、不能删、不能改任何文件**：只允许 llama.cpp 的 " +
-      "llama-*.exe（--help / -h / --version / -v / --list-devices）、nvidia-smi（显存查询）、tasklist（看进程）、" +
-      "where（查路径）、node -v。不经 shell，所以 `>`、`|` 这类字符不会被解释。",
+      "执行只读命令，返回 stdout / stderr 与退出码。**不能写、不能删、不能改任何文件**：程序可以是任意可执行文件，" +
+      "但参数只允许 --help / -h / --version / -v / -V / --list-* 这类只读参数；另外 nvidia-smi（显存查询）、" +
+      "tasklist（看进程）、where（查路径）、node -v 可以带各自的特有参数。program 只从用户问题里出现过的名字取，" +
+      "用户没指定就先问。不经 shell，所以 `>`、`|` 这类字符不会被解释。",
     inputSchema: {
       type: "object",
       properties: {
-        program: { type: "string", description: "可执行文件完整路径（如某个版本目录里的 llama-server.exe），或 nvidia-smi / tasklist / where / node" },
+        program: { type: "string", description: "可执行文件完整路径，或 nvidia-smi / tasklist / where / node 这类名字" },
         args: { type: "array", items: { type: "string" }, description: "参数数组，例如 [\"--version\"] 或 [\"--query-gpu=memory.total,memory.used\", \"--format=csv\"]" },
-        cwd: { type: "string", description: "工作目录，默认 E:\\AI\\llama.cpp-gui" },
+        cwd: { type: "string", description: "工作目录，默认服务器进程的当前目录" },
         timeout_ms: { type: "number", description: "超时毫秒，默认 60000，上限 300000" },
       },
       required: ["program"],
@@ -398,7 +419,7 @@ function handle(message) {
       let result;
       try {
         if (name === "list_dir") result = toolListDir(args);
-        else if (name === "llama_help") result = toolLlamaHelp(args);
+        else if (name === "run_help") result = toolRunHelp(args);
         else if (name === "read_text_file") result = toolReadTextFile(args);
         else if (name === "run_readonly") result = toolRunReadonly(args);
         else result = fail(`没有这个工具：${name}`);

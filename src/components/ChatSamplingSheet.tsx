@@ -54,6 +54,7 @@ export function ChatSamplingSheet({
     <Drawer
       title="采样设置"
       iconClass="fa-gear"
+      headless
       onClose={onClose}
       footer={
         <>
@@ -233,6 +234,24 @@ export function ChatSamplingSheet({
         </label>
 
         {draft.webSearch ? (
+          <label className="bench-switch chat-sampling__switch">
+            <input
+              type="checkbox"
+              className="switch-input"
+              checked={draft.webFetch}
+              onChange={(event) => update("webFetch", event.target.checked)}
+            />
+            <span>
+              读取网页正文
+              <br />
+              <span className="muted small">
+                搜索结果的节选不够时，模型会再打开原页面读全文；关掉只给搜索摘要（两个工具各占一次工具调用）
+              </span>
+            </span>
+          </label>
+        ) : null}
+
+        {draft.webSearch ? (
           <details className="st-collapse search-settings__fold">
             <summary>
               <i className="fas fa-globe" />
@@ -292,6 +311,38 @@ export function ChatSamplingSheet({
           >
             <option value="enter">Enter 发送，Shift+Enter 换行</option>
             <option value="ctrl">Ctrl+Enter 发送，Enter 换行</option>
+          </select>
+        </div>
+
+        <div className="st-field">
+          <label className="st-label" htmlFor="chat-s-process">
+            过程展示
+          </label>
+          <select
+            id="chat-s-process"
+            className="st-input"
+            value={draft.processMode}
+            onChange={(event) => update("processMode", event.target.value as "compact" | "normal" | "detailed")}
+          >
+            <option value="normal">标准：生成中展开，结束后收起</option>
+            <option value="compact">简洁：始终收起，只看最终回答</option>
+            <option value="detailed">详细：始终展开思考与工具调用</option>
+          </select>
+        </div>
+
+        <div className="st-field">
+          <label className="st-label" htmlFor="chat-s-font">
+            聊天字号
+          </label>
+          <select
+            id="chat-s-font"
+            className="st-input"
+            value={draft.chatFont}
+            onChange={(event) => update("chatFont", event.target.value as "sm" | "md" | "lg")}
+          >
+            <option value="sm">小</option>
+            <option value="md">标准</option>
+            <option value="lg">大</option>
           </select>
         </div>
 

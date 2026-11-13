@@ -66,6 +66,12 @@ export interface ChatToolEvent {
   raw?: Record<string, unknown>;
 }
 
+/** 联网搜索的来源条目：助手消息末尾渲染成卡片（方案 v2 第 4 项） */
+export interface ChatSource {
+  title: string;
+  url: string;
+}
+
 export interface ChatUsage {
   prompt_tokens?: number;
   completion_tokens?: number;
@@ -147,6 +153,8 @@ export interface ChatTurn {
   speed?: ChatSpeed;
   attachments?: ChatAttachment[];
   tools?: ChatToolEvent[];
+  /** 这一轮收到的搜索来源（去重、最多 8 条），界面上在正文末尾列成卡片 */
+  sources?: ChatSource[];
   /** 助手这一轮要求调用的工具（下一轮作为 `tool_calls` 原样发回去） */
   toolCalls?: ToolCall[];
   /** `role: "tool"` 时对应哪一次调用 */
@@ -205,6 +213,18 @@ const DEFAULT_SCHEMA_TEXT = `{
   "additionalProperties": false
 }`;
 
+/**
+ * 过程区（思考 + 工具调用）的默认展开方式，照上游「工作步骤展示模式」简化成三档：
+ * - compact：始终收起，正文就是答案本身；
+ * - normal：生成中展开、结束后收起（默认）；
+ * - detailed：始终展开，适合排查模型到底怎么调的工具。
+ * 手动点开/收起之后按 touched 托管，不再被流式状态覆盖。
+ */
+export type ChatProcessMode = "compact" | "normal" | "detailed";
+
+/** 聊天正文字号：小 / 标准 / 大（用户可在设置抽屉里改） */
+export type ChatFontSize = "sm" | "md" | "lg";
+
 export interface ChatOptions {
   model: string;
   reasoningEffort: ReasoningEffort;
@@ -215,8 +235,14 @@ export interface ChatOptions {
   seed: number | null;
   systemPrompt: string;
   showReasoning: boolean;
+  /** 过程区的默认展开方式（简洁 / 标准 / 详细） */
+  processMode: ChatProcessMode;
+  /** 聊天正文字号档位 */
+  chatFont: ChatFontSize;
   /** 允许模型调用内置联网搜索（工具由 GUI 执行，llama.cpp 自己不联网） */
   webSearch: boolean;
+  /** 允许 web_fetch 打开网页正文；默认跟着联网搜索走，可单独关掉只留搜索 */
+  webFetch: boolean;
   /** 允许模型调用用户在聊天设置里配的 MCP 工具（同样由 GUI 执行，见 `src-tauri/src/mcp.rs`） */
   mcpTools: boolean;
   /** Enter 直接发送（否则 Enter 换行、Ctrl+Enter 发送）；用户 m07816 第 3 点 */
@@ -250,7 +276,10 @@ export const DEFAULT_CHAT_OPTIONS: Readonly<ChatOptions> = Object.freeze({
   seed: null,
   systemPrompt: "",
   showReasoning: true,
+  processMode: "normal",
+  chatFont: "md",
   webSearch: false,
+  webFetch: false,
   mcpTools: false,
   enterSends: true,
   chatEdit: true,
@@ -360,7 +389,23 @@ export function normalizeChatOptions(value: unknown): ChatOptions {
       typeof stored.systemPrompt === "string" ? stored.systemPrompt : DEFAULT_CHAT_OPTIONS.systemPrompt,
     showReasoning:
       typeof stored.showReasoning === "boolean" ? stored.showReasoning : DEFAULT_CHAT_OPTIONS.showReasoning,
+    processMode:
+      typeof stored.processMode === "string" &&
+      ["compact", "normal", "detailed"].includes(stored.processMode)
+        ? (stored.processMode as ChatProcessMode)
+        : DEFAULT_CHAT_OPTIONS.processMode,
+    chatFont:
+      typeof stored.chatFont === "string" && ["sm", "md", "lg"].includes(stored.chatFont)
+        ? (stored.chatFont as ChatFontSize)
+        : DEFAULT_CHAT_OPTIONS.chatFont,
     webSearch: typeof stored.webSearch === "boolean" ? stored.webSearch : DEFAULT_CHAT_OPTIONS.webSearch,
+    // 旧版本没有 webFetch 字段：回落成联网搜索的值，行为与以前一致（两个工具一起开）
+    webFetch:
+      typeof stored.webFetch === "boolean"
+        ? stored.webFetch
+        : typeof stored.webSearch === "boolean"
+          ? stored.webSearch
+          : DEFAULT_CHAT_OPTIONS.webFetch,
     mcpTools: typeof stored.mcpTools === "boolean" ? stored.mcpTools : DEFAULT_CHAT_OPTIONS.mcpTools,
     enterSends: typeof stored.enterSends === "boolean" ? stored.enterSends : DEFAULT_CHAT_OPTIONS.enterSends,
     chatEdit: typeof stored.chatEdit === "boolean" ? stored.chatEdit : DEFAULT_CHAT_OPTIONS.chatEdit,
@@ -522,23 +567,6 @@ function apiMessage(message: ChatTurn, supportsImages: boolean): Record<string, 
   return { role: message.role, content: parts, ...extra };
 }
 
-/**
- * 联网搜索的查询拆解规则，作为 system 消息注入（用户自写 system prompt 时不注入）。
- *
- * 部署版实测：模型拿到「b12196 加载 MiniCPM-V、12G 显存怎么调参」这种问题，
- * 会搜「llama.cpp b12196 新参数有哪些」这类整句泛问，搜回来的都是无关博客，
- * 然后自己编参数名（`--moe-offload` / `--tensor-size-split-method` 都不存在）。
- * 这里把「实体拆开、版本号查 release/docs/PR、参数名原样引用」写成硬规则。
- */
-const TOOL_SEARCH_POLICY = [
-  "需要联网时，先把用户的问题拆成实体再搜，不要把整句问题当查询词。",
-  "1. 版本号、模型名、硬件型号、参数名各成一条查询；例如「llama.cpp --moe-cache-mib」「MiniCPM-V 4.7 35B A3B GGUF 层数 专家数」。",
-  "2. 问「某个版本新增了什么」时，查该版本的 release 页、docs 目录和相关 PR，不要用「新参数有哪些」这种泛问。",
-  "3. 每条查询不超过 12 个词；同一轮不要重复含义相同的查询。",
-  "4. 搜到的页面里出现具体参数名（-- 开头的名字）时，原样引用并说明用途；资料里没有的参数不要写进答案。",
-  "5. 查不到就直说「没查到」，不要用常识补、不要编参数名或数值，也不要用「可能」「大概」伪装成结论。",
-].join("\n");
-
 /** 回填历史时每条工具结果压到的字符数：卡片里留的是 2000 字原文，喂模型只给摘要 */
 const TOOL_REPLAY_CHARS = 2400;
 /** 网页正文回填的长度：比搜索条目宽一点，模型要据此回答细节 */
@@ -667,8 +695,70 @@ export function expandToolHistory(messages: ChatTurn[]): ChatTurn[] {
   });
 }
 
-/** 组装 `/v1/chat/completions` 的请求体（上游 `buildChatRequest` 的本工程版） */
-export function buildChatRequest(
+/**
+ * 上下文压缩（照 DSH 的 compaction，先做本地模板版）：历史太长时把早期消息压成一段摘要，
+ * 只保留最近几轮原文。不调用模型，所以没有额外成本，也不会因为模型失败而卡住发送。
+ *
+ * 工具调用必须成组：assistant 的 `tool_calls` 与紧随的 `tool` 结果拆开会拼出非法请求，
+ * 所以按「assistant(toolCalls) + 它的 tool 结果」整组保留或整组丢弃。
+ */
+export const CHAT_HISTORY_CHARS = 48_000;
+
+export function compactTurns(
+  messages: ChatTurn[],
+  limit = CHAT_HISTORY_CHARS,
+): { messages: ChatTurn[]; dropped: number } {
+  const weight = (message: ChatTurn) => (message.content?.length ?? 0) + (message.tools ? JSON.stringify(message.tools).length : 0);
+  const total = messages.reduce((sum, message) => sum + weight(message), 0);
+  if (total <= limit) return { messages, dropped: 0 };
+
+  const keep: ChatTurn[] = [];
+  let used = 0;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    // 当前是 tool 结果时，回溯到发起调用的那条 assistant，整组一起留/一起丢
+    let groupStart = index;
+    if (message.role === "tool") {
+      let cursor = index - 1;
+      while (cursor >= 0 && messages[cursor].role === "tool") cursor -= 1;
+      if (cursor >= 0 && messages[cursor].role === "assistant" && messages[cursor].toolCalls?.length) {
+        groupStart = cursor;
+      }
+    }
+    const group = messages.slice(groupStart, index + 1);
+    const groupWeight = group.reduce((sum, item) => sum + weight(item), 0);
+    // 至少留一组，避免 limit 小于最后一条消息时 keep 为空
+    if (keep.length > 0 && used + groupWeight > limit * 0.6) break;
+    keep.unshift(...group);
+    used += groupWeight;
+    index = groupStart;
+  }
+
+  const droppedMessages = messages.slice(0, messages.length - keep.length);
+  if (droppedMessages.length === 0) return { messages, dropped: 0 };
+  const lines = droppedMessages
+    .map((message) => {
+      if (message.role === "user") return `[用户] ${message.content.replace(/\s+/g, " ").slice(0, 120)}`;
+      if (message.role === "assistant") {
+        const calls = (message.toolCalls ?? []).map((call) => call.name).join("、");
+        const text = message.content.replace(/\s+/g, " ").slice(0, 120);
+        return `[助手] ${text}${calls ? `（调用了 ${calls}）` : ""}`;
+      }
+      return null;
+    })
+    .filter((line): line is string => Boolean(line));
+
+  const summary: ChatTurn = {
+    id: newId(),
+    role: "system",
+    content: `（更早的 ${droppedMessages.length} 条消息已压缩，以下是摘要）\n${lines.join("\n")}`,
+    createdAt: Date.now(),
+    meta: "历史摘要",
+  };
+  return { messages: [summary, ...keep], dropped: droppedMessages.length };
+}
+
+/** 组装 `/v1/chat/completions` 的请求体（上游 `buildChatRequest` 的本工程版） */export function buildChatRequest(
   messages: ChatTurn[],
   options: ChatOptions,
   supportsImages = false,
@@ -679,9 +769,6 @@ export function buildChatRequest(
   if (!options.model.trim()) throw new Error("请先选择模型");
   const api: Record<string, unknown>[] = [];
   if (options.systemPrompt.trim()) api.push({ role: "system", content: options.systemPrompt.trim() });
-  // 联网搜索的查询拆解规则（用户 m00874：搜索要「紧扣提问拆解方向」）。
-  // 模型自己写 system prompt 时不覆盖，避免和用户指令打架。
-  else if (tools.length > 0) api.push({ role: "system", content: TOOL_SEARCH_POLICY });
   const advanced: Record<string, unknown> = strata ? buildAdvancedChatFields(options) : {};
   if (strata && options.advanced.responseFormat !== "text" && tools.length > 0) {
     throw new Error("JSON 输出与工具调用互斥，请先关闭联网搜索 / MCP");

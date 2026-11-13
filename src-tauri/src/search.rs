@@ -59,8 +59,11 @@ const FETCH_MIN_USEFUL: usize = 400;
 const FETCH_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 const CACHE_TTL: Duration = Duration::from_secs(300);
 const CACHE_MAX: usize = 50;
-/// quota / auth 这类「今天再来也没用」的失败，本进程内不再碰这个引擎。
-const SESSION_COOLDOWN: Duration = Duration::from_secs(365 * 24 * 3600);
+/// 额度用尽 / 要付费：等充值或换引擎，别一直打（审查 F2：原来 Auth 与 Quota 共用 365 天）
+const QUOTA_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+/// key 无效或没配：用户改完 key 会立刻想重试，只退避 5 分钟。
+/// （原来是 365 天：匿名引擎一次 401/403 就把整条搜索锁死到重启 —— 这就是「搜索失败」的根因之一）
+const AUTH_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 /// 撞了机器人墙（429 / rate limit）退避 1 分钟。
 const BOT_WALL_COOLDOWN: Duration = Duration::from_secs(60);
 /// 网络抖动、5xx 之类，退避一小会儿。
@@ -211,7 +214,8 @@ pub enum FailureClass {
 impl FailureClass {
     fn cooldown(&self) -> Duration {
         match self {
-            FailureClass::Quota | FailureClass::Auth => SESSION_COOLDOWN,
+            FailureClass::Quota => QUOTA_COOLDOWN,
+            FailureClass::Auth => AUTH_COOLDOWN,
             FailureClass::BotWall => BOT_WALL_COOLDOWN,
             _ => TRANSIENT_COOLDOWN,
         }
@@ -247,14 +251,20 @@ impl Fail {
     /// 因为不少引擎用 200 带一条错误 JSON 的方式报配额问题。
     fn from_status(status: u16, body: &str, engine: &str) -> Self {
         let lower = body.to_lowercase();
-        let quota = lower.contains("quota")
-            || lower.contains("no_more_credits")
-            || lower.contains("insufficient")
-            || lower.contains("payment required")
-            || lower.contains("budget");
-        let auth = lower.contains("api key")
-            || lower.contains("unauthorized")
-            || lower.contains("invalid key");
+        // 关键字判定只在小响应体里做（审查 F2）：正常 200 结果页里偶尔出现
+        // "api key" / "budget" 字样时，旧逻辑会把整个引擎判成 Auth/Quota 并长时间冷却。
+        // 真实引擎报错通常是一个几十到几百字节的 JSON。
+        let small = body.len() < 2048 && status != 429;
+        let quota = small
+            && (lower.contains("quota")
+                || lower.contains("no_more_credits")
+                || lower.contains("insufficient")
+                || lower.contains("payment required")
+                || lower.contains("budget"));
+        let auth = small
+            && (lower.contains("api key")
+                || lower.contains("unauthorized")
+                || lower.contains("invalid key"));
         let class = match status {
             401 | 403 => FailureClass::Auth,
             402 => FailureClass::Quota,
@@ -303,6 +313,18 @@ fn set_cooldown(engine: &str, class: &FailureClass) {
     if let Ok(mut guard) = cooldowns().lock() {
         guard.insert(engine.to_string(), Instant::now() + class.cooldown());
     }
+}
+
+/// 剩余冷却秒数（0 = 没在冷却）：设置页显示「冷却 · 还需 N 秒」，比只知道「冷却中」有用
+fn cooling_secs(engine: &str) -> u64 {
+    let guard = match cooldowns().lock() {
+        Ok(guard) => guard,
+        Err(_) => return 0,
+    };
+    guard
+        .get(engine)
+        .map(|until| until.saturating_duration_since(Instant::now()).as_secs())
+        .unwrap_or(0)
 }
 
 fn cache_key(query: &str, time_range: Option<&str>, limit: usize) -> String {
@@ -438,6 +460,8 @@ fn http_post_json(url: &str, headers: &[(&str, String)], body: &Value) -> Result
         Ok(output) => output,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let _ = fs::remove_file(&out_path);
+            // 请求体含查询词，失败分支也要清（审查 S2：原来只在成功路径删）
+            let _ = fs::remove_file(&body_path);
             return Err(Fail::new(
                 FailureClass::Transient,
                 "这台机器上没有 curl.exe，联网搜索发不出请求",
@@ -445,6 +469,7 @@ fn http_post_json(url: &str, headers: &[(&str, String)], body: &Value) -> Result
         }
         Err(error) => {
             let _ = fs::remove_file(&out_path);
+            let _ = fs::remove_file(&body_path);
             return Err(Fail::new(
                 FailureClass::Transient,
                 format!("起 curl 失败：{error}"),
@@ -1178,7 +1203,11 @@ pub fn search(
         .filter_map(|item| item.error.as_ref().map(|error| format!("{}: {error}", item.engine)))
         .collect::<Vec<_>>()
         .join("；");
-    Err(format!("联网搜索失败：{detail}"))
+    // 失败原因原样交给模型，但必须带上「下一步怎么做」：模型看到一句裸错误会不停换关键词
+    // 重试，把引擎的冷却时间一路撞长。照 Strata 的 BLOCKED_MESSAGE，把行为指令写进错误里。
+    Err(format!(
+        "联网搜索失败：{detail}\n不要再换关键词重试（引擎正在冷却/不可用），直接基于已知内容回答；需要联网时用一句话告诉用户搜索暂时不可用。"
+    ))
 }
 
 // ---------------------------------------------------------------- Tauri 命令
@@ -1192,6 +1221,8 @@ pub struct EngineView {
     pub has_key: bool,
     /// 正在冷却（刚失败过）
     pub cooling: bool,
+    /// 冷却剩余秒数（0 = 没在冷却）
+    pub cooling_secs: u64,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -1212,6 +1243,7 @@ fn config_view(config: &SearchConfig) -> ConfigView {
             keyless: keyless(name),
             has_key: config.key(name).is_some(),
             cooling: cooling(name),
+            cooling_secs: cooling_secs(name),
         })
         .collect();
     ConfigView {
@@ -1528,8 +1560,71 @@ fn header_value(headers: &str, name: &str) -> Option<String> {
     None
 }
 
+/// 从响应头里取最后一跳的 Location，并解析成绝对 URL（只支持 http/https 与相对路径）
+fn redirect_target(headers: &str, base: &str) -> Option<String> {
+    let lower = headers.to_lowercase();
+    let at = lower.rfind("\nlocation:")?;
+    let line = headers[at + 1..].lines().next()?;
+    let value = line.split_once(':')?.1.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(join_url(base, value))
+}
+
+fn join_url(base: &str, target: &str) -> String {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return target.to_string();
+    }
+    let origin = match base.find("://") {
+        Some(scheme_end) => {
+            let rest = &base[scheme_end + 3..];
+            match rest.find('/') {
+                Some(slash) => &base[..scheme_end + 3 + slash],
+                None => base,
+            }
+        }
+        None => base,
+    };
+    if target.starts_with('/') {
+        format!("{origin}{target}")
+    } else {
+        format!("{origin}/{target}")
+    }
+}
+
 /// GET 一个地址，结果落到临时文件再读回来（理由同 `http_post_json`：Windows 命令行装不下）。
+///
+/// 重定向手动跟随（审查 S1）：curl 的 `-L` 会在不经过 `is_public_url` 的情况下把请求
+/// 打到本机/内网（内容虽然会被 `fetch_own` 拦下，但请求本身已经发出去了）。这里每跳
+/// 先校验目标，最多 4 跳。
 fn http_get(url: &str) -> Result<GetReply, Fail> {
+    let mut current = url.to_string();
+    for _ in 0..4 {
+        let reply = http_get_once(&current)?;
+        if !matches!(reply.status, 301 | 302 | 303 | 307 | 308) {
+            return Ok(reply);
+        }
+        let next = match redirect_target(&reply.headers, &current) {
+            Some(next) => next,
+            None => return Ok(reply),
+        };
+        if !is_public_url(&next) {
+            return Err(Fail::new(
+                FailureClass::Unknown,
+                "页面跳转到了本机/内网地址，已拒绝",
+            ));
+        }
+        current = next;
+    }
+    Err(Fail::new(
+        FailureClass::Transient,
+        "重定向次数过多（超过 4 跳），已停止",
+    ))
+}
+
+/// 单次 GET，不跟随重定向。
+fn http_get_once(url: &str) -> Result<GetReply, Fail> {
     let dir = std::env::temp_dir();
     let stamp = unique_stamp();
     let head_path = dir.join(format!("llamacpp-fetch-{stamp}.hdr"));
@@ -1554,7 +1649,6 @@ fn http_get(url: &str) -> Result<GetReply, Fail> {
     let mut command = curl_command();
     command.args([
         "-sS",
-        "-L",
         "--compressed",
         "--max-time",
         "30",

@@ -15,6 +15,7 @@ import { ErrorBoundary } from "./ErrorBoundary";
 export function Drawer({
   title,
   iconClass,
+  headless = false,
   onClose,
   footer,
   children,
@@ -22,6 +23,8 @@ export function Drawer({
   title: string;
   /** FontAwesome 图标类名，如 `fa-gear` */
   iconClass?: string;
+  /** 不显示标题栏（只留右上角一个关闭按钮）；title 仍作 aria-label 与错误边界标签 */
+  headless?: boolean;
   onClose: () => void;
   footer?: React.ReactNode;
   children: React.ReactNode;
@@ -55,20 +58,22 @@ export function Drawer({
         aria-modal="true"
         aria-label={title}
       >
-        <div className="st-drawer__head">
-          <h3 className="st-drawer__title">
-            <i className={`fas ${iconClass ?? "fa-gear"}`} />
-            <span>{title}</span>
-          </h3>
-          <button
-            type="button"
-            className="st-drawer__close"
-            onClick={() => onCloseRef.current()}
-            title="关闭"
-          >
-            &times;
-          </button>
-        </div>
+        {!headless && (
+          <div className="st-drawer__head">
+            <h3 className="st-drawer__title">
+              <i className={`fas ${iconClass ?? "fa-gear"}`} />
+              <span>{title}</span>
+            </h3>
+            <button
+              type="button"
+              className="st-drawer__close"
+              onClick={() => onCloseRef.current()}
+              title="关闭"
+            >
+              &times;
+            </button>
+          </div>
+        )}
         <div className="st-drawer__body">
           {/* 出错时的兜底关闭不拦：界面已经崩了，再弹确认框只是让人点不动 */}
           <ErrorBoundary label={title} onClose={onClose}>

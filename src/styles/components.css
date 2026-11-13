@@ -1753,6 +1753,63 @@ rect.scenario-column.is-failed {
     border-top: 1px solid var(--st-line);
 }
 
+/* 聊天字号档位（设置抽屉里的「聊天字号」）：只影响消息正文与输入框，
+   侧栏、工具条、meta 行保持自己的小字号 */
+.chat-fs-sm {
+    --chat-fs: calc(var(--st-fs-base) * 0.82);
+}
+
+.chat-fs-md {
+    --chat-fs: calc(var(--st-fs-base) * 0.9);
+}
+
+.chat-fs-lg {
+    --chat-fs: var(--st-fs-base);
+}
+
+/* 左侧会话的历史名称提示：自绘浮层（照 DSH 的 Tooltip：portal 到 body、
+   深色气泡、有延迟），替代原生 title 的系统灰框 */
+.chat-history-tip {
+    position: fixed;
+    top: var(--tip-top);
+    left: var(--tip-left);
+    z-index: 1200;
+    max-width: 280px;
+    padding: var(--st-s-2) var(--st-s-3);
+    border-radius: var(--st-r-sm);
+    background: var(--st-ink);
+    color: var(--st-surface);
+    box-shadow: var(--st-sh-pop);
+    pointer-events: none;
+    word-break: break-word;
+    animation: chat-tip-in 120ms ease-out;
+}
+
+.chat-history-tip strong {
+    display: block;
+    font-size: var(--st-fs-sm);
+    font-weight: 600;
+    line-height: 1.4;
+}
+
+.chat-history-tip small {
+    display: block;
+    margin-top: 2px;
+    color: color-mix(in srgb, var(--st-surface) 70%, transparent);
+    font-size: var(--st-fs-xs);
+}
+
+@keyframes chat-tip-in {
+    from {
+        opacity: 0;
+        transform: translateY(-2px);
+    }
+    to {
+        opacity: 1;
+        transform: none;
+    }
+}
+
 /* ---------- 左侧聊天历史 ---------- */
 
 .chat-history {
@@ -1760,6 +1817,9 @@ rect.scenario-column.is-failed {
     flex: 0 0 248px;
     flex-direction: column;
     gap: var(--st-s-2);
+    width: 248px;
+    min-width: 248px;
+    max-width: 248px;
     min-height: 0;
     padding: var(--st-s-4) var(--st-s-3);
     border-right: 1px solid var(--st-line);
@@ -1829,8 +1889,15 @@ rect.scenario-column.is-failed {
 .chat-history-item {
     display: flex;
     align-items: center;
-    gap: 2px;
+    gap: 0;
+    padding-right: var(--st-s-1);
     border-radius: var(--st-r-field);
+    overflow: hidden;
+}
+
+/* hover 与选中的底色都落在整行上，把右侧两个工具按钮一起包进来 */
+.chat-history-item:hover {
+    background: var(--st-surface);
 }
 
 .chat-history-item.is-active {
@@ -1841,11 +1908,12 @@ rect.scenario-column.is-failed {
 .chat-history-select {
     display: flex;
     flex: 1;
-    flex-direction: column;
-    gap: 2px;
-    min-height: 60px;
+    flex-direction: row;
+    align-items: center;
+    gap: var(--st-s-2);
+    min-height: 32px;
     min-width: 0;
-    padding: var(--st-s-2);
+    padding: var(--st-s-1) var(--st-s-2);
     border: 0;
     border-radius: var(--st-r-field);
     background: transparent;
@@ -1855,32 +1923,38 @@ rect.scenario-column.is-failed {
 }
 
 .chat-history-select span {
+    flex: 1;
+    min-width: 0;
     overflow: hidden;
     font-size: var(--st-fs-sm);
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 
-.chat-history-select small {
-    color: var(--st-ink-muted);
-    font-size: var(--st-fs-xs);
-}
-
-.chat-history-select:hover {
-    background: var(--st-surface);
-}
-
+/* 工具按钮常显：正常灰、当前会话/悬停变黑，和标题同处一行的底色里，不再 hover 才冒出来 */
 .chat-history-actions {
     display: flex;
-    flex-direction: column;
-    opacity: 0;
-    transition: opacity .12s ease;
+    flex-direction: row;
+    gap: 0;
 }
 
-.chat-history-item:hover .chat-history-actions,
-.chat-history-item.is-active .chat-history-actions,
-.chat-history-actions:focus-within {
-    opacity: 1;
+/* 工具按钮：比通用图标按钮小一号、始终透明底 */
+.chat-history-actions .st-btn--icon {
+    width: 24px;
+    height: 24px;
+    font-size: var(--st-fs-xs);
+    color: var(--st-ink-muted);
+    background: transparent;
+}
+
+.chat-history-actions .st-btn--icon:hover:not(:disabled) {
+    background: transparent;
+    color: var(--st-ink);
+}
+
+.chat-history-item:hover .chat-history-actions .st-btn--icon,
+.chat-history-item.is-active .chat-history-actions .st-btn--icon {
+    color: var(--st-ink);
 }
 
 .chat-history-rename {
@@ -1947,6 +2021,13 @@ rect.scenario-column.is-failed {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
+    /* 有右侧轮次导航（.chat-turns），不再显示滚动条；滚动本身保留 */
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+}
+
+.chat-scroll::-webkit-scrollbar {
+    display: none;
 }
 
 .chat {
@@ -1978,6 +2059,26 @@ rect.scenario-column.is-failed {
     color: var(--st-ink-muted);
 }
 
+/* 空态示例（P1）：点一下填进输入框，不直接发送 */
+.chat-empty__examples {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: var(--st-s-2);
+    max-width: 560px;
+    margin: var(--st-s-5) auto 0;
+}
+
+.chat-empty__examples .st-btn {
+    text-align: left;
+}
+
+.chat-empty__hint {
+    margin-top: var(--st-s-4);
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+}
+
 /* ---------- 消息 ---------- */
 
 .st-msg {
@@ -2006,7 +2107,8 @@ rect.scenario-column.is-failed {
     padding: 12px 16px;
     border-radius: var(--st-r-lg);
     color: var(--st-ink-soft);
-    font-size: var(--st-fs-base);
+    /* 字号档位：chat-workspace 上的 .chat-fs-sm / .chat-fs-lg 覆盖 --chat-fs */
+    font-size: var(--chat-fs, var(--st-fs-base));
     line-height: 1.55;
     overflow-wrap: anywhere;
     min-width: 0;
@@ -2237,6 +2339,208 @@ rect.scenario-column.is-failed {
     white-space: nowrap;
 }
 
+/* 删除会话后的 toast：贴在聊天历史栏底部，10 秒内可撤销（用户 m02931） */
+.chat-toast {
+    display: flex;
+    align-items: center;
+    gap: var(--st-s-1);
+    flex: 0 0 auto;
+    margin-top: var(--st-s-2);
+    padding: var(--st-s-1);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-field);
+    background: var(--st-surface);
+    color: var(--st-ink);
+    font-size: var(--st-fs-xs);
+    animation: chat-toast-in .16s ease;
+}
+
+.chat-toast__text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.chat-toast__undo {
+    flex: 0 0 auto;
+    padding: var(--st-s-1) var(--st-s-2);
+    border: 0;
+    border-radius: var(--st-r-btn);
+    background: transparent;
+    color: var(--st-accent);
+    font-size: var(--st-fs-xs);
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.chat-toast__undo:hover {
+    background: var(--st-surface-2);
+}
+
+.chat-toast__close {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--st-s-6);
+    height: var(--st-s-6);
+    border: 0;
+    border-radius: var(--st-r-btn);
+    background: transparent;
+    color: var(--st-ink-muted);
+    cursor: pointer;
+}
+
+.chat-toast__close:hover {
+    background: var(--st-surface-2);
+    color: var(--st-ink);
+}
+
+@keyframes chat-toast-in {
+    from {
+        opacity: 0;
+    }
+    to {
+        opacity: 1;
+    }
+}
+
+/* 联网搜索不可用时的灰字（照 DSH 的静默消失 + 一行说明，不弹窗） */
+.chat-search-hint {
+    width: min(var(--chat-width, 860px), calc(100% - 2 * var(--st-s-10)));
+    margin: 0 auto var(--st-s-1);
+    color: var(--st-ink-soft);
+    font-size: var(--st-fs-xs);
+}
+
+/* 右侧轮次导航（用户 m02182 第 1 点，外观照 DSH 的 TurnNavigator）：
+   一条 28px 宽的刻度轨道，每轮一条 2px 短横；当前轮拉满并用正文色，生成中的轮闪一下，
+   轨道上下各 24px 渐隐，滚动条隐藏。点短横跳到那轮开头，hover 用原生 title 看轮次摘要。 */
+.chat-turns {
+    position: absolute;
+    top: 96px;
+    right: 12px;
+    bottom: 156px;
+    z-index: 3;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    width: 28px;
+    max-height: 420px;
+    margin: auto 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: none;
+    mask-image: linear-gradient(#0000 0, #000 24px calc(100% - 24px), #0000 100%);
+}
+
+.chat-turns::-webkit-scrollbar {
+    display: none;
+}
+
+.chat-turns__mark {
+    position: relative;
+    display: flex;
+    flex: none;
+    align-items: center;
+    justify-content: flex-end;
+    width: 28px;
+    height: 10px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: pointer;
+}
+
+.chat-turns__mark::before {
+    content: "";
+    display: block;
+    width: 20px;
+    height: 2px;
+    border-radius: 2px;
+    background: var(--st-line);
+    transform: scaleX(0.6);
+    transform-origin: 100%;
+    transition: transform 0.14s, background-color 0.14s;
+}
+
+.chat-turns__mark:hover::before {
+    background: var(--st-ink-soft);
+    transform: scaleX(0.9);
+}
+
+.chat-turns__mark.is-on::before {
+    background: var(--st-ink);
+    transform: scaleX(1);
+}
+
+.chat-turns__mark.is-busy::before {
+    animation: chat-turn-mark-busy 1s ease-in-out infinite;
+}
+
+.chat-turns__mark:focus-visible::before {
+    background: var(--st-accent);
+    transform: scaleX(1);
+}
+
+@keyframes chat-turn-mark-busy {
+    50% {
+        opacity: 0.35;
+    }
+}
+
+/* 窄屏内容占满宽度，右侧导航压内容，直接收起（切轮次靠滚动） */
+@media (max-width: 900px) {
+    .chat-turns {
+        display: none;
+    }
+}
+
+/* 参考来源（方案 v2）：助手消息末尾列出去重后的来源，点击走系统浏览器 */
+.chat-sources {
+    margin-top: var(--st-s-3);
+    padding: var(--st-s-2) var(--st-s-3);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-md);
+    background: var(--st-surface-2);
+}
+
+.chat-sources__title {
+    display: flex;
+    align-items: center;
+    gap: var(--st-s-1);
+    color: var(--st-ink-muted);
+    font-size: var(--st-fs-xs);
+}
+
+.chat-sources ul {
+    margin: var(--st-s-1) 0 0;
+    padding-left: var(--st-s-4);
+}
+
+.chat-sources li {
+    font-size: var(--st-fs-sm);
+    line-height: var(--st-lh-body);
+}
+
+.chat-sources__link {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--st-info-text);
+    font: inherit;
+    text-align: left;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+}
+
+.chat-sources__link:hover {
+    color: var(--st-info);
+}
+
 /* 代码块右侧的动作按钮组（预览 + 复制） */
 .st-code__actions {
     display: inline-flex;
@@ -2450,6 +2754,14 @@ rect.scenario-column.is-failed {
     margin: var(--st-s-3) 0;
 }
 
+/* 过程区（照 DSH 的分组渲染）：思考与工具卡同在一个可折叠块里，正文只留答案 */
+.st-process__body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--st-s-2);
+    padding: var(--st-s-2) 0 var(--st-s-1);
+}
+
 .st-collapse.think summary,
 .st-collapse.tool-call summary {
     display: flex;
@@ -2586,7 +2898,7 @@ rect.scenario-column.is-failed {
     resize: none;
     background: transparent;
     color: var(--st-ink);
-    font: 400 var(--st-fs-base)/1.5 var(--st-font);
+    font: 400 var(--chat-fs, var(--st-fs-base))/1.5 var(--st-font);
 }
 
 .st-composer .attachments {
@@ -2750,6 +3062,9 @@ rect.scenario-column.is-failed {
 @media (max-width: 900px) {
     .chat-history {
         flex-basis: 200px;
+        width: 200px;
+        min-width: 200px;
+        max-width: 200px;
     }
 
     /* 窄屏时宽度由 min(100% - 2×20px) 兜住，这里不再加内边距，否则留白翻倍 */
@@ -2784,7 +3099,7 @@ rect.scenario-column.is-failed {
     z-index: 1101;
     display: flex;
     flex-direction: column;
-    width: 360px;
+    width: 420px;
     max-width: 100vw;
     background: var(--st-surface);
     border-left: 1px solid var(--st-line);
@@ -3038,6 +3353,31 @@ rect.scenario-column.is-failed {
     .chat-resize {
         display: none;
     }
+}
+
+/* 输入框下方的一行统计（照 DSH 的 composer dock）：只读、不抢焦点、不换行 */
+.composer-dock {
+    width: min(var(--chat-width, 860px), calc(100% - 2 * var(--st-s-10)));
+    margin: var(--st-s-1) auto 0;
+    color: var(--st-ink-soft);
+    font-size: var(--st-fs-xs);
+    text-align: center;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* 上下文用量（用户 m02182 第 2 点）：只要文本，不再画圆环。
+   分母是模型原生上下文（256k），括号里是本次运行窗口（--ctx-size）。 */
+.chat-context {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--st-s-1);
+    width: min(var(--chat-width, 860px), calc(100% - 2 * var(--st-s-10)));
+    margin: var(--st-s-1) auto 0;
+    color: var(--st-ink-soft);
+    font-size: var(--st-fs-xs);
 }
 
 /* 输入框里的模型选择（用户 m07816 第 1 点，参考 DSH）：菜单往上展开，
@@ -5331,4 +5671,33 @@ rect.scenario-column.is-failed {
 .model-download-inline .model-download-progress {
     flex: 1;
     min-width: 0;
+}
+/* 选中文字后的「引用」浮层（P1）：位置由 JS 写进 --quote-top/--quote-left，其它样式都走 token */
+.chat-quote-btn {
+    position: fixed;
+    top: var(--quote-top, 0);
+    left: var(--quote-left, 0);
+    z-index: 40;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--st-s-1);
+    padding: var(--st-s-1) var(--st-s-3);
+    border: 1px solid var(--st-line);
+    border-radius: var(--st-r-pill, 999px);
+    background: var(--st-surface);
+    box-shadow: var(--st-sh-pop);
+    color: var(--st-ink);
+    font-family: inherit;
+    font-size: var(--st-fs-xs);
+    cursor: pointer;
+}
+
+.chat-quote-btn:hover {
+    border-color: var(--st-line-strong);
+    color: var(--st-ink);
+}
+
+.chat-quote-btn i {
+    font-size: var(--st-fs-xs);
+    color: var(--st-ink-soft);
 }

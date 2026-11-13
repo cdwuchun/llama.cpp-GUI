@@ -11,7 +11,7 @@ import {
   unloadModel as apiUnloadModel,
 } from "./api/router";
 import { errText, ipc, monitorSample, monitorSampleNow, onLogLines, onModelsScanned, onStrataStatus } from "./ipc";
-import type { MonitorSnapshot } from "./types";
+import type { MonitorSnapshot, SearchResponse } from "./types";
 import { RECENT_TURN_LIMIT, type LastTurn, type RecentTurn } from "./utils/telemetry";
 import { reportFrontendError } from "./utils/frontendLog";
 import {
@@ -34,6 +34,7 @@ import { fetchChatModelProps, streamChat, streamChatTurn, type ChatMessage, type
 import {
   advanceChatExecution,
   buildChatRequest,
+  compactTurns,
   conversationTitle,
   expandToolHistory,
   finishChatExecution,
@@ -44,11 +45,15 @@ import {
   type ChatAttachment,
   type ChatDelta,
   type ChatOptions,
+  type ChatSource,
   type ChatTurn,
   type Conversation,
   type ToolCall,
 } from "./utils/chat";
 import { buildToolSpecs, isMcpTool, mergeToolCallFragments, parseToolArguments, searchQueriesFromArgs } from "./utils/tools";
+import { searchCacheGet, searchCachePut } from "./utils/searchCache";
+import { allConversations, deleteConversationRow, putConversations, STORE_CONVERSATION_LIMIT } from "./utils/chatStore";
+import { extractDocumentTextAsync, isDocumentFile } from "./utils/chatDocs";
 import {
   branchConversation,
   draftOfTurn,
@@ -323,12 +328,22 @@ const CHAT_CONVERSATIONS_KEY = "llamacpp-gui-chat-conversations";
 const CHAT_OPTIONS_KEY = "llamacpp-gui-chat-options";
 /** 上次打开的会话 id：不记的话，刷新/重启后聊天页回到空白新会话，用户会以为「上下文被重置」 */
 const CHAT_ACTIVE_KEY = "llamacpp-gui-chat-active";
+/** 每会话草稿（方案 v2 第 2 项）：按会话 id 分开存，切会话、刷新都能找回 */
+const CHAT_DRAFT_PREFIX = "llamacpp-gui-chat-draft:";
 
-/** 会话条数上限与单会话消息上限：聊天记录是便利功能，不能让 localStorage 无限涨 */
+/** 会话条数上限与单会话消息上限：聊天记录是便利功能，不能让 localStorage 无限涨。
+ *  IndexedDB（P1）里另有 500 条的全量副本；localStorage 只是首屏与降级用的快照。 */
 const CHAT_CONVERSATION_LIMIT = 30;
-const CHAT_MESSAGE_LIMIT = 200;
+const CHAT_MESSAGE_LIMIT = 500;
+/** 文档附件（PDF / Word / Excel / PPT）抽出来的文本上限：再长就没法塞进一次请求了 */
+const DOC_TEXT_LIMIT = 200_000;
 /** 工具结果落盘时保留的字符数：模型已经拿到全文，历史里留一份完整副本只会把 5 MB 配额吃光 */
 const TOOL_RESULT_KEEP = 2_000;
+
+/** web_fetch 的正文缓存：跨轮去重拆掉后靠它兜底——同一 URL + 长度上限 30 分钟内不重复抓 */
+const WEB_FETCH_TTL_MS = 30 * 60 * 1000;
+const WEB_FETCH_CACHE_LIMIT = 40;
+const webFetchCache = new Map<string, { text: string; note: string; at: number }>();
 
 function trimConversation(item: Conversation): Conversation {
   const messages = item.messages.slice(-CHAT_MESSAGE_LIMIT).map((message) => ({
@@ -360,15 +375,21 @@ function loadConversations(): Conversation[] {
 }
 
 function saveConversations(conversations: Conversation[]): Conversation[] {
-  const kept = [...conversations]
-    .sort((a, b) => b.updatedAt - a.updatedAt)
-    .slice(0, CHAT_CONVERSATION_LIMIT)
-    .map(trimConversation);
+  // 返回给调用方写回 state 的必须是**没 trim 过的**列表（审查 F1）：
+  // putConversations/trimConversation 会把附件正文清空，这个副本只用于落盘；
+  // 之前把 trim 后的对象返回出去，发完一轮附件就没了（缩略图变 chip、重生成报「附件丢失」）。
+  const kept = [...conversations].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, STORE_CONVERSATION_LIMIT);
+  const stored = kept.map(trimConversation);
   try {
-    localStorage.setItem(CHAT_CONVERSATIONS_KEY, JSON.stringify(kept));
+    // localStorage 是快照：只留最近 30 条，别把 5 MB 配额吃光
+    localStorage.setItem(CHAT_CONVERSATIONS_KEY, JSON.stringify(stored.slice(0, CHAT_CONVERSATION_LIMIT)));
   } catch {
     // 配额满 / 隐私模式：不打扰用户
   }
+  // 完整列表写 IndexedDB（P1）：全量重写在几百条的量级是毫秒级；失败只影响重启后的全量恢复
+  void putConversations(stored).then((ok) => {
+    if (!ok) console.warn("[chat] IndexedDB 写入失败：只保留 localStorage 快照（最近 30 条）");
+  });
   return kept;
 }
 
@@ -388,6 +409,102 @@ function rememberActiveId(id: string | null): void {
   } catch {
     // 隐私模式：不打扰
   }
+}
+
+/** 草稿键：空会话（还没发第一条）用 "new"，发出去之后归到会话 id 名下 */
+function draftKey(id: string | null): string {
+  return `${CHAT_DRAFT_PREFIX}${id ?? "new"}`;
+}
+
+function loadDraft(id: string | null): string {
+  try {
+    return localStorage.getItem(draftKey(id)) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/** 草稿写入的防抖定时器（审查 Q3：原来每次按键同步写 localStorage，长草稿打字会掉帧） */
+const draftTimers = new Map<string, number>();
+
+/** 防抖窗口内最后一次要写的值 */
+const pendingDrafts = new Map<string, string>();
+
+function writeDraft(key: string, value: string): void {
+  try {
+    if (value) localStorage.setItem(key, value);
+    else localStorage.removeItem(key);
+  } catch {
+    // 配额满 / 隐私模式：草稿只是便利功能，不打扰用户
+  }
+}
+
+/** 立即落盘某个草稿（切会话 / 发送 / 卸载前调用，避免 300ms 窗口里丢字） */
+function flushDraft(id: string | null): void {
+  const key = draftKey(id);
+  const timer = draftTimers.get(key);
+  if (timer === undefined) return;
+  window.clearTimeout(timer);
+  draftTimers.delete(key);
+  const pending = pendingDrafts.get(key);
+  pendingDrafts.delete(key);
+  if (pending !== undefined) writeDraft(key, pending);
+}
+
+function saveDraft(id: string | null, value: string): void {
+  const key = draftKey(id);
+  pendingDrafts.set(key, value);
+  const timer = draftTimers.get(key);
+  if (timer !== undefined) window.clearTimeout(timer);
+  draftTimers.set(
+    key,
+    window.setTimeout(() => {
+      draftTimers.delete(key);
+      const pending = pendingDrafts.get(key);
+      pendingDrafts.delete(key);
+      if (pending !== undefined) writeDraft(key, pending);
+    }, 300),
+  );
+}
+
+/** 把所有待写草稿立刻落盘（页面隐藏 / 切换会话时用） */
+function flushDrafts(): void {
+  for (const [key, pending] of [...pendingDrafts.entries()]) {
+    const timer = draftTimers.get(key);
+    if (timer !== undefined) window.clearTimeout(timer);
+    draftTimers.delete(key);
+    pendingDrafts.delete(key);
+    writeDraft(key, pending);
+  }
+}
+
+// 页面隐藏 / 关闭前把防抖里的草稿落盘（审查 Q3）：否则最后 300ms 打的字会丢
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", flushDrafts);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushDrafts();
+  });
+}
+
+/** 把几份搜索结果的 hits 收成来源卡片：按 url 去重，最多 8 条（界面上一屏能看完的量） */
+function collectSources(results: SearchResponse[]): ChatSource[] {
+  return mergeSources(
+    [],
+    results.flatMap((result) => result.hits.map((hit) => ({ title: hit.title || hit.url, url: hit.url }))),
+  );
+}
+
+/** 合并来源列表：同样的 url 只留一条，最多 8 条 */
+function mergeSources(current: ChatSource[] | undefined, next: ChatSource[]): ChatSource[] {
+  const seen = new Set<string>();
+  const out: ChatSource[] = [];
+  for (const item of [...(current ?? []), ...next]) {
+    if (!item.url || seen.has(item.url)) continue;
+    seen.add(item.url);
+    out.push(item);
+    if (out.length >= 8) break;
+  }
+  return out;
 }
 
 /** 启动时恢复会话列表与上次打开的会话：记着的那个被删了就退回最近更新的一条 */
@@ -430,6 +547,10 @@ export interface ChatState {
   undo: ChatUndo | null;
   /** 生成中排队的下一问（busyMode = "queue"/"interrupt" 时挂在这里） */
   pending: { text: string; attachments: ChatAttachment[] } | null;
+  /** 联网搜索可用性：开关开着但所有引擎都缺 key / 在冷却时为 false，聊天页显示一行灰字 */
+  searchAvailable: boolean;
+  /** 上一次发送时压缩了多少条早期消息（compactTurns，0 = 没压缩），输入框下方那行统计里显示 */
+  compacted: number;
 }
 
 /** 上下文档位压测的界面状态（放 store：切页面不丢，见 HANDOVER §8 第 1 项） */
@@ -655,7 +776,11 @@ interface AppStore {
   selectConversation: (id: string) => void;
   renameConversation: (id: string, title: string) => void;
   deleteConversation: (id: string) => void;
+  /** 撤销删除：把会话放回列表并切过去 */
+  restoreConversation: (conversation: Conversation) => void;
   setChatDraft: (value: string) => void;
+  /** 编辑第 index 条用户消息：正文与附件回填输入框，它和后面的消息隐藏（可撤销） */
+  editUserMessage: (index: number, text: string) => void;
   addChatAttachments: (files: File[]) => Promise<void>;
   removeChatAttachment: (id: string) => void;
   setChatOptions: (patch: Partial<ChatOptions>) => void;
@@ -696,6 +821,8 @@ interface AppStore {
   saveMcpServers: (next: McpServerConfig[]) => Promise<void>;
   /** 启动启用的服务器并拉工具，返回逐台状态（设置面板的「重新检测」用） */
   refreshMcpTools: () => Promise<McpToolsView | null>;
+  /** 重新判断「联网搜索还有没有可用引擎」：聊天页挂载、搜索设置保存、发送前都会调 */
+  refreshSearchAvailability: () => Promise<void>;
 }
 
 const emptyStrataStatus: StrataStatus = {
@@ -925,13 +1052,15 @@ export const useApp = create<AppStore>((set, get) => ({
   chat: {
     conversations: initialConversations,
     activeId: initialActiveId,
-    draft: "",
+    draft: loadDraft(initialActiveId),
     attachments: [],
     streaming: false,
     options: loadChatOptions(),
     error: null,
     undo: null,
     pending: null,
+    searchAvailable: true,
+    compacted: 0,
   },
   monitor: null,
   monitorAt: 0,
@@ -958,6 +1087,35 @@ export const useApp = create<AppStore>((set, get) => ({
       if (modelsTimer === null) {
         modelsTimer = window.setInterval(() => void get().refreshRouterModels(false), 5000);
       }
+
+      // 聊天记录以 IndexedDB 为准（P1）：localStorage 只留最近 30 条快照，启动时把 IDB 里的
+      // 全量列表补回来；隐私模式 / 旧内核没有 IDB 就继续用快照。
+      // 合并而不是整体覆盖（审查 F3）：某次 putConversations 失败（配额 / 事务中止）时，
+      // IDB 里会是旧数据，直接覆盖会把这几秒里新建/更新的会话丢掉。
+      void (async () => {
+        const stored = await allConversations();
+        if (!stored) return;
+        const current = get().chat;
+        // 用户已经在这几秒里开始对话了就别动列表
+        if (current.streaming) return;
+        const byId = new Map(current.conversations.map((item) => [item.id, item]));
+        for (const row of stored) {
+          const existing = byId.get(row.id);
+          if (!existing || row.updatedAt > existing.updatedAt) byId.set(row.id, row);
+        }
+        const merged = [...byId.values()]
+          .sort((a, b) => b.updatedAt - a.updatedAt)
+          .slice(0, STORE_CONVERSATION_LIMIT);
+        const same =
+          merged.length === current.conversations.length &&
+          merged.every((item) => current.conversations.some((row) => row.id === item.id && row.updatedAt === item.updatedAt));
+        if (same) return;
+        const activeId =
+          current.activeId && merged.some((item) => item.id === current.activeId)
+            ? current.activeId
+            : (merged[0]?.id ?? null);
+        set({ chat: { ...current, conversations: merged, activeId } });
+      })();
 
       // 1) 订阅先注册、且只注册一次（见 ensureListener / registerListeners）。
       //    它和下面的快照是两件事：快照失败时订阅也该在跑 —— 后端一恢复，
@@ -2642,6 +2800,11 @@ export const useApp = create<AppStore>((set, get) => ({
         error: null,
       },
     });
+    // 会话 id 变了：旧键（可能是 "new"）也要清，否则下次新会话会看到这条已经发出去的稿子
+    saveDraft(state.activeId, "");
+    saveDraft(conversationId, "");
+    flushDraft(state.activeId);
+    flushDraft(conversationId);
     rememberActiveId(conversationId);
 
     const controller = new AbortController();
@@ -2670,7 +2833,7 @@ export const useApp = create<AppStore>((set, get) => ({
     /** 跑一次工具调用，把结果整理成喂回模型的文本 */
     const runTool = async (
       call: ToolCall,
-    ): Promise<{ text: string; ok: boolean; note?: string }> => {
+    ): Promise<{ text: string; ok: boolean; note?: string; sources?: ChatSource[] }> => {
       const args = parseToolArguments(call.arguments);
       if (call.name === "web_search") {
         // 参数形态照 DSH 核心（dsh-tool-web）：queries 1–4 条，去重、并发、合并
@@ -2678,35 +2841,63 @@ export const useApp = create<AppStore>((set, get) => ({
         if (queries.length === 0) return { text: "搜索词是空的", ok: false };
         const limit = typeof args.limit === "number" ? args.limit : undefined;
         try {
-          // 每条查询并发打后端（`search_query` 是异步命令，后端互不排队），
-          // 任一查询失败整批中止 —— 与 DSH web_search 的融合信号语义一致
-          // （Promise.all 的第一个 reject 就是我们要回传的失败）。
-          // 走后端的多引擎搜索（`src-tauri/src/search.rs`）：拿回来的是已经包好
-          // 「不可信网页内容」边界的整段文本
-          const results = await Promise.all(queries.map((query) => ipc.searchQuery(query, limit)));
+          // 每条查询先查前端缓存（方案 v2 第 1 项）：同一轮里模型把同一个词换个
+          // 大小写/空格再来一遍时不再打引擎，省匿名额度也省时间。
+          // 缓存未命中才并发打后端（`search_query` 是异步命令，后端互不排队）。
+          // 用 allSettled 而不是 all（审查 F5）：一条 query 撞上冷却/限流不该让整批白跑，
+          // 其它几条的结果照常回给模型。
+          const settled = await Promise.allSettled(
+            queries.map(async (query) => {
+              const cached = searchCacheGet(query, limit);
+              if (cached) return cached;
+              const result = await ipc.searchQuery(query, limit);
+              searchCachePut(query, limit, result);
+              return result;
+            }),
+          );
+          const results: (SearchResponse | null)[] = settled.map((item) =>
+            item.status === "fulfilled" ? item.value : null,
+          );
+          const failures = settled.map((item, index) =>
+            item.status === "rejected"
+              ? `${queries[index]}：${errText(item.reason).slice(0, 80)}`
+              : null,
+          );
+          const done = results.filter((result): result is SearchResponse => result !== null);
           // 卡片上写清实际用的引擎、以及哪些引擎被跳过（失败原因），
           // 否则用户只看到「用了 Tavily」，没法知道排前面的 AnySearch 为什么没上
-          const note =
-            results
-              .map((result) => {
-                const skipped = result.attempts
-                  .filter((item) => item.engine !== result.engine)
-                  .map((item) => `${item.engine}（${item.error ?? "跳过"}）`)
-                  .join("、");
-                return skipped
-                  ? `${result.engine} · 跳过 ${skipped}`
-                  : `${result.engine}${result.cached ? " · 缓存" : ""}`;
-              })
-              .join("；");
-          const usable = results.filter((result) => result.hits.length > 0);
-          if (usable.length === 0) return { text: "没有搜到结果", ok: false, note };
-          const text =
-            queries.length === 1
-              ? usable[0].block
-              : results
-                  .map((result, index) => `### ${queries[index]}\n${result.hits.length > 0 ? result.block : "没有搜到结果"}`)
-                  .join("\n\n");
-          return { text, ok: true, note };
+          const note = done
+            .map((result) => {
+              const skipped = result.attempts
+                .filter((item) => item.engine !== result.engine)
+                .map((item) => `${item.engine}（${item.error ?? "跳过"}）`)
+                .join("、");
+              return skipped
+                ? `${result.engine} · 跳过 ${skipped}`
+                : `${result.engine}${result.cached ? " · 缓存" : ""}`;
+            })
+            .join("；");
+          const usable = done.filter((result) => result.hits.length > 0);
+          if (usable.length === 0) {
+            const failed = failures.filter((item): item is string => item !== null);
+            return {
+              text: `没有搜到结果${failed.length ? `（失败的查询：${failed.join("；")}）` : ""}`,
+              ok: false,
+              note,
+            };
+          }
+          // 固定指令跟在结果后面（照 DSH 把纪律写进工具结果而不是 system 消息）：
+          // 每轮都可见，用户自写 system prompt 也不会把它顶掉。
+          const instruction =
+            "\n\n引用相关链接时用 markdown 链接；资料里没有的参数名或数值不要写进答案，查不到就直说。";
+          const body = results
+            .map((result, index) => {
+              if (!result) return `### ${queries[index]}\n这条没有搜到（${failures[index] ?? "未知原因"}）`;
+              return `### ${queries[index]}\n${result.hits.length > 0 ? result.block : "没有搜到结果"}`;
+            })
+            .join("\n\n");
+          const text = (queries.length === 1 && results[0] ? results[0].block : body) + instruction;
+          return { text, ok: true, note, sources: collectSources(done) };
         } catch (error) {
           return { text: errText(error), ok: false };
         }
@@ -2715,12 +2906,22 @@ export const useApp = create<AppStore>((set, get) => ({
         const url = typeof args.url === "string" ? args.url.trim() : "";
         if (!url) return { text: "url 是空的", ok: false };
         const maxChars = typeof args.maxChars === "number" ? args.maxChars : undefined;
+        const cacheKey = `${url}|${maxChars ?? ""}`;
+        const hit = webFetchCache.get(cacheKey);
+        if (hit && Date.now() - hit.at < WEB_FETCH_TTL_MS) {
+          return { text: hit.text, ok: true, note: `${hit.note} · 缓存` };
+        }
         try {
           // 后端用系统 curl 抓回来、抽成正文并包好「不可信网页内容」边界
           const page = await ipc.webFetch(url, maxChars);
           const host = page.finalUrl.replace(/^https?:\/\//, "").split("/")[0];
           const tail = page.truncated ? " · 已截断" : "";
           const note = `${host} · ${page.chars} 字符${tail}${page.note ? ` · ${page.note}` : ""}`;
+          webFetchCache.set(cacheKey, { text: page.block, note, at: Date.now() });
+          if (webFetchCache.size > WEB_FETCH_CACHE_LIMIT) {
+            const oldest = [...webFetchCache.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+            if (oldest) webFetchCache.delete(oldest[0]);
+          }
           return { text: page.block, ok: true, note };
         } catch (error) {
           return { text: errText(error), ok: false };
@@ -2788,19 +2989,40 @@ export const useApp = create<AppStore>((set, get) => ({
         const view = await get().refreshMcpTools();
         mcpTools = view?.tools ?? [];
       }
-      const tools = buildToolSpecs(state.options.webSearch, mcpTools);
+      // 联网搜索的就绪度（照 DSH 的 searchReady）：没有任何可用引擎（都缺 key 或都在冷却）
+      // 时这一步干脆不提供 web_search，模型连「有搜索可用」都看不到；web_fetch 不受影响，
+      // 因为抓取只依赖系统 curl。读不到配置时不限制——宁可给工具让模型拿到失败文案，
+      // 也不要因为一次 IPC 失败就静默失去搜索。
+      let searchReady = state.options.webSearch;
+      if (!state.options.webSearch) {
+        // 开关关着：灰字提示不该出现，可用性视为 true
+        if (!get().chat.searchAvailable) set({ chat: { ...get().chat, searchAvailable: true } });
+      } else {
+        try {
+          const config = await ipc.searchConfig();
+          searchReady = config.engines.some((engine) => (engine.keyless || engine.hasKey) && !engine.cooling);
+        } catch {
+          searchReady = state.options.webSearch;
+        }
+        if (get().chat.searchAvailable !== searchReady) {
+          set({ chat: { ...get().chat, searchAvailable: searchReady } });
+        }
+      }
+      const tools = buildToolSpecs(searchReady, mcpTools, state.options.webFetch);
       // 模型可以连续要工具：每要一次就执行、回填，再要一次，最多 5 轮（防死循环）
       // 历史里的工具卡片先还原成 tool_calls/tool 消息，否则模型在追问时看不到上次搜到的资料
-      let history = [...expandToolHistory(previous.filter((m) => !m.error)), user];
+      // 历史超长时压掉早期消息（照 DSH 的 compaction，本地模板摘要、不调模型）。
+      // 会话里的原消息不动，只影响这次请求；压缩条数记在 chat.compacted 里给界面提示。
+      const packed = compactTurns(expandToolHistory(previous.filter((m) => !m.error)));
+      let history = [...packed.messages, user];
+      if (get().chat.compacted !== packed.dropped) {
+        set({ chat: { ...get().chat, compacted: packed.dropped } });
+      }
       /** 5 轮用尽时模型还在要工具：此时必须补一次收尾请求，哪怕这一轮已经写了过渡语 */
       let hitToolLimit = false;
       let calls: ToolCall[] = [];
       /** 本轮回答的正文（含工具轮之间的过渡文字），用来判断要不要收尾 */
       let answer = "";
-      /** 本次发送里已经搜过的关键词，用来挡掉重复搜索 */
-      const searched = new Set<string>();
-      /** 本次发送里已经读过的网页，用来挡掉重复抓取 */
-      const fetched = new Set<string>();
       const onDelta = (delta: ChatDelta) => {
         if (delta.reasoning && reasoningStartedAt === undefined) reasoningStartedAt = performance.now();
         if (delta.content) {
@@ -2874,39 +3096,11 @@ export const useApp = create<AppStore>((set, get) => ({
         }
 
         const results: ChatTurn[] = [];
-        // 这一轮有没有拿到新资料：全是被去重拦下的重复调用就没有，再问下去只是白等
-        let progressed = false;
         for (const call of calls) {
-          // 按查询去重（照 DSH 的口径：完全相同的查询只执行一次）。
-          // 模型换词重搜要放行；已搜过的词只跑新词，全搜过就整张卡跳过
-          // （用户 m07347 截图里 5 张卡片同一个 query）
-          const callArgs = parseToolArguments(call.arguments);
-          const asked = call.name === "web_search" ? searchQueriesFromArgs(callArgs) : [];
-          const fresh = asked.filter((item) => !searched.has(item));
-          const target = typeof callArgs.url === "string" ? callArgs.url.trim() : "";
-          const repeated =
-            (call.name === "web_search" && asked.length > 0 && fresh.length === 0) ||
-            (call.name === "web_fetch" && target !== "" && fetched.has(target));
-          const outcome = repeated
-            ? {
-                text:
-                  call.name === "web_fetch"
-                    ? `已经读过 ${target}，正文就在上面的工具结果里。请直接基于已有资料回答，不要再重复抓取。`
-                    : `已经搜过「${asked.join("，")}」，结果就在上面的工具结果里。请直接基于已有资料回答，不要再重复搜索。`,
-                ok: true,
-                note: "重复调用已跳过",
-              }
-            : await runTool(
-                // 部分查询搜过、部分是新的：参数里摘掉旧词，只跑新词
-                call.name === "web_search" && fresh.length > 0 && fresh.length < asked.length
-                  ? { ...call, arguments: JSON.stringify({ ...callArgs, queries: fresh }) }
-                  : call,
-              );
-          if (call.name === "web_search" && !repeated) {
-            for (const item of fresh) searched.add(item);
-          }
-          if (call.name === "web_fetch" && target !== "" && !repeated) fetched.add(target);
-          if (!repeated) progressed = true;
+          // 跨轮去重已拆（照 DSH：工具调用一律执行，模型自己负责不重复）。
+          // 重复的搜索由 30 分钟查询缓存兜底、重复抓取由 web_fetch 缓存兜底，
+          // 框架不再替模型否决调用（否则模型看到的是「跳过」而不是真实结果）。
+          const outcome = await runTool(call);
           patchAssistant((message) => ({
             ...message,
             tools: (message.tools ?? []).map((item) =>
@@ -2920,6 +3114,8 @@ export const useApp = create<AppStore>((set, get) => ({
                   }
                 : item,
             ),
+            // 来源卡片：同一轮多次搜索累加，只保留前 8 条（方案 v2 第 4 项）
+            sources: outcome.sources?.length ? mergeSources(message.sources, outcome.sources) : message.sources,
           }));
           results.push({
             id: newId(),
@@ -2938,11 +3134,6 @@ export const useApp = create<AppStore>((set, get) => ({
           { id: newId(), role: "assistant", content: "", createdAt: Date.now(), toolCalls: calls },
           ...results,
         ];
-        // 整轮都在重复「已经搜过」的调用：它不会自愈，继续循环只是把 8 分钟拖成 15 分钟
-        if (!progressed) {
-          hitToolLimit = true;
-          break;
-        }
       }
 
       // 轮次用尽还在要工具时，正文是空的 —— 再发一次「不许再调工具」的收尾请求，
@@ -3037,6 +3228,7 @@ export const useApp = create<AppStore>((set, get) => ({
         set({
           chat: { ...get().chat, pending: null, draft: queued.text, attachments: queued.attachments },
         });
+        saveDraft(get().chat.activeId, queued.text);
         void get().sendChat();
       }
     }
@@ -3048,13 +3240,19 @@ export const useApp = create<AppStore>((set, get) => ({
 
   newConversation() {
     const state = get().chat;
-    set({ chat: { ...state, activeId: null, draft: "", attachments: [], error: null } });
+    // 切走前先存当前草稿，回来还能接着写（方案 v2 第 2 项）；flush 保证防抖窗口里的字不丢
+    saveDraft(state.activeId, state.draft);
+    flushDraft(state.activeId);
+    set({ chat: { ...state, activeId: null, draft: loadDraft(null), attachments: [], error: null } });
     rememberActiveId(null);
   },
 
   selectConversation(id) {
     const state = get().chat;
-    set({ chat: { ...state, activeId: id, draft: "", attachments: [], error: null } });
+    if (id === state.activeId) return;
+    saveDraft(state.activeId, state.draft);
+    flushDraft(state.activeId);
+    set({ chat: { ...state, activeId: id, draft: loadDraft(id), attachments: [], error: null } });
     rememberActiveId(id);
   },
 
@@ -3081,13 +3279,35 @@ export const useApp = create<AppStore>((set, get) => ({
         ...state,
         conversations: saveConversations(state.conversations.filter((item) => item.id !== id)),
         activeId: state.activeId === id ? null : state.activeId,
+        draft: state.activeId === id ? "" : state.draft,
       },
     });
+    saveDraft(id, "");
+    flushDraft(id);
     if (state.activeId === id) rememberActiveId(null);
+    void deleteConversationRow(id);
+  },
+
+  restoreConversation(conversation) {
+    const state = get().chat;
+    const conversations = saveConversations([
+      conversation,
+      ...state.conversations.filter((item) => item.id !== conversation.id),
+    ]);
+    set({
+      chat: {
+        ...state,
+        conversations,
+        activeId: conversation.id,
+        draft: loadDraft(conversation.id),
+      },
+    });
+    rememberActiveId(conversation.id);
   },
 
   setChatDraft(value) {
     set({ chat: { ...get().chat, draft: value } });
+    saveDraft(get().chat.activeId, value);
   },
 
   async addChatAttachments(files) {
@@ -3106,6 +3326,27 @@ export const useApp = create<AppStore>((set, get) => ({
           reader.readAsDataURL(file);
         });
         added.push({ id: newId(), name: file.name, type: "image", mimeType: file.type, content });
+      } else if (isDocumentFile(file)) {
+        // PDF / Word / Excel / PPT：本地抽成文本再当文本附件发（模型看不到原排版，只能读文字）
+        try {
+          const text = await extractDocumentTextAsync(file);
+          if (!text) {
+            problems.push(`${file.name}: 没读取出文字（扫描件或加密文件），可以先把内容导出成文本再附加`);
+            continue;
+          }
+          added.push({
+            id: newId(),
+            name: `${file.name}（已提取文本）`,
+            type: "text",
+            mimeType: "text/plain",
+            content:
+              text.length > DOC_TEXT_LIMIT
+                ? `${text.slice(0, DOC_TEXT_LIMIT)}\n…（文档太长，只取了前 ${DOC_TEXT_LIMIT} 个字符）`
+                : text,
+          });
+        } catch (error) {
+          problems.push(`${file.name}: 解析失败（${errText(error)}）`);
+        }
       } else if (
         file.type.startsWith("text/") ||
         /\.(txt|md|json|csv|tsv|xml|yaml|yml|py|js|ts|tsx|jsx|html|css|log|sql|sh|ps1|c|cpp|h|rs)$/i.test(file.name)
@@ -3122,7 +3363,7 @@ export const useApp = create<AppStore>((set, get) => ({
           content: await file.text(),
         });
       } else {
-        problems.push(`${file.name}: 只支持文本文件和 png/jpeg/webp/gif 图片`);
+        problems.push(`${file.name}: 只支持文本、图片（png/jpeg/webp/gif）与 PDF/Word/Excel/PPT`);
       }
     }
     const state = get().chat;
@@ -3199,6 +3440,55 @@ export const useApp = create<AppStore>((set, get) => ({
       },
     });
     void get().sendChat();
+  },
+
+  /**
+   * 编辑用户消息（方案 v2）：这条和它后面的全部隐藏，正文与附件回填输入框，由用户按发送。
+   * 与 `regenerateReply` 的区别是文本本身被改写，而不是拿旧文本直接重跑。
+   */
+  editUserMessage(index, text) {
+    const state = get().chat;
+    if (state.streaming) return;
+    const conversation = state.conversations.find((item) => item.id === state.activeId);
+    if (!conversation) return;
+    const message = conversation.messages[index];
+    if (!message || message.role !== "user") return;
+    const clean = text.trim();
+    if (!clean) {
+      set({ chat: { ...state, error: "消息内容不能为空" } });
+      return;
+    }
+    // 历史会话的附件只留了名字：回填后发出去会丢图片/文本，先拦下来
+    const draft = draftOfTurn(message);
+    if (draft.lost > 0) {
+      set({
+        chat: {
+          ...state,
+          error: `这条消息还有 ${draft.lost} 个附件只保留了文件名（历史会话不保存附件内容）。请新建会话重新添加附件后再试。`,
+        },
+      });
+      return;
+    }
+    const keep = conversation.messages.slice(0, index);
+    const changed: Conversation = { ...conversation, messages: keep, updatedAt: Date.now() };
+    set({
+      chat: {
+        ...state,
+        conversations: saveConversations([
+          changed,
+          ...state.conversations.filter((item) => item.id !== changed.id),
+        ]),
+        draft: clean,
+        attachments: draft.attachments,
+        undo: {
+          messages: conversation.messages,
+          text: "已编辑这条消息，后面的消息已隐藏（内容放回了输入框）",
+        },
+        error: null,
+      },
+    });
+    saveDraft(state.activeId, clean);
+    flushDraft(state.activeId);
   },
 
   /** 改写回答（照上游 `editAnswer`）：只替换正文并打「已编辑」，思考/工具/用量丢弃，后面消息隐藏 */
@@ -3328,6 +3618,23 @@ export const useApp = create<AppStore>((set, get) => ({
 
   dismissChatUndo() {
     set({ chat: { ...get().chat, undo: null } });
+  },
+
+  async refreshSearchAvailability() {
+    const state = get().chat;
+    if (!state.options.webSearch) {
+      if (!state.searchAvailable) set({ chat: { ...state, searchAvailable: true } });
+      return;
+    }
+    try {
+      const config = await ipc.searchConfig();
+      const available = config.engines.some((engine) => (engine.keyless || engine.hasKey) && !engine.cooling);
+      if (get().chat.searchAvailable !== available) {
+        set({ chat: { ...get().chat, searchAvailable: available } });
+      }
+    } catch {
+      // 读不到配置就不提示：宁可让模型拿到失败文案，也不要因为一次 IPC 失败吓人
+    }
   },
 
   /** 抓一次采集快照；状态栏 1 秒调一次，失败就把 metric 置空（界面显示「监控不可用」）。 */

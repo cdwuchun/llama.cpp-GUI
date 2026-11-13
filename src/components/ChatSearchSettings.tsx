@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { ipc } from "../ipc";
+import { useApp } from "../store";
 import type { SearchConfigView } from "../types";
 
 /** 引擎名 → 展示名（后端 ENGINES 的固定顺序见 `src-tauri/src/search.rs`） */
@@ -31,6 +32,7 @@ const errText = (error: unknown): string =>
  * 所以「测试」之后要重新拉一次配置，才能看到冷却标记。
  */
 export function ChatSearchSettings() {
+  const refreshSearchAvailability = useApp((state) => state.refreshSearchAvailability);
   const [config, setConfig] = useState<SearchConfigView | null>(null);
   const [keys, setKeys] = useState<Record<string, string>>({});
   const [order, setOrder] = useState<string[]>([]);
@@ -96,6 +98,8 @@ export function ChatSearchSettings() {
       });
       reset(next);
       setNotice("已保存");
+      // 保存后同步「联网搜索可用」状态（审查 F7）：否则输入框上方的灰字要等下次发送才更新
+      void refreshSearchAvailability();
     } catch (err) {
       setError(errText(err));
     } finally {
@@ -136,6 +140,8 @@ export function ChatSearchSettings() {
       setError(errText(err));
     } finally {
       setTesting(null);
+      // 测试会触发冷却判定：同步一次就绪度，灰字/冷却徽标立刻反映结果（审查 F7）
+      void refreshSearchAvailability();
     }
   };
 
@@ -221,7 +227,11 @@ export function ChatSearchSettings() {
                   <span>{label}</span>
                 </label>
                 {engine.keyless ? <span className="st-badge st-badge--ok">免key</span> : null}
-                {engine.cooling ? <span className="st-badge st-badge--queued">冷却</span> : null}
+                {engine.cooling ? (
+                  <span className="st-badge st-badge--queued">
+                    冷却{engine.coolingSecs ? ` · 还需 ${engine.coolingSecs} 秒` : ""}
+                  </span>
+                ) : null}
                 <span className="spacer" />
                 <button
                   type="button"
