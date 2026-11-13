@@ -778,6 +778,11 @@ interface AppStore {
   deleteConversation: (id: string) => void;
   /** 撤销删除：把会话放回列表并切过去 */
   restoreConversation: (conversation: Conversation) => void;
+  /**
+   * 真正删掉会话在 tmp 下的临时目录（本地 MCP 的写沙箱）。
+   * 删会话时不立即调用：先留着给「撤销」把文件一起救回来，撤销窗口结束后再调用。
+   */
+  purgeConversationTmp: (id: string) => void;
   setChatDraft: (value: string) => void;
   /** 编辑第 index 条用户消息：正文与附件回填输入框，它和后面的消息隐藏（可撤销） */
   editUserMessage: (index: number, text: string) => void;
@@ -2934,7 +2939,7 @@ export const useApp = create<AppStore>((set, get) => ({
           return { text: `找不到工具 ${call.name}，MCP 服务器可能改过了，请在聊天设置里重新检测`, ok: false };
         }
         try {
-          const text = await ipc.mcpCallTool(target.server, target.name, args);
+          const text = await ipc.mcpCallTool(target.server, target.name, args, get().chat.activeId ?? undefined);
           return { text, ok: true, note: `${target.server} · ${target.name}` };
         } catch (error) {
           return { text: errText(error), ok: false, note: `${target.server} · ${target.name}` };
@@ -3286,6 +3291,11 @@ export const useApp = create<AppStore>((set, get) => ({
     flushDraft(id);
     if (state.activeId === id) rememberActiveId(null);
     void deleteConversationRow(id);
+    // tmp 下的会话目录不在这里删：等撤销窗口（toast 10 秒）结束再删，撤销才能把文件一起救回来。
+  },
+
+  purgeConversationTmp(id) {
+    void ipc.chatTmpRemove(id).catch(() => {});
   },
 
   restoreConversation(conversation) {

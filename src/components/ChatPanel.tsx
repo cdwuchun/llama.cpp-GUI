@@ -103,6 +103,7 @@ export function ChatPanel() {
   const renameConversation = useApp((s) => s.renameConversation);
   const deleteConversation = useApp((s) => s.deleteConversation);
   const restoreConversation = useApp((s) => s.restoreConversation);
+  const purgeConversationTmp = useApp((s) => s.purgeConversationTmp);
   const setChatDraft = useApp((s) => s.setChatDraft);
   const addChatAttachments = useApp((s) => s.addChatAttachments);
   const removeChatAttachment = useApp((s) => s.removeChatAttachment);
@@ -126,22 +127,55 @@ export function ChatPanel() {
   const [samplingOpen, setSamplingOpen] = useState(false);
   /** 输入框里的模型下拉是否展开（用户 m07816 第 1 点） */
   const [modelOpen, setModelOpen] = useState(false);
-  /** 刚删除的会话：底部 toast 给 10 秒撤销窗口（与下方 setTimeout 的 10000ms 保持一致） */
-  const [deleted, setDeleted] = useState<Conversation | null>(null);
+  /** 刚删除、还在撤销窗口里的会话：连续删除时每个都有自己的 10 秒窗口，互不顶掉 */
+  const [deletedList, setDeletedList] = useState<Conversation[]>([]);
+  /** 每个待删会话的定时器：撤销/关闭时取消，到期时才真正删 tmp/<会话 id> */
+  const deleteTimers = useRef(new Map<string, number>());
 
-  /** 删除会话并留一份用于撤销（用户 m02858：一次删除，但可撤销） */
+  /** 删除会话并留一份用于撤销（用户 m02858：一次删除，但可撤销；m03279 连续删除各算各的） */
   const handleDelete = (id: string) => {
     const target = chat.conversations.find((item) => item.id === id);
     if (!target) return;
     deleteConversation(id);
-    setDeleted(target);
+    setDeletedList((list) => [...list, target]);
+    const timer = window.setTimeout(() => {
+      deleteTimers.current.delete(id);
+      // 撤销窗口结束、没有点撤销：这时才删 tmp/<会话 id>（会话里生成的临时测试代码随之清掉）
+      void purgeConversationTmp(id);
+      setDeletedList((list) => list.filter((item) => item.id !== id));
+    }, 10000);
+    deleteTimers.current.set(id, timer);
+  };
+
+  /** 撤销某一条删除：取消它的定时器，只把这一条会话放回去（m03310：任意一条 toast 都能单独撤销） */
+  const undoDelete = (conversation: Conversation) => {
+    const timer = deleteTimers.current.get(conversation.id);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      deleteTimers.current.delete(conversation.id);
+    }
+    restoreConversation(conversation);
+    setDeletedList((list) => list.filter((item) => item.id !== conversation.id));
+  };
+
+  /** 关掉某一条提示等于放弃那一条的撤销：只删这一条的目录（m03310） */
+  const dismissDeleted = (conversation: Conversation) => {
+    const timer = deleteTimers.current.get(conversation.id);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      deleteTimers.current.delete(conversation.id);
+    }
+    void purgeConversationTmp(conversation.id);
+    setDeletedList((list) => list.filter((item) => item.id !== conversation.id));
   };
 
   useEffect(() => {
-    if (!deleted) return;
-    const timer = window.setTimeout(() => setDeleted(null), 10000);
-    return () => window.clearTimeout(timer);
-  }, [deleted]);
+    const timers = deleteTimers.current;
+    return () => {
+      for (const timer of timers.values()) window.clearTimeout(timer);
+      timers.clear();
+    };
+  }, []);
 
   const files = useRef<HTMLInputElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
@@ -702,27 +736,28 @@ export function ChatPanel() {
             ))
           )}
         </div>
-        {deleted && (
-          <div className="chat-toast" role="status">
-            <span className="chat-toast__text">已删除「{deleted.title || "未命名会话"}」</span>
-            <button
-              type="button"
-              className="chat-toast__undo"
-              onClick={() => {
-                restoreConversation(deleted);
-                setDeleted(null);
-              }}
-            >
-              撤销
-            </button>
-            <button
-              type="button"
-              className="chat-toast__close"
-              aria-label="关闭提示"
-              onClick={() => setDeleted(null)}
-            >
-              <i className="fas fa-xmark" />
-            </button>
+        {deletedList.length > 0 && (
+          <div className="chat-toasts">
+            {deletedList.map((item) => (
+              <div className="chat-toast" role="status" key={item.id}>
+                <span className="chat-toast__text">已删除「{item.title || "未命名会话"}」</span>
+                <button
+                  type="button"
+                  className="chat-toast__undo"
+                  onClick={() => undoDelete(item)}
+                >
+                  撤销
+                </button>
+                <button
+                  type="button"
+                  className="chat-toast__close"
+                  aria-label="关闭提示"
+                  onClick={() => dismissDeleted(item)}
+                >
+                  <i className="fas fa-xmark" />
+                </button>
+              </div>
+            ))}
           </div>
         )}
       </aside>}

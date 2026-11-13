@@ -421,9 +421,19 @@ fn normalize_result(result: &Value) -> String {
     }
 }
 
-fn call_tool(proc: &mut Proc, tool: &str, arguments: &Value) -> Result<String, String> {
+fn call_tool(
+    proc: &mut Proc,
+    tool: &str,
+    arguments: &Value,
+    session: Option<&str>,
+) -> Result<String, String> {
     ensure_init(proc)?;
-    let params = json!({ "name": tool, "arguments": arguments });
+    let mut params = json!({ "name": tool, "arguments": arguments });
+    // 会话 id 以 MCP 约定的 `_meta` 透传：本地 tools 服务器据此把文件写到 tmp/<会话 id>/，
+    // 删会话时 GUI 再把该目录删掉。服务器不认 `_meta` 也没关系（忽略即可）。
+    if let Some(session) = session {
+        params["_meta"] = json!({ "sessionId": session });
+    }
     let result = request(proc, "tools/call", Some(params), CALL_TIMEOUT)?;
     Ok(normalize_result(&result))
 }
@@ -636,13 +646,15 @@ pub async fn mcp_tools_list(
     .map_err(|error| format!("拉取 MCP 工具失败：{error}"))?
 }
 
-/// 执行一次工具调用，返回给模型看的文本。
+/// 执行一次工具调用，返回给模型看的文本。`session_id` 由前端带上，透传给工具服务器
+/// （本地 tools 用它把写操作落到 `tmp/<会话 id>/`）。
 #[tauri::command]
 pub async fn mcp_tool_call(
     state: tauri::State<'_, crate::state::AppState>,
     server: String,
     tool: String,
     arguments: Value,
+    session_id: Option<String>,
 ) -> Result<String, String> {
     let config = load_config(&state.config_dir);
     let found = config
@@ -657,10 +669,32 @@ pub async fn mcp_tool_call(
         };
         // 只压这台服务器自己的锁：一次 tools/call 可能跑几十秒
         let mut proc = slot.lock().map_err(|_| "MCP 进程被占用".to_string())?;
-        call_tool(&mut proc, &tool, &arguments)
+        call_tool(&mut proc, &tool, &arguments, session_id.as_deref())
     })
     .await
     .map_err(|error| format!("MCP 工具调用失败：{error}"))?
+}
+
+/// 删除一个会话在 `tmp` 下的临时目录（删会话时调用）。会话 id 只接受字母数字与 `-` `_`，
+/// 防止拼出 `..` 之类的路径片段。
+#[tauri::command]
+pub fn chat_tmp_remove(session_id: String) -> Result<(), String> {
+    let valid = !session_id.is_empty()
+        && session_id.len() <= 64
+        && session_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_');
+    if !valid {
+        return Err("会话 id 不合法，拒绝删除".to_string());
+    }
+    let dir = std::env::current_dir()
+        .map_err(|error| format!("取当前目录失败：{error}"))?
+        .join("tmp")
+        .join(&session_id);
+    if !dir.exists() {
+        return Ok(());
+    }
+    std::fs::remove_dir_all(&dir).map_err(|error| format!("删除 tmp 会话目录失败：{error}"))
 }
 
 /// 停掉全部服务器进程（保存配置、退出 GUI 时调用）。
@@ -775,7 +809,7 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
         assert!(tools[0].description.contains("原样返回"));
-        let text = call_tool(&mut proc, "echo", &json!({ "text": "你好" })).expect("tools/call 失败");
+        let text = call_tool(&mut proc, "echo", &json!({ "text": "你好" }), None).expect("tools/call 失败");
         assert_eq!(text, "echo: 你好");
         proc.kill();
     }

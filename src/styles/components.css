@@ -2339,13 +2339,22 @@ rect.scenario-column.is-failed {
     white-space: nowrap;
 }
 
-/* 删除会话后的 toast：贴在聊天历史栏底部，10 秒内可撤销（用户 m02931） */
+/* 删除会话后的 toast：贴在聊天历史栏底部，多条堆叠，每条 10 秒内可单独撤销（用户 m02931 / m03310） */
+.chat-toasts {
+    display: flex;
+    flex-direction: column;
+    gap: var(--st-s-1);
+    flex: 0 0 auto;
+    margin-top: var(--st-s-2);
+    max-height: 50%;
+    overflow-y: auto;
+}
+
 .chat-toast {
     display: flex;
     align-items: center;
     gap: var(--st-s-1);
     flex: 0 0 auto;
-    margin-top: var(--st-s-2);
     padding: var(--st-s-1);
     border: 1px solid var(--st-line);
     border-radius: var(--st-r-field);

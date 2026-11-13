@@ -278,8 +278,10 @@ export const ipc = {
   mcpSaveServers: (servers: McpServerConfig[]) =>
     invoke<McpServerConfig[]>("mcp_servers_save", { servers }),
   mcpTools: () => invoke<McpToolsView>("mcp_tools_list"),
-  mcpCallTool: (server: string, tool: string, args: Record<string, unknown>) =>
-    invoke<string>("mcp_tool_call", { server, tool, arguments: args }),
+  mcpCallTool: (server: string, tool: string, args: Record<string, unknown>, sessionId?: string) =>
+    invoke<string>("mcp_tool_call", { server, tool, arguments: args, sessionId }),
+  /** 删会话时清掉它在 tmp 下的临时目录（本地 MCP 的写沙箱按会话隔离）。 */
+  chatTmpRemove: (sessionId: string) => invoke<void>("chat_tmp_remove", { sessionId }),
 };
 
 /**

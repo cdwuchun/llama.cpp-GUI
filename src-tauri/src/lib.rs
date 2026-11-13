@@ -2511,6 +2511,7 @@ pub fn run() {
             mcp::mcp_servers_save,
             mcp::mcp_tools_list,
             mcp::mcp_tool_call,
+            mcp::chat_tmp_remove,
             config_remove,
             config_entries,
             config_set_api_key,
