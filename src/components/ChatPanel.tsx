@@ -126,7 +126,7 @@ export function ChatPanel() {
   const [samplingOpen, setSamplingOpen] = useState(false);
   /** 输入框里的模型下拉是否展开（用户 m07816 第 1 点） */
   const [modelOpen, setModelOpen] = useState(false);
-  /** 刚删除的会话：底部 toast 给 6 秒撤销窗口 */
+  /** 刚删除的会话：底部 toast 给 10 秒撤销窗口（与下方 setTimeout 的 10000ms 保持一致） */
   const [deleted, setDeleted] = useState<Conversation | null>(null);
 
   /** 删除会话并留一份用于撤销（用户 m02858：一次删除，但可撤销） */

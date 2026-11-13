@@ -267,6 +267,7 @@ Strata 的二进制不同名、没有 router mode，config 是 `strata-*.json`�
 - **附件解析在 worker 里做**：`src/utils/chatDocs.ts` 抽文本，PDF 走 `pdfjs-dist`、Word / Excel / PPT 走 `jszip`（OOXML 本身是 zip + xml），两者都是 `await import(...)` 动态加载 —— 平时不下载，附加文件时才拉 chunk。**构建必须 `worker.format: "es"`**（见 §5），否则 `iife` 不支持 code splitting，构建直接失败。
 - **搜索有 30 分钟 / 120 条的跨轮缓存**：`src/utils/searchCache.ts` 照 Strata `web-search-ddg.mjs` 的阈值，键是「归一化查询 + limit + 时间范围」。同一轮里模型把同一个词换个大小写再来一遍时不再真打引擎（匿名引擎按分钟计额度，重复打容易被冷却）；命中时 `SearchResponse.cached = true`，工具卡片上能看到。
 - **历史栏一条一个组件**：`src/components/ChatHistoryItem.tsx` 从 `ChatPanel.tsx` 拆出来，标题溢出用自绘浮层（portal 到 body，深色小气泡）而不是原生 `title` —— 原生那个是系统灰框，延迟和样式都不可控。
+- **删除不做二次确认，改成「一次删除 + 10 秒撤销」**：删掉的会话先留一份快照，底部浮一条带「撤销」的 toast（`ChatPanel.tsx` 的 `deletedConversation`，`window.setTimeout(…, 10000)` 到点自动消失），点撤销走 `store.restoreConversation` 原样放回。**别再改回点两次确认** —— 用户 0.3.11 明确要求过这个交互。
 
 ---
 
