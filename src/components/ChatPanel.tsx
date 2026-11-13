@@ -189,6 +189,8 @@ export function ChatPanel() {
   const imeCommitAt = useRef(0);
   /** 输入 @ 打开了文件选择：选完要把草稿末尾那个 @ 去掉 */
   const atPending = useRef(false);
+  /** 右侧轮次高亮的 rAF 合并句柄：0 表示本帧还没排 */
+  const turnSyncFrame = useRef(0);
   const scrolledConversation = useRef("");
   /** 当前视口里最靠上的那一轮（右侧轮次跳转的高亮项） */
   const [activeTurn, setActiveTurn] = useState(0);
@@ -349,6 +351,9 @@ export function ChatPanel() {
     const element = document.getElementById(`chat-msg-${id}`);
     if (!scroll || !element) return;
     pinned.current = false;
+    // 平滑滚动期间的 scroll 事件会先派发（此时 distance 还小），不记 readerInput 的话
+    // onScroll 会把 pinned 重置回 true，下一帧就被拽回底部 —— 思考中尤其明显
+    readerInput.current = Date.now();
     const top =
       element.getBoundingClientRect().top - scroll.getBoundingClientRect().top + scroll.scrollTop - TURN_OFFSET;
     scroll.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
@@ -371,7 +376,7 @@ export function ChatPanel() {
       }
       turnIndex += 1;
     }
-    setActiveTurn(current);
+    setActiveTurn((previous) => (previous === current ? previous : current));
   }, [conversation]);
 
   // 消息数/会话变化时同步一次高亮（渲染后 DOM 才就位）
@@ -462,7 +467,10 @@ export function ChatPanel() {
     if (!scroll) return;
     const inner = scroll.firstElementChild;
     const stick = () => {
-      if (pinned.current) scroll.scrollTop = scroll.scrollHeight;
+      // 读者刚滚过（400ms 内）就不贴底，否则图片加载完会把用户拽回底部
+      if (pinned.current && Date.now() - readerInput.current >= READER_INPUT_WINDOW) {
+        scroll.scrollTop = scroll.scrollHeight;
+      }
     };
     const observer = new ResizeObserver(stick);
     observer.observe(scroll);
@@ -476,7 +484,12 @@ export function ChatPanel() {
     if (!scroll || !streaming) return;
     let frame = 0;
     const loop = () => {
-      if (pinned.current) scroll.scrollTop = scroll.scrollHeight;
+      const distance = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight;
+      const recent = Date.now() - readerInput.current < READER_INPUT_WINDOW;
+      // rAF 早于 scroll 事件执行，无条件贴底会把滚轮滚动吞掉（scroll 事件到时 distance 已经是 0，
+      // pinned 又被重置回 true）；读者刚滚过的 400ms 内必须让位。滚回底部并停够 400ms 后自动恢复跟随。
+      if (pinned.current && !recent) scroll.scrollTop = scroll.scrollHeight;
+      else if (!pinned.current && !recent && distance <= FOLLOW_SLACK) pinned.current = true;
       frame = requestAnimationFrame(loop);
     };
     frame = requestAnimationFrame(loop);
@@ -539,24 +552,37 @@ export function ChatPanel() {
     );
   }, []);
 
-  /** 导出整段对话为 PNG（P1）：html2canvas 动态加载，按 .chat 的完整高度渲染 */
+  /** 导出整段对话为 PNG（P1）：把 .chat 序列化成 SVG foreignObject 再栅格化。
+   *  原来用 html2canvas，它按自己的布局引擎重排 flex/gap/表格，导出的长图里行与行、
+   *  表格列会重叠；foreignObject 直接让浏览器渲染同一份 DOM，排版与页面一致。 */
   const exportImage = useCallback(async (item: Conversation) => {
     const node = chatScroll.current?.querySelector(".chat");
     if (!(node instanceof HTMLElement)) return;
     setNotice("正在生成长图…");
+    // 截图前临时加左右留白：.chat 平时贴着滚动容器，直接截会顶到画布边缘
+    node.classList.add("chat--exporting");
     try {
-      const { default: html2canvas } = await import("html2canvas");
-      const canvas = await html2canvas(node, {
+      const { toBlob } = await import("html-to-image");
+      await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+      const width = node.scrollWidth;
+      const height = node.scrollHeight;
+      // Chromium 的渲染纹理上限是 16384px：超长会话自动降倍率，否则整张图会导出失败
+      const ratio = Math.max(1, Math.min(2, 16384 / Math.max(width, height, 1)));
+      // 用 toBlob 而不是 toPng + fetch(data:)：应用的 CSP 里 connect-src 不含 data:
+      const blob = await toBlob(node, {
         backgroundColor: getComputedStyle(document.body).backgroundColor || "#ffffff",
-        scale: Math.min(2, window.devicePixelRatio || 1),
-        logging: false,
+        pixelRatio: ratio,
+        width,
+        height,
+        style: { margin: "0", transform: "none" },
       });
-      const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
       if (!blob) throw new Error("画布为空");
       download(blob, exportName(item.title, ".png"));
       setNotice("长图已导出");
     } catch (error) {
       setNotice(`长图导出失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      node.classList.remove("chat--exporting");
     }
     setTimeout(() => setNotice(null), 2600);
   }, []);
@@ -823,13 +849,25 @@ export function ChatPanel() {
             const scroll = event.currentTarget;
             const distance = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight;
             const recent = Date.now() - readerInput.current < READER_INPUT_WINDOW;
-            // 距底 ≤24 才算在底部；读者刚滚过（400ms 内）或离底 >400 就放手，不再每帧拽回来
-            if (distance <= FOLLOW_SLACK) pinned.current = true;
+            // 距底 ≤24 才算在底部；读者刚滚过（400ms 内）或离底 >400 就放手，不再每帧拽回来。
+            // recent 时绝不能把 pinned 重置回 true —— 流式每帧贴底会先把 distance 抹成 0。
+            if (distance <= FOLLOW_SLACK && !recent) pinned.current = true;
             else if (recent || distance > PILL_DISTANCE) pinned.current = false;
-            syncActiveTurn();
+            // rAF 贴底会每帧派发 scroll，直接同步高亮等于每帧对每轮做一次 getBoundingClientRect；
+            // 一帧只算一次，避免长会话滚动时被强制布局拖住
+            if (!turnSyncFrame.current) {
+              turnSyncFrame.current = requestAnimationFrame(() => {
+                turnSyncFrame.current = 0;
+                syncActiveTurn();
+              });
+            }
           }}
           onWheel={(event) => {
-            if (event.deltaY < 0) readerInput.current = Date.now();
+            if (event.deltaY < 0) {
+              readerInput.current = Date.now();
+              // 只在确实离开底部时才停止跟随；已经到底时滚轮不该误关跟随
+              if (event.currentTarget.scrollTop > FOLLOW_SLACK) pinned.current = false;
+            }
           }}
           onTouchMove={() => {
             readerInput.current = Date.now();

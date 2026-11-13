@@ -2042,6 +2042,12 @@ rect.scenario-column.is-failed {
     padding: var(--st-s-5) 0;
 }
 
+/* 导出长图时临时给左右留白，截图结束后由 ChatPanel 移除这个类 */
+.chat.chat--exporting {
+    padding-left: var(--st-s-8);
+    padding-right: var(--st-s-8);
+}
+
 .chat-empty {
     margin: 12vh auto 0;
     text-align: center;
