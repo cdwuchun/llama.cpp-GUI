@@ -44,6 +44,8 @@ import type {
   StrataDraftingPlan,
   StrataDraftingResult,
   StrataCommunityDiscovery,
+  StrataCommunitySetupRequest,
+  StrataCommunitySetupSnapshot,
   StrataOrcaProbe,
   StrataOrcaSnapshot,
   StrataLaunchPreset,
@@ -181,6 +183,16 @@ export const ipc = {
       force,
       endpoint: endpoint ?? null,
     }),
+  /**
+   * 起一次社区档安装：按社区仓库的固定提交下分片（逐个 SHA-256 校验），
+   * 再用 `setup.py --gguf-dir` 准备，配置单独登记为 `strata-<slug>-<quant>.json`。
+   */
+  strataCommunitySetupStart: (request: StrataCommunitySetupRequest) =>
+    invoke<StrataUpgradeStart>("strata_community_setup_start", { request }),
+  /** 社区安装进度（每秒轮询） */
+  strataCommunitySetupStatus: () => invoke<StrataCommunitySetupSnapshot>("strata_community_setup_status"),
+  /** 取消社区安装（已下好的分片保留） */
+  strataCommunitySetupStop: () => invoke<void>("strata_community_setup_stop"),
   /** ORCA 导入前置探测（解释器 / iq_pack.py / 引擎 是否齐） */
   strataOrcaProbe: () => invoke<StrataOrcaProbe>("strata_orca_probe"),
   /** 开始 ORCA 导入（下载分片 → iq_pack 打包 → 写配置） */

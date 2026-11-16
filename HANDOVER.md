@@ -68,11 +68,12 @@ llama.cpp 的 router mode 已于 2026-10-15 退役（`router.rs` → `logs.rs`�
 | `src-tauri/src/strata_launch.rs` | **launch 预设对齐**：读 `%APPDATA%\Strata\launch-presets\*.json`，启动前用控制端 `Runner.build_config` 重生成 `launch\<slug>.json` | §2.11 |
 | `src-tauri/src/strata_download.rs` | **模型下载**：起 `setup.py --family/--model/--context/--vision/--images/--yes/--no-start`，按 `\r` 切行解析进度、磁盘预检（`GetDiskFreeSpaceExW`）、`HostInfo`、`scan_gguf`、`check_mtp` | 单槽 `AppState.strata_download` |
 | `src-tauri/src/strata_community.rs` | **社区目录**：`curl.exe` 拉 HF 镜像 `/api/models?search=` + `/tree/<sha>`，按分片名还原量化与家族，24 h 缓存 `%APPDATA%\llamacpp-gui\community-cache.json` | 默认镜像 `https://hf-mirror.com`；CSP 不含外部域，必须走后端 |
+| `src-tauri/src/strata_community_setup.rs` | **社区档安装（四步）**：`fetch`（下社区仓库固定提交的分片、逐个 SHA-256，官方同字节分片硬链接复用）→ `stash`（把官方 `strata-<tag>.json` 挪到 `.stash`）→ `setup.py --gguf-dir` → `finish`（登记 `strata-<slug>-<quant>.json`、官方配置放回、恢复 settings.json 的 `data_dir`） | 移植自上游 `community_model.rs`；与 `strata_download` 分开槽位，前端三条链路互斥 |
 | `src-tauri/src/strata_orca.rs` | **ORCA 导入**：两分片（85.2 GB）`curl -C -` → `tools/iq_pack.py --gguf <shard1> --out <pack> --compat-bf16` → 写 `strata-orca-iq3_xxs.json` | 与 `strata_download` 分开槽位 |
 | `src-tauri/src/monitor.rs` | 硬件与引擎指标采集：sysinfo + NVML（显存 / PCIe）+ PDH（磁盘）+ 引擎 `/metrics` 解析 | |
 | `src-tauri/src/search.rs` | 联网搜索五引擎（anysearch / tavily / firecrawl / keenable / exa）+ `search.json` + `web_fetch` 正文抓取；HTTP 走系统 `curl.exe`（本机 schannel 不可用，不引 reqwest） | `WEB_SEARCH_PLAN.md` |
 | `src-tauri/src/mcp.rs` | **MCP 客户端**：`mcp.json` 清单，stdio + NDJSON 拉子进程，`initialize` / `tools/list` / `tools/call`，工具名 `mcp__<服务器>__<工具>` | 保存配置或退出时 `stop_all()` |
-| `src-tauri/src/state.rs` | `AppState`：配置目录、调度器表、日志环形缓冲、扫描与元数据缓存、启动互斥、托盘标志、`strata_download` / `strata_orca` 槽位 | 缓存 TTL 与前端轮询同周期时命中率≈0 |
+| `src-tauri/src/state.rs` | `AppState`：配置目录、调度器表、日志环形缓冲、扫描与元数据缓存、启动互斥、托盘标志、`strata_download` / `strata_orca` / `strata_community_setup` 槽位 | 缓存 TTL 与前端轮询同周期时命中率≈0 |
 | `src-tauri/src/tray.rs` / `tray_icon.rs` | 托盘菜单与 RGBA 图标常量（`scripts/make-icons.mjs` 生成） | 托盘不直接调后端，把命令转给前端 |
 | `src/store.ts` | zustand 全局状态：设置、模型、前门状态、聊天与工具编排、通知 | 业务编排几乎都在这里 |
 | `src/api/router.ts` | 前门 / 各引擎的 HTTP + SSE 客户端（**唯一**带鉴权的地方） | §2.4 |
@@ -80,9 +81,9 @@ llama.cpp 的 router mode 已于 2026-10-15 退役（`router.rs` → `logs.rs`�
 | `src/utils/models.ts` | 扫描结果 ↔ 运行态合并、过滤排序（纯逻辑） | 组件文件只导出组件 |
 | `src/utils/paramSchema.ts` | 参数表 schema 与表单状态换算（纯数据） | |
 | `src/utils/strataParams.ts` | `strata-*.json` 的 `args` ↔ 表单状态换算与参数 schema | 新增参数的唯一落点 |
-| `src/utils/modelCatalog.ts` | 官方模型目录快照（`MODEL_CATALOG` 七族）+ 版本闸门 + 上下文预设 | 照搬上游 `packages/core/src/catalog.ts` |
+| `src/utils/modelCatalog.ts` | 官方模型目录快照（`MODEL_CATALOG` 七族）+ 版本闸门 + 上下文预设 | 照搬上游 `packages/core/src/catalog.ts`；档位清单还要和本机 `control\<版本>\setup.py` 的 `MODELS` 对账——上游目录常年落后于安装器（0.1.58 的 unsloth 有 11 档，上游只列 5 档） |
 | `src/utils/modelPerformance.ts` | 速度 / 首字延迟估算表（上游 `model-performance.ts` 的实测数据） | 按家族 + 量化 + 硬件查表 |
-| `src/utils/communityCatalog.ts` | 社区内置三条 + `mergeCommunityModels` + 风险与类型中文标签 | 发现结果来自 `strata_community_discover` |
+| `src/utils/communityCatalog.ts` | 社区内置三条（带完整文件清单与 SHA-256，与上游 `community-catalog.ts` 逐字一致）+ `communitySetupRequest` + `mergeCommunityModels` + 风险与类型中文标签 | 发现结果来自 `strata_community_discover`；安装请求发给 `strata_community_setup_start` |
 | `src/utils/tools.ts` | 聊天工具定义（`web_search` / `web_fetch` / `mcp__*`）与工具调用片段合并 | 执行在 `store.ts::sendChat` |
 | `src/utils/chatStore.ts` | 会话的 IndexedDB 存储（500 条上限），`localStorage` 降级保留 | 全量重写、按 `updatedAt` 裁剪；IDB 打不开时界面照常工作 |
 | `src/utils/chatDocs.ts` + `chatDocs.worker.ts` | 文档附件抽文本（PDF 走 pdfjs-dist、Word/Excel/PPT 走 jszip），解析在 worker、解析库动态 `import` | 构建要求 `worker.format: "es"`（§5） |
@@ -90,7 +91,7 @@ llama.cpp 的 router mode 已于 2026-10-15 退役（`router.rs` → `logs.rs`�
 | `src/components/ChatHistoryItem.tsx` | 历史栏单条：切换 / 行内改名 / 二次确认删除 / 自绘标题提示 | 从 `ChatPanel.tsx` 拆出（降低重渲染成本） |
 | `src/components/ParamForm.tsx` | 参数表单控件（下拉、路径选择、JSON 编辑） | 下拉菜单用 portal |
 | `src/components/ModelSheets.tsx` | 模型配置 / 详情弹窗；Strata 侧左栏是 config 原文（可编辑） | |
-| `src/components/ModelDownloadPage.tsx` | **模型下载页**：官方 / 社区两档 + 本地 GGUF + ORCA 面板，四个弹窗 | 照搬上游同名页面结构与文案 |
+| `src/components/ModelDownloadPage.tsx` | **模型下载页**：官方 / 社区两档 + 本地 GGUF + ORCA 面板，四个弹窗 | 社区档走 `strata_community_setup_*`（不再是官方安装器直连），三条下载链路互斥 |
 | `src/components/StrataPanel.tsx` | Strata 页：卡片列表 + 配置 / 详情 Sheet | |
 | `src/components/Sheet.tsx` | **唯一的通用弹窗** `Modal`（Esc / 遮罩 / × 都走 `confirmClose`） | 新弹窗一律复用 |
 | `src/styles/tokens.css` | **样式真源**：`--st-*` token + 旧变量兼容别名 | 新样式只准用 `--st-*` |
@@ -212,6 +213,14 @@ Strata 的二进制不同名、没有 router mode，config 是 `strata-*.json`�
 - HF tree 接口的 `lfs.oid` 是**裸 64 位十六进制**（没有 `sha256:` 前缀），且 `mtp*` 文件与量化名同形 —— 分片/量化/家族的还原规则与上游 `community-catalog.ts` 完全一致，别"优化"。
 - ORCA 打包用 `tools/iq_pack.py --gguf <shard1> --out <pack> --compat-bf16`（`--compat-bf16` 与 `--base` 互斥；它自己调 `strata_tokenizer.py` 导出 `tokenizer/`），成功后写 `strata-orca-iq3_xxs.json`。
 - MTP 草稿层没有安装器参数：安装器只认 `<数据目录>\mtp\rt\experts.bin`，所以「选 MTP 目录」等价于把所选目录的父级当 `--data-dir` 传下去（`check_mtp` 的 `data_directory`）。
+- **社区档不能直接交给官方安装器**：`setup.py` 的 `FAMILIES[family]["hf"]` 写死官方仓库（`ISTA-DASLab/…GSQ-RCO-GGUF`），argparse 也没有 `--repo`，所以只传 `--family/--model` 一定下官方权重 —— 这就是旧版「选社区档却下官方版」的根因。现行四步（`strata_community_setup.rs`，移植上游 `community_model.rs`）：`fetch` 按社区仓库的固定提交下分片并逐个核对 SHA-256（与 `ISTA_FILES` 同 (size, sha256) 的分片从本机官方下载**硬链接**复用，官方文件只读）→ `stash` 把同量化的官方 `strata-<tag>.json` 挪到 `.stash`、并快照 settings.json 的 `data_dir` → `setup.py --gguf-dir` 准备（`--data-dir` 指向 `<数据目录>\community\<slug>-<quant>`）→ `finish` 把新配置改名 `strata-<slug>-<quant>.json`、`model_name` 设为 `<slug>-<quant>`（**不加 `community` 前缀**：slug 自带来源，`sc117-abliterated-iq3_s` 与官方 `qwen` 天然不同名），安装器写的启动脚本也从 `run-<tag>.bat` 改名成 `run-<slug>-<量化>.bat` 并把内容里的 `--config` 指向社区配置（不改的话它启动的是放回后的官方配置）——这一步按**内容**扫 `run-*.bat/.sh` 里还引用 `strata-<tag>.json` 的那个，而且路径比较必须忽略大小写：`setup.py` 写脚本时用它自己的 `home()`（现场是 `E:\AI\strata`），后端传的 root 是 `E:\AI\Strata`，精确比较会让整段被跳过、脚本保持原名原内容（用户 m02112 现场就是「参数页配置对、bat 不对」）——官方配置放回、`data_dir` 复原。
+- 三条下载链路（官方 / 社区 / ORCA）都写 `<根>` 下的配置，且社区安装要临时挪走官方配置，所以前端用 `anyRunning` 互斥，同一时间只允许跑一条。
+- **社区档的 pack 落在社区数据目录**：四步里的 `stash` 先 `mkdir <community>/packs/<tag>`，`setup.py` 第 6 步的 `pack = find_in(roots, f"packs/{tag}") or data/"packs"/<tag>`（`roots = [data, *elsewhere]`，见 setup.py:10910、:7225）会先命中这个空目录，于是 `iq_pack.py --gguf <社区分片>` 把 pack 写进社区目录，**不复用官方 pack**。体积分三种：普通量化只写 `native_experts.txt` + `tokenizer/`（秒级，按 2 GB 兜底）；`qwen` 的 `Q2_0` 在 AVX-512 机器上走 `strata_pack.py build` 重编码成约 40 GB 的 `experts.bin`；RAM 不够时（`low_ram`）再写一份 `experts.bin`（arena 大小）。前端 `communityPackGb()` 按这个口径算进 preflight，「使用已有模型」的社区分支也只按 pack 算磁盘。MTP 不跟过来：`mtp = find_in(roots, "mtp/rt/experts.bin") or data/"mtp/…"` 会命中官方数据目录的草稿层（社区目录里没有 `mtp/`）。
+- **「使用已有模型」分两种登记**：官方档照旧 `setup.py --gguf-dir`（按 family/quant 写成 `strata-<tag>.json`，`own=True` 时**不核对 SHA-256**）；左侧选的是社区条目时走社区四步并把 `localDir` 传给后端（`COMMUNITY_LOCAL_DIR` 环境变量 → HELPER 的 `reuse_local`），按清单文件名在本地方向里找分片、**逐个核对 SHA-256**（尺寸或摘要对不上直接 `setup.fail`，不会悄悄改成下载），命中的硬链接进 `<数据目录>\community\<slug>-<量化>\models\<量化>`，最后登记成 `strata-<slug>-<量化>.json`，官方配置原样保留。
+- **`vision.mmproj` 的斜杠要和安装器一致（反斜杠）**：扫描器回报的路径统一是正斜杠（`models.rs` 的 `to_forward_slash`），参数页把候选值原样写进 config 时，`vision.mmproj` 就成了 `E:/AI/…`，而安装器写的 `vision.model` / `args --native` 是反斜杠，同一个 config 两种风格（用户 m02175）。保存时在 `strataParams.ts` 里归一化 `mmproj.replace(/\//g, "\\")`；读旧配置时显示的仍是原值，重新保存一次才纠正。
+- **新装的 config 要补写 API Key**：设置页「服务」里的 Key 只在点「保存」那一下扫过当时的 `strata-*.json`（`strata_set_api_key` → `set_api_key_all`），之后装出来的模型（官方档 / 社区档 / ORCA / 手工装）都不带 `api_key` 字段 —— 引擎就不会按 `--api-key` 起，而 GUI 带着 key 请求，出现「以为在鉴权、其实没鉴权」的错位。三条链路的 `*_status` 在「刚完成（`ok == Some(true)` 且不再 running）」时调 `lib.rs` 的 `adopt_api_key` → `strata::adopt_missing_api_keys`：**只补“顶层缺 `api_key` 字段”的**（字段在、值是 `null` 也算同步过，用户可能手改过），重复调用无副作用。新增配置时若又把这一步漏掉，症状是模型卡片 `has_api_key` 为 false、`/props` 不带鉴权也能访问。
+- **llama.cpp 通道同理**：`model_config::ensure_config`（扫描/同步/启动时给新模型补一份最小 `llamacpp-<id>.json`）以前写死的 `api_key: None`，同样是「保存设置后才出现的模型没有 Key」。现在它多收一个 `api_key` 参数，三个调用方（`sync_model_configs` 的 `with_ensure` 分支、`scheduler::ensure_config_for`、`config_sync`）都从 `settings.api_key` 传入；子实例的 `--api-key` 来自 `scheduler::build_model_args` 读的同一字段。
+- **官方档的档位清单要拿本机 `setup.py` 的 `MODELS` 对账，别默认上游目录是对的**：`src/utils/modelCatalog.ts` 是上游 `packages/core/src/catalog.ts` 的快照，而上游常年落后于安装器 —— 0.1.58 的 unsloth 家族在 `MODELS` 里有 11 个可装档位（`UD-IQ1_M` / `UD-Q2_0` / `UD-IQ2_XS` / `UD-Q2_K_XL` / `UD-IQ3_XXS` / `UD-Q3_K_XL` 之外的 5 个是老的），上游只列了 5 个，用户会问「明明有 iq2/iq3」（m01975）。对账办法：`cd <控制器目录>; python -c "import setup; [print(q, e.get('download_gb'), e.get('ram_gb'), e.get('arena_gb')) for q,e in setup.MODELS.items() if 'unsloth' in (e.get('families') or ())]"`，界面值取 `download_gb` / `ram_gb` / `arena_gb`，`minEngine` 取 `engine`。两个例外不要补：`UD-IQ1_S` 没在 `MODELS` 里、`UD-IQ4_XS-v31` 与 `UD-IQ4_XS` 同体积且 HF 上没有 `UD-IQ4_XS-v31/` 目录（`UNSLOTH_V31_IQ4_XS` 只是本地识别用的别名）。
 
 ### 2.12 `/metrics` 自带实时吞吐 gauge，速度别只靠本地实测
 - `--metrics` 下有两支 gauge：`llamacpp:predicted_tokens_seconds`（HELP "Average generation throughput in tokens/s"）与 `llamacpp:prompt_tokens_seconds`（"Average prompt throughput in tokens/s"）。实测 b11671 一次 24 token 的请求后分别是 `19.6849` / `70.6986`，**空闲时归 0** —— 是瞬时均值，不是累计值，别做差分。
@@ -290,8 +299,8 @@ Strata 的二进制不同名、没有 router mode，config 是 `strata-*.json`�
 npm install                        # 受限沙箱里需要 --ignore-scripts
 npm run cargo:proxy                # 另开终端保持运行：本机 crates 代理 http://127.0.0.1:8787
 npx tsc --noEmit                   # 前端类型检查（仓库根）
-cd src-tauri; cargo test --lib      # 后端单测（当前基线 184 passed / 19 ignored）
-npm test                           # test:web + test:rs
+cd src-tauri; cargo test --offline --lib   # 直接用 cargo 时要自己把 TMP/TEMP 指进工作区；日常走下面的 npm run test:rs
+npm test                           # test:web + test:rs（test:rs 内置 tmp/test-temp 临时目录）
 npm run tauri build                # 打包（exe + NSIS 安装包）
 node scripts/make-icons.mjs        # 重新生成全部图标资产
 ```
@@ -308,6 +317,7 @@ node scripts/make-icons.mjs        # 重新生成全部图标资产
   ```
 
   否则前端 `88 modules transformed` 之后报 `[vite:esbuild-transpile] remove C:\Users\…\Temp\esbuild-<hash>: Access is denied.`，cargo 测试里大量写临时文件的用例会以 `Os { code: 5, kind: PermissionDenied }` 失败（**那是环境问题，不是代码缺陷**，本仓库曾因此误判 48 个失败用例）。
+- **`npm run test:rs` 已经把 `TMP`/`TEMP` 指到 `tmp/test-temp`**（`scripts/test-rs.mjs`）：直接 `cargo test` 会踩上面那条系统 Temp 的 `os error 5`，这一个入口不用手动设环境变量。构建走 `npm run tauri build` 时仍要按上一条把 `TEMP`/`TMP` 指进工作区（`tmp/build-temp`）。
 - **提权被拒绝就不要重试同一个命令**，换做法或先问用户。
 - **CI 与发布门禁**：`.github/workflows/ci.yml` 跑 `npm run build`（含 tsc）+ `test:rs` + `test:smoke`；`release.yml` 打 tag 时校验 **tag 与 `tauri.conf.json` / `package.json` / `Cargo.toml` / `Cargo.lock` 四处版本一致**（0.3.4 起；以前只比 `tauri.conf.json`，其余三处漂了也照样发版）。CI 目前**不跑** `cargo fmt --check` / `clippy` —— 存量 42 条 clippy 警告，清完再加这一道。
 - **换图标后必须删 `src-tauri\target\release\build\llamacpp-gui-*` 与 `.fingerprint/llamacpp-gui-*` 再构建**（`tauri-build` 不监听 `icons/*`；不删的话 exe 在原路径上仍是旧图标）。
@@ -361,7 +371,7 @@ Strata 侧：`strata_root`、`strata_controller`、`strata_auto_controller`(true
 ## 7. 未决项与已知边界
 
 **未决项**：
-0. **模型下载页的四条链路只验证到「能起、能解析、能生成配置」，没跑过真流量**：官方 `setup.py` 下载、社区分片下载、ORCA 的 `iq_pack.py --compat-bf16` 打包（85.2 GB 输入、十几分钟）、本地 GGUF 打包，都需要在 GUI 里实际点一次并盯日志。两个外部依赖：社区目录默认打 `https://hf-mirror.com`（本机直连 huggingface.co 21 s 超时），ORCA 分片也走同一镜像；换源在页面「下载配置」里填 HF 镜像。ORCA 打包失败先看 `iq_pack.py` 退出码，再核对 `tools/iq_pack.py` 是否支持 `--compat-bf16`（0.1.52 支持）。
+0. **模型下载页的四条链路只验证到「能起、能解析、能生成配置」，没跑过真流量**：官方 `setup.py` 下载、社区档四步安装（`fetch`→`stash`→`setup.py --gguf-dir`→`finish`，见 §2.11 末条）、ORCA 的 `iq_pack.py --compat-bf16` 打包（85.2 GB 输入、十几分钟）、本地 GGUF 打包，都需要在 GUI 里实际点一次并盯日志。社区档重点看三处：分片 SHA-256 是否与 `community-catalog.ts` 里的值一致、官方配置是否原样放回（`strata-<tag>.json.stash` 不残留）、`settings.json` 的 `data_dir` 是否复原。两个外部依赖：社区目录默认打 `https://hf-mirror.com`（本机直连 huggingface.co 21 s 超时），ORCA 分片也走同一镜像；换源在页面「下载配置」里填 HF 镜像。ORCA 打包失败先看 `iq_pack.py` 退出码，再核对 `tools/iq_pack.py` 是否支持 `--compat-bf16`（0.1.52 支持）。
 1. **Strata 引擎在显存耗尽后会卡死，不是 GUI 的 bug**：反复打大 prompt 后 `/status` 长挂 `phase=reading the prompt`/`thinking`、`elapsed_s` 一直涨、`tokens_per_s` 掉到个位数，此后**所有**请求（连 `curl` 直连引擎端口）要么空回复、要么只收到 236–428 B 就被断开，日志报 `0 MiB of VRAM free with everything loaded - LOW …`。处置：杀掉 python 进程树，前门会在下一个请求冷启动新引擎。本机 2026-10-11 按引擎自报值定稿：三份 config 统一 `--kv-resident 30720`，`--vram-reserve-mib` 两份 512、`swift-1.5-iq3_xxs` 不传（引擎默认 700 MiB）。显存账见 `STRATA_INTEGRATION_PLAN.md` §22.10。
 
 **已知边界**（现状如此，不是缺陷）：

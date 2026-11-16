@@ -1,7 +1,7 @@
 {
   "name": "llamacpp-gui",
   "private": true,
-  "version": "0.3.11",
+  "version": "0.3.12",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,7 +11,7 @@
     "stamp:version": "node scripts/stamp-version.mjs",
     "cargo:proxy": "node scripts/cargo-proxy.mjs",
     "test:web": "tsc --noEmit",
-    "test:rs": "cargo test --lib --manifest-path src-tauri/Cargo.toml",
+    "test:rs": "node scripts/test-rs.mjs",
     "test:smoke": "node scripts/smoke-paramform.mjs",
     "lint": "eslint src",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\"",

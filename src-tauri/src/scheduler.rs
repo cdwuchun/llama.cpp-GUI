@@ -902,6 +902,9 @@ pub fn ensure_config_for(state: &AppState, id: &str) -> Result<model_config::Dir
             &model.path,
             model.mmproj.as_deref(),
             crate::LLAMACPP_PORT_BASE,
+            // 新配置要带上设置页的 Key：漏了子实例就不会按 `--api-key` 起，
+            // 而 GUI 带着 key 请求 —— 与 Strata 侧补 key 是同一个口径。
+            settings.api_key.as_deref(),
         )
         .map_err(|err| format!("{err:#}"))?;
     }

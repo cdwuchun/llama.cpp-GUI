@@ -125,12 +125,15 @@ fn family_quants(family: &str) -> &'static [&'static str] {
     }
 }
 
-fn setup_supports(family: &str, quant: &str) -> bool {
+pub(crate) fn setup_supports(family: &str, quant: &str) -> bool {
     family_quants(family).iter().any(|known| *known == quant)
 }
 
 /// 文件名的量化段：`...-IQ3_XXS-00001-of-00002.gguf` → `IQ3_XXS`；`...-UD-Q4_K_XL.gguf` → `UD-Q4_K_XL`。
-fn quant_of_stem(stem: &str) -> Option<String> {
+///
+/// 社区安装（`strata_community_setup::validate`）按上游 `local_model::quant_of` 用它核对
+/// 「请求里的量化名 == 文件名里的量化名」，调用方先把分片后缀剥掉。
+pub(crate) fn quant_of_stem(stem: &str) -> Option<String> {
     let parts: Vec<&str> = stem.split('-').collect();
     let last = parts.last()?;
     if !is_quant_name(last) {
@@ -179,7 +182,7 @@ fn is_quant_name(text: &str) -> bool {
 /// → `UD-`/`Q8_0` → 回退 `qwen`。注意 `swift` 排在 `UD-` 之前：`SC117/Swift-1.5-…` 的
 /// `Swift-1.5-…-IQ3_XXS` 归 swift，而同一个仓库里不带 swift 字样的 `UD-*` 才归 unsloth ——
 /// 上游列表里「· Swift」「· Unsloth UD」两条就是这么拆出来的。
-fn infer_family(stem: &str, quant: &str) -> Option<&'static str> {
+pub(crate) fn infer_family(stem: &str, quant: &str) -> Option<&'static str> {
     let lower = stem.to_lowercase();
     let family = if lower.contains("qwen3.6") {
         "qwen36"

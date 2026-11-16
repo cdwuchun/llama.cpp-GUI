@@ -844,12 +844,16 @@ pub fn restore_from_orphan(dir: &Path, id: &str, model_path: &str) -> Result<Opt
 /// 给扫描到但还没有配置的模型补一份最小的 JSON。
 ///
 /// 返回值第二项表示「这次是新建的」（前端据此提示同步了几个模型）。
+///
+/// `api_key` 是设置页「服务」里那把：新配置不带它的话，子实例就不会按 `--api-key`
+/// 起，而 GUI 带着 key 去请求 —— 与 Strata 侧 `adopt_missing_api_keys` 同一个坑。
 pub fn ensure_config(
     dir: &Path,
     name: &str,
     model_path: &str,
     mmproj: Option<&str>,
     port_base: u16,
+    api_key: Option<&str>,
 ) -> Result<(PathBuf, bool)> {
     let path = path_for_id(dir, name);
     if path.exists() {
@@ -858,6 +862,10 @@ pub fn ensure_config(
     let mut cfg = ModelConfig::new(name, Some(model_path.to_string()));
     cfg.mmproj = mmproj.map(str::to_string);
     cfg.port = Some(allocate_port(dir, port_base));
+    cfg.api_key = api_key
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string);
     write(&path, &cfg)?;
     Ok((path, true))
 }
@@ -991,16 +999,19 @@ mod tests {
             "E:/models/hy.gguf",
             Some("E:/models/mmproj.gguf"),
             18221,
+            Some("sk-new"),
         )
         .unwrap();
         assert!(created);
         let loaded = load(&path).unwrap().config;
         assert_eq!(loaded.port, Some(18221));
         assert_eq!(loaded.mmproj.as_deref(), Some("E:/models/mmproj.gguf"));
+        // 新配置要带上设置页的 Key（否则子实例不按 --api-key 起）
+        assert_eq!(loaded.api_key.as_deref(), Some("sk-new"));
 
         // 已存在 → 不覆盖（幂等）
         let (_, created_again) =
-            ensure_config(&dir, "Unsloth/Hy-MT2-1.8B", "E:/models/other.gguf", None, 18221).unwrap();
+            ensure_config(&dir, "Unsloth/Hy-MT2-1.8B", "E:/models/other.gguf", None, 18221, None).unwrap();
         assert!(!created_again);
         assert_eq!(
             load(&path).unwrap().config.model.as_deref(),

@@ -1201,7 +1201,10 @@ export function stateToConfig(
   const mainModel = firstArgAfter("--native") || firstArgAfter("--model") || "";
   if (visionOn || prevVision) {
     const v: Record<string, unknown> = prevVision ?? {};
-    if (mmproj) v.mmproj = mmproj;
+    // 扫描器回报的路径一律是正斜杠（`models.rs::to_forward_slash`），而安装器写的
+    // `vision.model` / `args --native` 是反斜杠。同一个 config 里两条路径风格混着，
+    // 引擎按字面比较时就对不上，所以这里统一回 Windows 的反斜杠。
+    if (mmproj) v.mmproj = mmproj.replace(/\//g, "\\");
     // 三键（exe / mmproj / model）是上游 server.py 的必需键：拿不到新值就保留原值
     if (mainModel) v.model = mainModel;
     // vision.exe 必须指向这一次安装的引擎组件（官方布局是 `components\engine\<版本>-…`）。

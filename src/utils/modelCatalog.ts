@@ -2,9 +2,10 @@
  * 官方安装器目录的静态快照（照搬上游 strata-manager `packages/core/src/catalog.ts`）。
  *
  * 数据来自 Strata 官方 `setup.py` 的 `MODELS` / `FAMILIES` / `OWN_PATH_FAMILIES`
- * （上游核对于 Niko1221/Strata v0.1.45，DeepSeek 一路核对于 v0.2.6）。安装器本身会
- * 随版本变化，所以这里只做「界面上的选择与门禁」，实际能装什么以所选控制端为准 ——
- * 页脚那句「目录来自官方安装器快照」就是这意思。
+ * （上游核对于 Niko1221/Strata v0.1.45，DeepSeek 一路核对于 v0.2.6；2026-11-16 又逐档
+ * 对过本机 `control\0.1.58\setup.py`，unsloth 的 ud-iq1_m / q2_0 / iq2_xs / q2_k_xl /
+ * iq3_xxs / q3_k_xl 就是那次补的）。安装器本身会随版本变化，所以这里只做「界面上的选择
+ * 与门禁」，实际能装什么以所选控制端为准 —— 页脚那句「目录来自官方安装器快照」就是这意思。
  *
  * 这里是工具模块，不导出组件（铁律 7）。
  */
@@ -119,11 +120,33 @@ export const MODEL_CATALOG: CatalogModel[] = [
     id: "unsloth",
     family: "unsloth",
     name: "Qwen3.8-Flash-Next (Unsloth)",
-    quants: ["UD-IQ4_XS", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"],
+    // 逐档比对 `control\0.1.58\setup.py` 的 MODELS 表：UD-IQ1_S 未在该表注册，
+    // `UD-IQ4_XS-v31` 与 UD-IQ4_XS 同体积、只是另一套张量，都先不列。
+    quants: [
+      "UD-IQ1_M",
+      "UD-Q2_0",
+      "UD-IQ2_XS",
+      "UD-Q2_K_XL",
+      "UD-IQ3_XXS",
+      "UD-Q3_K_XL",
+      "UD-IQ4_XS",
+      "UD-Q4_K_XL",
+      "UD-Q5_K_XL",
+      "UD-Q6_K_XL",
+      "Q8_0",
+    ],
     images: true,
     source,
     snapshotDate,
     quantInfo: {
+      // 0.1.57 起的新档位：weightsGB 取 MODELS[*].arena_gb（引擎预留的显存/内存），
+      // downloadGB / ramGB 取 MODELS[*].download_gb / ram_gb。
+      "UD-IQ1_M": { downloadGB: 68.0, ramGB: 48, weightsGB: 34.8, minEngine: "0.1.57" },
+      "UD-Q2_0": { downloadGB: 70.5, ramGB: 48, weightsGB: 37.4, minEngine: "0.1.57" },
+      "UD-IQ2_XS": { downloadGB: 75.8, ramGB: 48, weightsGB: 42.3, minEngine: "0.1.57" },
+      "UD-Q2_K_XL": { downloadGB: 79.6, ramGB: 48, weightsGB: 46.0, minEngine: "0.1.57" },
+      "UD-IQ3_XXS": { downloadGB: 83.6, ramGB: 48, weightsGB: 50.3, minEngine: "0.1.57" },
+      "UD-Q3_K_XL": { downloadGB: 89.5, ramGB: 48, weightsGB: 56.2, minEngine: "0.1.57" },
       "UD-IQ4_XS": { downloadGB: 93.7, ramGB: 48, weightsGB: 72 },
       "UD-Q4_K_XL": { downloadGB: 111.3, ramGB: 48, weightsGB: 88, experimental: true, nvidiaOnly: true, visionUntested: true },
       "UD-Q5_K_XL": { downloadGB: 158.3, ramGB: 108, weightsGB: 108, minEngine: "0.1.44" },

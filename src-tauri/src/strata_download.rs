@@ -180,7 +180,7 @@ pub fn stop(job: &mut DownloadJob) {
 ///
 /// `setup.py` **必须在它自己的目录里跑**：它靠 `Path(__file__).resolve().parent`
 /// 推 `ROOT`（`setup.py:76`），换个 cwd 就会把引擎装到别处。
-fn locate() -> Result<(PathBuf, PathBuf, PathBuf), String> {
+pub(crate) fn locate() -> Result<(PathBuf, PathBuf, PathBuf), String> {
     let root = crate::strata::root()
         .filter(|root| root.is_dir())
         .ok_or_else(|| "未找到 Strata 目录（设置 → 通用 → Strata 目录 可指定）".to_string())?;

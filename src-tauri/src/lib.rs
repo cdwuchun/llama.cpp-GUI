@@ -16,6 +16,7 @@ mod settings;
 mod state;
 mod strata;
 mod strata_community;
+mod strata_community_setup;
 mod strata_download;
 mod strata_drafting;
 mod strata_orca;
@@ -1038,6 +1039,20 @@ async fn strata_set_api_key(api_key: String) -> Result<serde_json::Value, String
     .map_err(|err| format!("写入 API Key 失败：{err}"))
 }
 
+/// 任务刚结束：把设置页的 API Key 补进这次新写的 config（见 [`strata::adopt_missing_api_keys`]）。
+///
+/// 官方档 / 社区档 / ORCA 三条链路都在完成时调一次：新装的 config 不带 `api_key`，
+/// 而设置里的 Key 只在「保存」那一下扫过当时的文件；漏这一步就会出现
+/// 「GUI 带着 key 请求、引擎却没按 `--api-key` 起」的错位。
+/// 重复调用没有副作用（只补「字段缺失」的，补过就有了）。
+fn adopt_api_key(state: &AppState) -> Vec<String> {
+    let Some(root) = strata::root().filter(|root| root.is_dir()) else {
+        return Vec::new();
+    };
+    let key = state.settings.get().api_key;
+    strata::adopt_missing_api_keys(&root, key.as_deref())
+}
+
 /// 列 Strata 的 launch 预设（`%APPDATA%\Strata\launch-presets\*.json`）。
 #[tauri::command]
 fn strata_launch_presets() -> Vec<strata_launch::LaunchPreset> {
@@ -1227,6 +1242,14 @@ fn strata_download_status(
         if let Some(cache) = scan_cache.as_mut() {
             **cache = None;
         }
+        // 新配置写出来时不带 `api_key`：这里补上设置页那把，否则引擎不会按 `--api-key` 起。
+        let adopted = adopt_api_key(&state);
+        if !adopted.is_empty() {
+            state.logs.push(
+                "strata",
+                format!("已把设置里的 API Key 写进 {} 份新配置", adopted.len()),
+            );
+        }
     }
     Ok(snapshot)
 }
@@ -1321,6 +1344,84 @@ async fn strata_orca_probe() -> Result<strata_orca::OrcaProbe, String> {
         .map_err(|err| format!("探测 ORCA 环境失败：{err}"))
 }
 
+/// 起一次社区档安装：按社区仓库的固定提交下分片（逐个 SHA-256 校验），再用官方安装器
+/// `--gguf-dir` 准备，最后登记成 `strata-community-<slug>-<quant>.json`。
+///
+/// 与官方档（`strata_download_start`）分两个槽互不覆盖；前端同时只允许跑一个。
+#[tauri::command]
+fn strata_community_setup_start(
+    state: State<'_, AppState>,
+    request: strata_community_setup::SetupRequest,
+) -> Result<serde_json::Value, String> {
+    {
+        let mut slot = state
+            .strata_community_setup
+            .lock()
+            .map_err(|_| "社区安装状态锁不可用".to_string())?;
+        if let Some(job) = slot.as_mut() {
+            if job.running() {
+                return Err("已有社区安装任务在进行，请等它结束或先取消".into());
+            }
+        }
+        *slot = None;
+    }
+    let hub = state.logs.clone();
+    let (job, message) = strata_community_setup::start(hub, request)?;
+    {
+        let mut slot = state
+            .strata_community_setup
+            .lock()
+            .map_err(|_| "社区安装状态锁不可用".to_string())?;
+        *slot = Some(job);
+    }
+    Ok(serde_json::json!({ "started": true, "message": message }))
+}
+
+/// 社区安装进度（前端每秒轮询）。没有任务时返回空快照。
+#[tauri::command]
+fn strata_community_setup_status(
+    state: State<'_, AppState>,
+) -> Result<strata_community_setup::SetupSnapshot, String> {
+    let mut slot = state
+        .strata_community_setup
+        .lock()
+        .map_err(|_| "社区安装状态锁不可用".to_string())?;
+    match slot.as_mut() {
+        Some(job) => {
+            let snapshot = job.snapshot();
+            if !job.running() {
+                // 装完的 `strata-<slug>-<量化>.json` 不带 `api_key`：补上设置页那把再清槽，
+                // 否则引擎不会按 `--api-key` 起，GUI 却带着 key 去请求（用户 m06341 的口径）。
+                if snapshot.ok == Some(true) {
+                    let adopted = adopt_api_key(&state);
+                    if !adopted.is_empty() {
+                        state.logs.push(
+                            "strata",
+                            format!("已把设置里的 API Key 写进 {} 份新配置", adopted.len()),
+                        );
+                    }
+                }
+                *slot = None;
+            }
+            Ok(snapshot)
+        }
+        None => Ok(strata_community_setup::SetupSnapshot::default()),
+    }
+}
+
+/// 取消社区安装（硬杀整棵进程树，已下好的分片保留）。
+#[tauri::command]
+fn strata_community_setup_stop(state: State<'_, AppState>) -> Result<(), String> {
+    let mut slot = state
+        .strata_community_setup
+        .lock()
+        .map_err(|_| "社区安装状态锁不可用".to_string())?;
+    if let Some(job) = slot.as_mut() {
+        strata_community_setup::stop(job);
+    }
+    Ok(())
+}
+
 /// 起一次 ORCA 导入：下载两个分片 → `tools/iq_pack.py` 打包 → 写 `strata-orca-*.json`。
 #[tauri::command]
 fn strata_orca_start(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
@@ -1370,6 +1471,14 @@ fn strata_orca_status(state: State<'_, AppState>) -> Result<strata_orca::OrcaSna
     if !snapshot.running && snapshot.ok == Some(true) {
         if let Some(cache) = scan_cache.as_mut() {
             **cache = None;
+        }
+        // ORCA 写出来的 `strata-orca-*.json` 同样不带 `api_key`，补上设置页那把。
+        let adopted = adopt_api_key(&state);
+        if !adopted.is_empty() {
+            state.logs.push(
+                "strata",
+                format!("已把设置里的 API Key 写进 {} 份新配置", adopted.len()),
+            );
         }
     }
     Ok(snapshot)
@@ -1610,6 +1719,7 @@ fn sync_model_configs(
     models_list: &[models::ScannedModel],
     roots: &[PathBuf],
     with_ensure: bool,
+    api_key: Option<&str>,
 ) -> (Vec<model_config::DirConfig>, Vec<String>, Vec<String>, bool) {
     let mut items = model_config::load_dir(dir);
     let mut removed: Vec<String> = Vec::new();
@@ -1671,6 +1781,7 @@ fn sync_model_configs(
                 &model.path,
                 model.mmproj.as_deref(),
                 LLAMACPP_PORT_BASE,
+                api_key,
             ) {
                 eprintln!("[config] 为 {} 补配置失败: {err:#}", model.id);
             }
@@ -1832,7 +1943,7 @@ async fn models_scan(
     // 刷新模型只对齐配置（归档失效的、还原回来的），不主动补新配置：
     // 补配置会写盘，交给用户点「同步」时再做。
     let (items, restored, removed, skipped) =
-        sync_model_configs(&config_dir, &models_list, &roots, false);
+        sync_model_configs(&config_dir, &models_list, &roots, false, settings.api_key.as_deref());
     Ok(build_scan_result(
         models_list,
         &items,
@@ -1865,7 +1976,7 @@ async fn config_sync(state: State<'_, AppState>) -> Result<models::ModelScanResu
 
     // 「同步」才补配置：模型在、配置不在的，先看 `.orphan\` 有没有旧参数，没有才写最小 JSON
     let (items, restored, removed, skipped) =
-        sync_model_configs(&config_dir, &models_list, &roots, true);
+        sync_model_configs(&config_dir, &models_list, &roots, true, settings.api_key.as_deref());
     Ok(build_scan_result(
         models_list,
         &items,
@@ -2476,6 +2587,9 @@ pub fn run() {
             strata_download_check_mtp,
             strata_control_catalog,
             strata_community_discover,
+            strata_community_setup_start,
+            strata_community_setup_status,
+            strata_community_setup_stop,
         strata_orca_probe,
         strata_orca_start,
         strata_orca_status,

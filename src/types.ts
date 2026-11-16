@@ -519,6 +519,11 @@ export interface StrataCommunityModel {
   quants: string[];
   quantInfo: Record<string, StrataCommunityQuant>;
   mmproj: string | null;
+  /**
+   * 去拒答向量（GGUF）：只跟着量化走一遍，作为 `setup.py --experimental-speed-projection` 的参数。
+   * 上游只有 alesha 那条带（`Huihui-Qwen3.8-Flash-Next-refusal-direction-r.gguf`）。
+   */
+  controlVector?: StrataCommunityFile | null;
   risks: string[];
   source: "builtin" | "discovered";
   downloads: number | null;
@@ -532,6 +537,59 @@ export interface StrataCommunityDiscovery {
   state: "fresh" | "cached" | "stale" | "offline";
   fetchedAt: number | null;
   error: string | null;
+}
+
+/**
+ * 社区档安装请求（`strata_community_setup_start`）。
+ *
+ * 与官方档（`strata_download_start`）的关键差别：**必须带上 repo/revision/files**。
+ * `setup.py` 的 `FAMILIES[family]["hf"]` 是写死的官方仓库、也没有 `--repo` 参数，
+ * 只传 family+quant 下回来的必然是官方权重量化 —— 这就是「选社区版下官方版」那个 bug。
+ */
+export interface StrataCommunitySetupRequest {
+  slug: string;
+  repo: string;
+  revision: string;
+  family: string;
+  quant: string;
+  files: StrataCommunityFile[];
+  /** 去拒答向量（仅 qwen 家族、仓库根目录）；setup.py 走 `--experimental-speed-projection` */
+  controlVector?: StrataCommunityFile | null;
+  context: number;
+  images: boolean;
+  /**
+   * 「使用已有模型」：分片已经在这个目录里。后端 fetch 按清单文件名找、逐个核对 SHA-256，
+   * 命中的硬链接进社区目录，找不到的才下载；对不上直接报错（不会悄悄改成下载）。
+   */
+  localDir?: string | null;
+  dataDir?: string | null;
+  hfEndpoint?: string | null;
+  source?: string | null;
+  backend?: string | null;
+  gpu?: string | null;
+}
+
+/** 社区档安装进度（`strata_community_setup_status`，前端每秒轮询一次）。 */
+export interface StrataCommunitySetupSnapshot {
+  running: boolean;
+  /** `download` / `stash` / `setup` / `config` / `done` / `failed` / `cancelled` */
+  phase: string;
+  percent: number;
+  message: string;
+  logTail: string[];
+  /** 结束时判定：成功为 true */
+  ok: boolean | null;
+  /** 条目 slug（任务面板里与量化一起显示） */
+  family: string;
+  quant: string;
+  /** 登记进配置的模型名 `<slug>-<quant>` */
+  modelName: string;
+  /** 社区自己的数据目录 `<data>/community/<slug>-<quant>` */
+  dataDirectory: string;
+  /** 社区配置文件 `strata-<slug>-<quant>.json` */
+  configPath: string;
+  totalBytes: number;
+  doneBytes: number;
 }
 
 /**

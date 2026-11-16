@@ -2795,6 +2795,46 @@ pub fn set_api_key_all(root: &Path, key: Option<&str>) -> (Vec<String>, Vec<Stri
     (written, failed)
 }
 
+/// 把 API Key 补写进**还没有顶层 `api_key` 字段**的 config。
+///
+/// 新装的模型（官方档 / 社区档 / ORCA / 手工装）写出来的 config 不带 `api_key`，
+/// 而设置页的 Key 只在「保存」那一下扫过当时的文件（见 [`set_api_key_all`]）。
+/// 任务一结束就补上，引擎才会按 `--api-key` 起，GUI 带的鉴权头也不会被当成「不校验」。
+///
+/// 只认「字段缺失」：字段在（哪怕值是 `null`）说明同步过、用户也可能手改过，不再覆盖。
+/// 返回补写成功的文件名（没有新配置时是空列表，所以重复调用没有副作用）。
+pub fn adopt_missing_api_keys(root: &Path, key: Option<&str>) -> Vec<String> {
+    let mut written = Vec::new();
+    let dir = configs_dir(root);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return written;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !is_config_file(&name) {
+            continue;
+        }
+        // 读不出来（正在被写、权限）就跳过，别把一份半截文本改成坏 JSON。
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if top_level_values(&text)
+            .into_iter()
+            .any(|(field, ..)| field == "api_key")
+        {
+            continue;
+        }
+        if set_config_api_key(&path, key).is_ok() {
+            written.push(name);
+        }
+    }
+    written
+}
+
 /// 把 config 顶层的 `args` 整体换成 `args`（调优结果落盘用，用户 m01544）。
 ///
 /// 只换数组中括号那一段，其余字节原样保留（同 [`top_level_values`] 的理由）。
@@ -3315,6 +3355,38 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         assert_eq!(configs_dir_with(&dir, false), dir);
         assert_eq!(configs_dir_with(&dir, true), dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 新装出来的 config（没有 `api_key` 字段）补上设置里的 Key；已经有过字段的不动
+    /// （用户 m06341 的口径：GUI 里的 Key 必须和 config 里一致，否则引擎不校验）。
+    #[test]
+    fn new_configs_get_the_saved_api_key_but_synced_ones_are_left_alone() {
+        let dir = std::env::temp_dir().join(format!("dsh-strata-adopt-key-{}", now_ms()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // 旧配置：保存设置时同步过（值是 null，代表「不校验」），不能因为 Key 变了就改它
+        fs::write(
+            dir.join("strata-old.json"),
+            "{\n \"exe\": \"engine.exe\",\n \"model_name\": \"old\",\n \"args\": [],\n \"api_key\": null\n}",
+        )
+        .unwrap();
+        // 新配置：setup.py / 社区安装刚写出来的，没有 api_key
+        fs::write(
+            dir.join("strata-new.json"),
+            "{\n \"exe\": \"engine.exe\",\n \"model_name\": \"new\",\n \"args\": []\n}",
+        )
+        .unwrap();
+
+        let written = adopt_missing_api_keys(&dir, Some("sk-new"));
+        assert_eq!(written, vec!["strata-new.json".to_string()]);
+        let new = fs::read_to_string(dir.join("strata-new.json")).unwrap();
+        assert!(new.contains("\"api_key\": \"sk-new\""), "新配置没写进 Key：{new}");
+        let old = fs::read_to_string(dir.join("strata-old.json")).unwrap();
+        assert!(old.contains("\"api_key\": null"), "同步过的配置被改了：{old}");
+
+        // 再跑一次没有可补的（前端每秒轮询，不能每次都重写）
+        assert!(adopt_missing_api_keys(&dir, Some("sk-new")).is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

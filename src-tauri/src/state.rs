@@ -102,6 +102,13 @@ pub struct AppState {
     /// 与 `strata_download` 分开一个槽：它下的是社区仓库分片、走 `iq_pack.py` 打包，
     /// 两套子进程不该互相覆盖；但两者都写 `Strata-data`，前端同时只允许跑一个。
     pub strata_orca: Arc<Mutex<Option<crate::strata_orca::OrcaJob>>>,
+    /// 正在跑的「社区档安装」（模型下载页 → 社区 → 下载并准备）。
+    ///
+    /// 与 `strata_download` 分开一个槽：社区档是「先按社区仓库下分片（SHA-256 校验），再用
+    /// `setup.py --gguf-dir` 准备」，四步链路与官方那条不同；两者都写 `<根>` 下的配置，
+    /// 前端同时只允许跑一个（`strata_download` 的 `--setup` 会覆盖 `strata-<tag>.json`，
+    /// 社区安装的 `stash` 又要把官方配置挪走，并发必然互相打脸）。
+    pub strata_community_setup: Arc<Mutex<Option<crate::strata_community_setup::SetupJob>>>,
     /// 最近一次向上游报告过的辅助文件列表（mmproj / 草稿模型）。
     ///
     /// `scan_cache` 只存模型列表，而 `models://scanned` 的"变没变"要连辅助文件一起判，
@@ -203,7 +210,8 @@ impl AppState {
             strata_scan_cache: Mutex::new(None),
             strata_upgrade: Arc::new(Mutex::new(None)),
             strata_download: Arc::new(Mutex::new(None)),
-        strata_orca: Arc::new(Mutex::new(None)),
+            strata_orca: Arc::new(Mutex::new(None)),
+            strata_community_setup: Arc::new(Mutex::new(None)),
             aux_cache: Mutex::new(None),
         }
     }

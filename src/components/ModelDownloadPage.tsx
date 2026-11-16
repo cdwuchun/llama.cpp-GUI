@@ -6,9 +6,12 @@
  * （量化表带本机适配刻度与速度估算 → 启动预设 → 资源预估）、底部提交条。
  *
  * 与上游的差别只在**执行方式**：
- * - 上游调自己的 native 下载器（`runtime-core` 的 setup 通道）；
- * - 这里非交互跑官方安装器 `setup.py --family … --yes --no-start`（见
- *   `src-tauri/src/strata_download.rs`），进度由安装器的 `\r` 行翻译而来。
+ * - 官方档：非交互跑官方安装器 `setup.py --family … --yes --no-start`（见
+ *   `src-tauri/src/strata_download.rs`），进度由安装器的 `\r` 行翻译而来；
+ * - 社区档：按上游 `community_model.rs` 移植的四步链路（`strata_community_setup.rs`）——
+ *   下社区仓库固定提交的分片并逐个校验 SHA-256 → 让开官方配置 → `setup.py --gguf-dir`
+ *   准备 → 登记 `strata-<来源>-<量化>` 独立配置；
+ * - ORCA：自建 curl 下载 + `iq_pack.py` 打包（`strata_orca.rs`）。
  *
  * 组件文件只导出组件（铁律 7），纯函数都在 `src/utils/modelCatalog.ts` 与
  * `src/utils/modelPerformance.ts`。
@@ -20,6 +23,8 @@ import { ipc } from "../ipc";
 import { useApp } from "../store";
 import type {
   StrataCommunityModel,
+  StrataCommunitySetupRequest,
+  StrataCommunitySetupSnapshot,
   StrataDownloadDisk,
   StrataDownloadSnapshot,
   StrataHostInfo,
@@ -53,6 +58,8 @@ import {
   type CatalogModel,
 } from "../utils/modelCatalog";
 import {
+  communityPackGb,
+  communitySetupRequest,
   kindLabel,
   mergeCommunityModels,
   riskLabel,
@@ -215,6 +222,11 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
   const [orca, setOrca] = useState<StrataOrcaSnapshot | null>(null);
   const [orcaToken, setOrcaToken] = useState(0);
 
+  // 社区档安装：按社区仓库的固定提交下分片 → SHA-256 校验 → `setup.py --gguf-dir` 准备
+  // → 登记成 `strata-<slug>-<quant>.json`（不覆盖同量化的官方配置）
+  const [communitySetup, setCommunitySetup] = useState<StrataCommunitySetupSnapshot | null>(null);
+  const [communityToken, setCommunityToken] = useState(0);
+
   const taskRef = useRef<HTMLDivElement | null>(null);
 
   const selected = MODEL_CATALOG.find((entry) => entry.id === selectedId) ?? MODEL_CATALOG[0];
@@ -291,7 +303,53 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
     [prefs.hfEndpoint],
   );
 
-  /** 社区模型的下载：仍然交给官方安装器（社区条目的家族都在 `setup.py` 的白名单里）。 */
+  /**
+   * 社区档的下载：**不再交给官方安装器的 `--family/--model`**。
+   *
+   * `setup.py` 的 `FAMILIES[family]["hf"]` 写死官方 ISTA-DASLab 仓库、也没有 `--repo` 参数，
+   * 所以只传 `--family/--model` 时「选社区版、下回来是官方权重」。这里按上游
+   * `communitySetupRequest` 的形态把仓库 + 固定提交 + 文件清单交给
+   * `strata_community_setup_start`：先逐文件下载并核对 SHA-256，再用 `--gguf-dir`
+   * 交给官方安装器准备，配置登记成 `strata-<来源>-<量化>.json`，官方配置原样放回。
+   */
+  /** 提交一次社区安装：磁盘预检 → `strata_community_setup_start` → 打开任务面板。 */
+  const submitCommunity = useCallback(
+    async (request: StrataCommunitySetupRequest, need: number) => {
+      setSubmitting(true);
+      setLocalError(null);
+      try {
+        if (need > 0) {
+          const check = await ipc.strataDownloadPreflight(need, prefs.dataDir.trim() || null);
+          if (check.status !== "ready") {
+            setLocalError(
+              check.status === "insufficient"
+                ? "磁盘空间不足，请检查存储位置或清理空间。"
+                : "磁盘空间尚未核验，请重新检查。",
+            );
+            return;
+          }
+        }
+        const result = await ipc.strataCommunitySetupStart({
+          ...request,
+          context: request.context || communitySelection.context,
+          source: prefs.source === "auto" ? null : prefs.source,
+          hfEndpoint: prefs.hfEndpoint.trim() || null,
+          dataDir: prefs.dataDir.trim() || null,
+          backend: prefs.backend || null,
+          gpu: prefs.gpu.trim() || null,
+        });
+        setNotice(result.message);
+        setCommunityToken((token) => token + 1);
+        setSheet("tasks");
+      } catch (err) {
+        setLocalError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setSubmitting(false);
+      }
+    },
+    [communitySelection.context, prefs, setNotice],
+  );
+
   const startCommunity = useCallback(async () => {
     if (!selectedCommunity || !communityQuant) {
       return;
@@ -300,43 +358,18 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
       setLocalError("这条模型要走 ORCA 通道，官方安装器不认它的参数，请按面板里的说明用官方安装器导入。");
       return;
     }
-    setSubmitting(true);
-    setLocalError(null);
-    try {
-      const context = communitySelection.context;
-      const images = communitySelection.images && selectedCommunity.images;
-      const need = Math.round((communityInfo?.downloadGb ?? 0) * 2e9) + (images ? 1_000_000_000 : 0);
-      if (need > 0) {
-        const check = await ipc.strataDownloadPreflight(need, prefs.dataDir.trim() || null);
-        if (check.status !== "ready") {
-          setLocalError(
-            check.status === "insufficient"
-              ? "磁盘空间不足，请检查存储位置或清理空间。"
-              : "磁盘空间尚未核验，请重新检查。",
-          );
-          return;
-        }
-      }
-      const result = await ipc.strataDownloadStart({
-        family: selectedCommunity.family,
-        quant: communityQuant,
-        context,
-        images,
-        source: prefs.source === "auto" ? null : prefs.source,
-        hfEndpoint: prefs.hfEndpoint.trim() || null,
-        dataDir: prefs.dataDir.trim() || null,
-        backend: prefs.backend || null,
-        gpu: prefs.gpu.trim() || null,
-      });
-      setNotice(result.message);
-      setPollToken((token) => token + 1);
-      setSheet("tasks");
-    } catch (err) {
-      setLocalError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSubmitting(false);
+    const request = communitySetupRequest(selectedCommunity, communityQuant);
+    if (!request) {
+      setLocalError("这条来源没有可校验的文件清单（缺 SHA-256），不能按社区档安装；换一个量化或改用官方档。");
+      return;
     }
-  }, [selectedCommunity, communityQuant, communityInfo, communitySelection, prefs, setNotice]);
+    const images = communitySelection.images && selectedCommunity.images;
+    const need =
+      Math.round((communityInfo?.downloadGb ?? 0) * 2e9) +
+      communityPackGb(request.family, communityQuant) * 1e9 +
+      (images ? 1_000_000_000 : 0);
+    await submitCommunity({ ...request, context: communitySelection.context, images }, need);
+  }, [selectedCommunity, communityQuant, communityInfo, communitySelection, submitCommunity]);
 
   /** ORCA：下载两个分片 → iq_pack 打包 → 写配置（后端一次跑三步）。 */
   const startOrca = useCallback(async () => {
@@ -357,6 +390,15 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
   const cancelOrca = useCallback(async () => {
     try {
       await ipc.strataOrcaStop();
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : String(err));
+    }
+  }, []);
+
+  const cancelCommunity = useCallback(async () => {
+    try {
+      await ipc.strataCommunitySetupStop();
+      setCommunityToken((token) => token + 1);
     } catch (err) {
       setLocalError(err instanceof Error ? err.message : String(err));
     }
@@ -466,6 +508,34 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
     };
   }, [orcaToken]);
 
+  // 社区安装进度轮询：四步（下载分片 / 让开官方配置 / 安装器准备 / 登记配置）都在后端线程里
+  useEffect(() => {
+    let alive = true;
+    let timer: number | undefined;
+    const tick = async () => {
+      try {
+        const next = await ipc.strataCommunitySetupStatus();
+        if (!alive) return;
+        setCommunitySetup(next.phase ? next : null);
+        if (next.running) timer = window.setTimeout(tick, 1000);
+      } catch {
+        if (alive) timer = window.setTimeout(tick, 3000);
+      }
+    };
+    void tick();
+    return () => {
+      alive = false;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [communityToken]);
+
+  // 社区安装成功 → 让「模型」页的 Strata 那档重新扫一遍（新配置叫 strata-<来源>-<量化>.json）
+  useEffect(() => {
+    if (communitySetup && !communitySetup.running && communitySetup.ok === true) {
+      void useApp.getState().refreshStrata().catch(() => undefined);
+    }
+  }, [communitySetup]);
+
   // 选择变化（或点了刷新、开了图像支持）→ 重算磁盘需求
   useEffect(() => {
     if (!selected || !selection.quant) return;
@@ -513,6 +583,9 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
   const downloadGB = selected ? downloadGBOf(selected.family, selection.quant) : 0;
   const running = snapshot?.running ?? false;
   const orcaRunning = orca?.running ?? false;
+  const communityRunning = communitySetup?.running ?? false;
+  // 三条下载链路都会写 `<根>` 下的配置（社区安装还要把官方配置挪走再放回），同时只能跑一个
+  const anyRunning = running || orcaRunning || communityRunning;
 
   const start = useCallback(
     async (options?: { ggufDir?: string; family?: string; quant?: string; context?: number; images?: boolean; dataDir?: string }) => {
@@ -733,6 +806,37 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
       mtpData = check.dataDirectory;
     }
     setSheet(null);
+    // 社区档：不交给官方安装器（它会按 FAMILIES[family].hf 下官方权重、并把配置写成同名的
+    // `strata-<tag>.json`），而是按社区条目登记成 `<slug>-<量化>`；本地文件先核对
+    // 清单里的 SHA-256，对不上直接报错。
+    if (scope === "community") {
+      if (!selectedCommunity) {
+        setLocalError("先在左侧选一条社区模型，再导入本地文件");
+        return;
+      }
+      if (!selectedCommunity.quants.includes(group.quant)) {
+        setLocalError(`这条社区来源没有 ${group.quant} 这一档，换个量化或先选别的条目`);
+        return;
+      }
+      const request = communitySetupRequest(selectedCommunity, group.quant);
+      if (!request) {
+        setLocalError("这条来源没有可校验的文件清单（缺 SHA-256），不能按社区档登记；这条请用官方档导入。");
+        return;
+      }
+      if (group.family && group.family !== request.family) {
+        setLocalError(
+          `本地文件看着是 ${group.family} 家族的，选中的社区条目是 ${request.family}；先在左侧选对条目`,
+        );
+        return;
+      }
+      // 本地导入不下载权重，磁盘只需要 pack 的空间（Q2_0 的重编码约 40 GB，其余 2 GB）
+      const need = communityPackGb(request.family, group.quant) * 1e9;
+      await submitCommunity(
+        { ...request, context: localContext, images: false, localDir: dir },
+        need,
+      );
+      return;
+    }
     await start({
       ggufDir: dir,
       family: group.family,
@@ -740,7 +844,19 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
       context: localContext,
       dataDir: mtpData,
     });
-  }, [localDir, localFiles, localQuant, localContext, mtpPath, mtpCheck, scanDir, start]);
+  }, [
+    localDir,
+    localFiles,
+    localQuant,
+    localContext,
+    mtpPath,
+    mtpCheck,
+    scanDir,
+    start,
+    scope,
+    selectedCommunity,
+    submitCommunity,
+  ]);
 
   const localGroups = useMemo(() => localGroupsOf(localFiles ?? []), [localFiles]);
   const localGroup = localGroups.find((item) => item.quant === localQuant) ?? localGroups[0] ?? null;
@@ -776,7 +892,7 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
   );
   const estimate = estimatePerformance(selected.family, selection.quant, hardware);
 
-  const taskCount = (running ? 1 : 0) + (orcaRunning ? 1 : 0);
+  const taskCount = (running ? 1 : 0) + (orcaRunning ? 1 : 0) + (communityRunning ? 1 : 0);
 
   return (
     <main className="main-area">
@@ -1218,7 +1334,7 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
                     <button
                       type="button"
                       className="st-btn st-btn--primary"
-                      disabled={submitting || running || blocked || quantBlocked}
+                      disabled={submitting || anyRunning || blocked || quantBlocked}
                       onClick={() => void start()}
                     >
                       {submitting ? "正在检查并提交…" : `下载并准备 · ${downloadGB} GB`}
@@ -1226,7 +1342,7 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
                   </div>
                   <small>
                     下载 → 打包 → 生成配置，完成后在「模型」页手动启用。
-                    {running ? "（正在下载时不能提交新任务）" : ""}
+                    {anyRunning ? "（有任务在跑，等它结束再提交）" : ""}
                   </small>
                 </footer>
               </>
@@ -1243,10 +1359,11 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
                 memoryGB={memoryGB}
                 vramGB={vramGB}
                 submitting={submitting}
-                running={running}
+                running={anyRunning}
                 error={error}
-                snapshot={snapshot}
+                snapshot={communitySetup}
                 onStart={() => void startCommunity()}
+                onCancel={() => void cancelCommunity()}
                 taskRef={taskRef}
                 orcaProbe={orcaProbe}
                 orca={orca}
@@ -1365,12 +1482,14 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
           footer={
             <div className="model-download-local-submit">
               <span className="model-download-local-note">
-                检查 → 打包 → 生成配置，完成后在「我的模型」启用。原文件不会被移动或修改。
+                {scope === "community"
+                  ? "核对 SHA-256 → 打包 → 登记社区配置，完成后在「我的模型」启用。原文件不会被移动或修改。"
+                  : "检查 → 打包 → 生成配置，完成后在「我的模型」启用。原文件不会被移动或修改。"}
               </span>
               <button
                 type="button"
                 className="st-btn st-btn--primary"
-                disabled={submitting || running || localBusy || !localDir.trim() || !localGroup}
+                disabled={submitting || anyRunning || localBusy || !localDir.trim() || !localGroup}
                 onClick={() => void useLocal()}
               >
                 使用已有模型
@@ -1435,11 +1554,20 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
                 ))}
               </div>
               <p className="model-download-local-hint">
-                安装器会按{" "}
-                <code>
-                  --family {localGroup.family ?? "?"} --model {localGroup.quant}
-                </code>{" "}
-                使用这个目录里的 {localGroup.quant} 文件（文件名不必与官方发布名一致）
+                {scope === "community" ? (
+                  <>
+                    当前在「社区」档：会登记成 <code>&lt;来源&gt;-{localGroup.quant}</code>，
+                    并把这几个文件逐个对照社区仓库的 SHA-256（文件名要一致；对不上会直接报错，官方配置不受影响）。
+                  </>
+                ) : (
+                  <>
+                    安装器会按{" "}
+                    <code>
+                      --family {localGroup.family ?? "?"} --model {localGroup.quant}
+                    </code>{" "}
+                    使用这个目录里的 {localGroup.quant} 文件（文件名不必与官方发布名一致）
+                  </>
+                )}
               </p>
             </>
           ) : (
@@ -1461,11 +1589,13 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
           </select>
           <p className="model-download-local-hint">图像支持默认关闭，可稍后在配置页开启。</p>
 
-          <details
-            className="model-download-local-fold"
-            open={mtpOpen}
-            onToggle={(event) => setMtpOpen(event.currentTarget.open)}
-          >
+          {/* MTP 只在官方档可指定：社区链路沿用官方安装器自己的查找（`mtp/mtp-q2_0.gguf`） */}
+          {scope === "official" && (
+            <details
+              className="model-download-local-fold"
+              open={mtpOpen}
+              onToggle={(event) => setMtpOpen(event.currentTarget.open)}
+            >
             <summary>
               MTP 草稿层（可选） <span className={mtpCheck?.problems.length ? "is-bad" : ""}>{mtpState}</span>
             </summary>
@@ -1497,14 +1627,19 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
               </button>
             </div>
           </details>
+          )}
 
           <h4 className="model-download-sheet-title">使用前检查</h4>
           <ul className="model-download-local-checks">
             {localGroup ? (
               <li>
                 <i className="fas fa-circle" /> 磁盘 还需约{" "}
-                {Math.max(4, Math.ceil(localGroup.bytes / 1e9 / 12))} GB（打包、MTP、运行环境）{" "}
-                <code>{prefs.dataDir.trim() || disk?.dataDirectory || "控制端默认目录"}</code>
+                {scope === "community" && selectedCommunity
+                  ? Math.ceil(communityPackGb(selectedCommunity.family, localGroup.quant))
+                  : Math.max(4, Math.ceil(localGroup.bytes / 1e9 / 12))}{" "}
+                GB（
+                {scope === "community" && selectedCommunity ? "pack；本地分片已在磁盘" : "打包、MTP、运行环境"}
+                ） <code>{prefs.dataDir.trim() || disk?.dataDirectory || "控制端默认目录"}</code>
               </li>
             ) : (
               <li className="is-muted">
@@ -1525,9 +1660,10 @@ export function ModelDownloadPage({ onNavigate }: { onNavigate?: (tab: "models" 
         >
           <div className="model-download-task-list">
             {error && <p className="model-download-error">{error}</p>}
+            <TaskPanel task={communityTaskView(communitySetup)} onCancel={() => void cancelCommunity()} />
             <TaskPanel task={downloadTaskView(snapshot)} onCancel={() => void cancel()} />
             <TaskPanel task={orcaTaskView(orca)} onCancel={() => void cancelOrca()} />
-            {!snapshot && !orca && (
+            {!communitySetup && !snapshot && !orca && (
               <p className="model-download-empty">
                 <i className="fas fa-inbox" /> 还没有下载任务。
               </p>
@@ -1607,10 +1743,12 @@ interface TaskView {
   size?: string;
 }
 
-/** 安装器阶段的中文说法（与 `strata_download::consume` 写的 `phase` 对应）。 */
+/** 安装器阶段的中文说法（与 `strata_download::consume` / `strata_community_setup` 写的 `phase` 对应）。 */
 const PHASE_LABEL: Record<string, string> = {
   check: "检查环境",
   download: "下载分片",
+  stash: "准备配置",
+  setup: "安装器准备",
   pack: "打包权重",
   engine: "准备引擎",
   config: "写入配置",
@@ -1618,6 +1756,24 @@ const PHASE_LABEL: Record<string, string> = {
   failed: "失败",
   cancelled: "已取消",
 };
+
+/** 社区档的四步进度（下载分片 → 让开官方配置 → 安装器准备 → 登记社区配置）。 */
+function communityTaskView(snapshot: StrataCommunitySetupSnapshot | null): TaskView | null {
+  if (!snapshot) {
+    return null;
+  }
+  return {
+    running: snapshot.running,
+    ok: snapshot.ok,
+    percent: snapshot.percent,
+    detail: ["社区", snapshot.modelName, PHASE_LABEL[snapshot.phase] ?? snapshot.phase]
+      .filter(Boolean)
+      .join(" · "),
+    message: snapshot.message,
+    logTail: snapshot.logTail,
+    size: snapshot.totalBytes > 0 ? fmtSize(snapshot.totalBytes) : undefined,
+  };
+}
 
 function downloadTaskView(snapshot: StrataDownloadSnapshot | null): TaskView | null {
   if (!snapshot) {
@@ -1703,7 +1859,10 @@ function TaskPanel({ task, onCancel }: { task: TaskView | null; onCancel: () => 
   );
 }
 
-/** 社区档的详情：量化、风险、资源评估与提交（社区条目同样交给官方安装器）。 */
+/** 社区档的详情：量化、风险、资源评估与提交。
+ *
+ * 社区档的安装与官方档不同：它按社区仓库的固定提交下分片（逐个 SHA-256 校验），
+ * 再走 `setup.py --gguf-dir` 准备并登记成 `strata-<来源>-<量化>.json`（`strata_community_setup_start`）。 */
 function CommunityPane({
   model,
   quant,
@@ -1717,6 +1876,7 @@ function CommunityPane({
   error,
   snapshot,
   onStart,
+  onCancel,
   taskRef,
   orcaProbe,
   orca,
@@ -1739,9 +1899,10 @@ function CommunityPane({
   submitting: boolean;
   running: boolean;
   error: string | null;
-  /** 官方下载任务的快照（社区条目也走同一条安装器） */
-  snapshot: StrataDownloadSnapshot | null;
+  /** 社区安装任务的快照（四步：下载分片 → 让开官方配置 → 安装器准备 → 登记配置） */
+  snapshot: StrataCommunitySetupSnapshot | null;
   onStart: () => void;
+  onCancel: () => void;
   taskRef: RefObject<HTMLDivElement | null>;
   orcaProbe: StrataOrcaProbe | null;
   orca: StrataOrcaSnapshot | null;
@@ -1771,6 +1932,11 @@ function CommunityPane({
   const rowFit = fitOf(info?.ramGb ?? 0, budgetGB, null);
   const isOrca = model.family === "orca";
   const supported = setupFamilyOf(model.family);
+  // 社区链路要求「导出这条量化时把分片清单与 SHA-256 一起带出来」：内置三条有，
+  // 现场发现的仓库只有名字没有摘要（setup.py 的 FAMILIES 又写死官方仓库），不能装。
+  const files = info?.files ?? [];
+  const pinned = files.length > 0 && files.every((file) => Boolean(file.sha256));
+  const installable = supported && pinned;
   const estimate = estimatePerformance(model.family, quant, hardware);
   const axisMax = Math.max(
     usableMemoryGb(memoryGB, vramGB) ?? 0,
@@ -2004,6 +2170,13 @@ function CommunityPane({
                 >
                   <i className="fas fa-list-check" /> 任务
                 </button>
+                <button
+                  type="button"
+                  className="st-btn st-btn--secondary st-btn--sm"
+                  onClick={onCancel}
+                >
+                  <i className="fas fa-stop" /> 取消
+                </button>
               </div>
             )}
         <div className="model-download-submit-row">
@@ -2035,10 +2208,16 @@ function CommunityPane({
               <button
                 type="button"
                 className="st-btn st-btn--primary"
-                disabled={submitting || running || !supported}
+                disabled={submitting || running || !installable}
                 onClick={onStart}
               >
-                {submitting ? "正在检查并提交…" : supported ? `下载并准备 · ${info?.downloadGb ?? "?"} GB` : "需用官方安装器"}
+                {submitting
+                  ? "正在检查并提交…"
+                  : !supported
+                    ? "需用官方安装器"
+                    : !pinned
+                      ? "缺文件清单，不能装"
+                      : `下载并准备 · ${info?.downloadGb ?? "?"} GB`}
               </button>
             </>
           )}
@@ -2046,9 +2225,11 @@ function CommunityPane({
         <small>
           {isOrca
             ? "分片下载 → 控制端 iq_pack 打包 → 写 strata-orca-iq3_xxs.json，完成后在「模型」页手动启用。"
-            : supported
-              ? "下载 → 打包 → 生成配置，完成后在「模型」页手动启用。"
-              : "这条模型只能由官方安装器导入（见上方说明）。"}
+            : !supported
+              ? "这条模型只能由官方安装器导入（见上方说明）。"
+              : !pinned
+                ? "这条只有名字，没有可校验的分片清单与 SHA-256，不能按社区档安装；改用官方档，或换一条带清单的社区来源。"
+                : "按社区仓库的固定提交下载分片并逐个核对 SHA-256 → 官方安装器用 --gguf-dir 准备（pack 另占空间：Q2_0 约 40 GB，其余约 2 GB）→ 登记为 <来源>-<量化>（同量化的官方配置原样保留），完成后在「模型」页刷新。"}
         </small>
       </footer>
     </>
