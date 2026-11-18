@@ -1,5 +1,6 @@
 /**
- * 参数表 schema 与表单状态换算（由 `scripts/build-param-schema.mjs` 从 llama.cpp-hub 抽取）。
+ * 参数表 schema 与表单状态换算。数据源是 `src/assets/params.json` —— **手工维护的唯一真源**
+ * （原先由 `scripts/build-param-schema.mjs` 从 llama.cpp-hub 生成，hub 停更后该脚本已停用）。
  *
  * 纯数据 + 纯函数，不含组件：React Fast Refresh 要求一个模块要么只导出组件、
  * 要么不导出组件，混在一起会让热更新退化成整页刷新。

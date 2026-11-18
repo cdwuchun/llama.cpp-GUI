@@ -1,7 +1,8 @@
 {
-  "source": "llama.cpp-hub/classes/server-params.json + i18n/zh-CN.json",
+  "source": "手工维护（2026-11-18 起）。原由 scripts/build-param-schema.mjs 从 llama.cpp-hub 的 classes/server-params.json + i18n/zh-CN.json 生成；hub 已停止开发、部署目录不复存在，该脚本已停用，本文件是模型弹窗参数表的唯一真源。",
   "generatedAt": "2026-09-19",
-  "note": "router 掌管的键（port/host/api-key/alias/hf-repo）与已废弃的 mlock 已排除",
+  "handEditedAt": "2026-11-18",
+  "note": "router 掌管的键（port/host/api-key/alias/hf-repo）与已废弃的 mlock 已排除。取值域以本机实跑 llama-server --help 的 allowed values 为准（顺序照抄、淘汰值一并删除）；维护步骤见 scripts/build-param-schema.mjs 头部说明。",
   "groups": [
     {
       "id": "page.params.group.basic",
@@ -735,6 +736,10 @@
           "label": "bf16"
         },
         {
+          "value": "f8_e4m3",
+          "label": "f8_e4m3（FP8）"
+        },
+        {
           "value": "q8_0",
           "label": "q8_0"
         },
@@ -757,22 +762,10 @@
         {
           "value": "q5_1",
           "label": "q5_1"
-        },
-        {
-          "value": "turbo4",
-          "label": "turbo4"
-        },
-        {
-          "value": "turbo3",
-          "label": "turbo3"
-        },
-        {
-          "value": "turbo2",
-          "label": "turbo2"
         }
       ],
       "label": "KV 缓存类型（K）",
-      "desc": "--cache-type-k：设置 KV 缓存中 K 向量的数据类型（精度/量化方式）。更高精度（如 f32）占用更大、通常更稳；更低精度或量化（如 q8/q5/q4/iq4）可显著节省显存并可能提升带宽受限场景的速度，但在部分模型/场景下可能带来轻微质量变化或数值稳定性差异，且不同后端对某些类型的支持程度不同。可选：f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1。",
+      "desc": "--cache-type-k：设置 KV 缓存中 K 向量的数据类型（精度/量化方式）。更高精度（如 f32）占用更大、通常更稳；更低精度或量化（如 q8/q5/q4/iq4）可显著节省显存并可能提升带宽受限场景的速度，但在部分模型/场景下可能带来轻微质量变化或数值稳定性差异，且不同后端对某些类型的支持程度不同。可选：f32, f16, bf16, f8_e4m3（FP8）, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1。注：f8_e4m3 即 OCP FP8（E4M3），每元素 1 字节，约为 f16 的一半；需要 2026-11-10 之后的构建（PR #28392，本机 b12406 起有，b12196 及更早会报 Unsupported cache type）；MLA 以及 DeepSeek / GLM-DSA / MiniMax-M3 / DFlash 等直接用缓存做注意力的架构会拒绝 FP8 缓存。",
       "group": "page.params.group.performance",
       "order": 30,
       "sort": 9,
@@ -800,6 +793,10 @@
           "label": "bf16"
         },
         {
+          "value": "f8_e4m3",
+          "label": "f8_e4m3（FP8）"
+        },
+        {
           "value": "q8_0",
           "label": "q8_0"
         },
@@ -822,22 +819,10 @@
         {
           "value": "q5_1",
           "label": "q5_1"
-        },
-        {
-          "value": "turbo4",
-          "label": "turbo4"
-        },
-        {
-          "value": "turbo3",
-          "label": "turbo3"
-        },
-        {
-          "value": "turbo2",
-          "label": "turbo2"
         }
       ],
       "label": "KV 缓存类型（V）",
-      "desc": "--cache-type-v：设置 KV 缓存中 V 向量的数据类型（精度/量化方式）。该选项与 K 类型类似，主要影响 KV 缓存的显存占用与带宽开销：更低精度/量化可减少内存占用、提高可承载的上下文长度或并发数，但也可能带来轻微质量差异或在少数环境下不稳定。建议在显存紧张或需要更长上下文/更高并发时尝试更低精度，并对效果做对比验证。可选：f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1。",
+      "desc": "--cache-type-v：设置 KV 缓存中 V 向量的数据类型（精度/量化方式）。该选项与 K 类型类似，主要影响 KV 缓存的显存占用与带宽开销：更低精度/量化可减少内存占用、提高可承载的上下文长度或并发数，但也可能带来轻微质量差异或在少数环境下不稳定。建议在显存紧张或需要更长上下文/更高并发时尝试更低精度，并对效果做对比验证。可选：f32, f16, bf16, f8_e4m3（FP8）, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1。注：f8_e4m3 即 OCP FP8（E4M3），每元素 1 字节；需要 2026-11-10 之后的构建（PR #28392）；V 用量化必须开 flash-attn（auto 时会自动打开，显式设成 off 会直接报错）；MLA 以及 DeepSeek / GLM-DSA / MiniMax-M3 / DFlash 等架构不支持 FP8 缓存。",
       "group": "page.params.group.performance",
       "order": 30,
       "sort": 10,
@@ -1909,6 +1894,10 @@
           "label": "bf16"
         },
         {
+          "value": "f8_e4m3",
+          "label": "f8_e4m3（FP8）"
+        },
+        {
           "value": "q8_0",
           "label": "q8_0"
         },
@@ -1960,6 +1949,10 @@
         {
           "value": "bf16",
           "label": "bf16"
+        },
+        {
+          "value": "f8_e4m3",
+          "label": "f8_e4m3（FP8）"
         },
         {
           "value": "q8_0",

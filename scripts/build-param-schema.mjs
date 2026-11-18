@@ -1,5 +1,22 @@
 /**
- * 从 llama.cpp-hub 的部署目录抽取参数表单 schema。
+ * 【已停用 · 2026-11-18】不要运行本脚本。
+ *
+ * 唯一输入是 llama.cpp-hub 的部署目录。hub 早已停止开发，`E:\AI\llama.cpp-hub` 不会再有，
+ * 所以没有可靠的输入源；而它**整文件覆盖** `src/assets/params.json` —— 真跑起来只会拿旧数据
+ * 抹掉手工改过的取值与说明。
+ *
+ * 自 2026-11-18 起 `src/assets/params.json` 就是**手工维护的唯一真源**（模型弹窗参数表）。
+ * 改动时的规矩：
+ *   1. 取值域（values）以本机实跑的 `llama-server --help` 里该 flag 的 allowed values 为准，
+ *      顺序照抄；上游已淘汰的取值一并删掉，否则用户能选到一个必然起不来的值
+ *      （例如 `-ctk turbo4` → `Unsupported cache type: turbo4`）。
+ *   2. 新增参数照现有条目结构补全：key / flag / abbr / type / values / label / desc / group / order / sort。
+ *   3. desc 里写清版本要求与运行时限制（例：`f8_e4m3` 需 2026-11-10 后的构建；量化 V 缓存必须开 flash-attn）。
+ *   4. 改完跑 `npm run test:smoke`（真实渲染 ParamForm）与 `npx tsc --noEmit`。
+ *
+ * 以下为原生成逻辑，仅留作追溯，不要据此恢复运行。
+ *
+ * 原本：从 llama.cpp-hub 的部署目录抽取参数表单 schema。
  *
  * 输入（默认取本机 hub 部署目录，可用 --hub 覆盖）：
  *   <hub>/classes/server-params.json     模型启动参数（类型/默认值/取值域/分组/排序）
@@ -14,6 +31,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+
+// 硬停用：源目录不会再有，能跑起来只会用旧数据覆盖手工维护的 params.json。
+// 故意不留 --force 之类开关 —— 真要恢复生成，得先找到一个可靠的参数来源。
+console.error(
+  "build-param-schema.mjs 已于 2026-11-18 停用：llama.cpp-hub 停止开发，输入源不复存在。\n" +
+    "src/assets/params.json 现为手工维护的唯一真源，维护步骤见本文件头部注释。",
+);
+process.exit(1);
 
 const args = process.argv.slice(2);
 const hubArg = args.indexOf("--hub");
