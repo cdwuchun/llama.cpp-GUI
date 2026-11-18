@@ -680,7 +680,7 @@ pub struct ApplyControllerResult {
     pub folder: PathBuf,
     /// 重写过的 `run-*.bat` 文件名。
     pub scripts: Vec<String>,
-    /// 改过 `cwd` / `args` 的 config 文件名。
+    /// 改过 `cwd` / `--expert-profile` 的 config 文件名。
     pub configs: Vec<String>,
 }
 
@@ -690,7 +690,8 @@ pub struct ApplyControllerResult {
 /// - `run-*.bat`：启动行的解释器与 `serve\server.py` 换成新版本目录里的，
 ///   `cd /d` 切到新版本目录；非 serve 侧参数（引擎自己的 `--expert-profile` 等）留在 config 里。
 /// - `strata-*.json`：顶层 `cwd` 指向新版本目录，`args` 里 `--expert-profile` 若位于
-///   其它版本目录的 `data\` 下就跟着换到新目录（同名文件）。
+///   其它版本目录的 `data\` 下就跟着换到新目录（同名文件）；`args_written` / `user_args`
+///   里的同一选项**必须一起换**（见 [`controller_data_args`]：只换 `args` 会被上游当成用户手改）。
 ///
 /// 任何一份写失败都整批报错（与 [`apply_engine`] 同口径）：切一半的安装比不切更难查。
 pub fn apply_controller(
@@ -754,14 +755,24 @@ pub fn apply_controller(
                 edits.push((old.to_string(), target.clone()));
             }
         }
-        if let Some(old) = controller_data_arg(&json) {
-            if let Some(file) = controller_data_file_name(Path::new(&old)) {
-                let next = dir.join("data").join(file);
-                let next_text = next.to_string_lossy().to_string();
-                // 新版本目录里没有同名文件就别改：改指过去只会让引擎起不来
-                if next.is_file() && next_text != old {
-                    edits.push((old, next_text));
-                }
+        // `args` / `args_written` / `user_args` 三处都要改。上游 `strata_control/user_args.py`
+        // 的 `capture()` 把「`args` 里与 `args_written` 不同」的选项判定为**用户手改**，
+        // 收进 `user_args`，之后每次启动与 setup 都拿它把值压回来 —— 只改 `args` 等于把
+        // 旧控制器路径钉成用户选项，升级后 `--expert-profile` 就再也不跟着控制器走了。
+        for old in controller_data_args(&json) {
+            let Some(file) = controller_data_file_name(Path::new(&old)) else {
+                continue;
+            };
+            let next = dir.join("data").join(file);
+            let next_text = next.to_string_lossy().to_string();
+            if !next.is_file() || next_text == old || edits.iter().any(|(seen, _)| *seen == old) {
+                continue;
+            }
+            // `rewrite_config_strings` 每对只换第一处，这里按原文里出现的次数补足对数，
+            // 让三处快照一起换到同一个新路径。
+            let quoted = serde_json::to_string(&old).unwrap_or_default();
+            for _ in 0..raw.matches(&quoted).count().max(1) {
+                edits.push((old.clone(), next_text.clone()));
             }
         }
         if edits.is_empty() {
@@ -885,16 +896,36 @@ fn config_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// `args` 里指向控制器数据目录的路径参数（目前只有 `--expert-profile`）。
+/// `args` / `args_written` / `user_args` 里指向控制器数据目录的路径参数（目前只有 `--expert-profile`）。
 ///
 /// 上游 `setup.py:9542` 把它写成 `<根>\control\<版本>\data\expert-profile.bin`，
-/// 换控制器版本时这个路径得跟着换。
-fn controller_data_arg(json: &serde_json::Value) -> Option<String> {
-    let args = json.get("args")?.as_array()?;
-    let pos = args
-        .iter()
-        .position(|value| value.as_str() == Some("--expert-profile"))?;
-    args.get(pos + 1)?.as_str().map(|value| value.to_string())
+/// 换控制器版本时这个路径得跟着换。三处都要看：
+/// - `args`：真正启动用的那份；
+/// - `args_written`：上次写盘时的 `args` 快照，与 `args` 的差异会被上游
+///   `strata_control/user_args.py` 的 `capture()` 当成**用户手改**；
+/// - `user_args`：被那样收进去的手改，后续每次启动 / setup 都以它为准。
+///
+/// 只改 `args` 的后果（用户实测）：升级控制器后旧路径立刻被 `capture()` 钉进
+/// `user_args`，之后再怎么切版本都会被它压回去 —— 表现就是「参数没跟着控制器变化」。
+fn controller_data_args(json: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for key in ["args", "args_written", "user_args"] {
+        let Some(args) = json.get(key).and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for (idx, value) in args.iter().enumerate() {
+            if value.as_str() != Some("--expert-profile") {
+                continue;
+            }
+            let Some(path) = args.get(idx + 1).and_then(|value| value.as_str()) else {
+                continue;
+            };
+            if !out.iter().any(|seen| seen == path) {
+                out.push(path.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// `<…>\control\<版本>\data\<文件>` / `<…>\terminal\<版本>\data\<文件>` → `Some("<文件>")`。
@@ -2308,7 +2339,8 @@ fn temp_config_path(path: &Path) -> PathBuf {
 /// 把 `\/` 变成 `/`，等于每次切引擎都重写整份文件。
 ///
 /// 匹配的是**加引号后的 JSON 字面量**（`serde_json::to_string` 的转义与文件里写入时一致），
-/// 每个旧值只替换第一次出现的位置。
+/// 每个旧值只替换第一次出现的位置（同一个旧值要换多处就重复给几对：同一份 config 里
+/// 同一个旧值可能对应不同的新值，比如 `component:strata-engine` 同时指引擎与视觉两个 exe）。
 fn rewrite_config_strings(path: &Path, edits: &[(&str, &str)]) -> Result<()> {
     let mut text = fs::read_to_string(path)?;
     let mut changed = false;
@@ -2540,7 +2572,12 @@ pub fn write_config_raw(path: &Path, text: &str) -> Result<()> {
     // 校验过了才拿锁：解析失败时连锁都不用碰。
     // 中毒不走 `let Ok(..) = ...lock() else`（那会静默跳过整段写入），统一 `into_inner()`。
     let _guard = strata_lock().lock().unwrap_or_else(|e| e.into_inner());
-    write_config_raw_locked(path, text)
+    // app 自己写的路径：对齐 `args_written`，并同步 `user_args` 里**已有**的同名 flag
+    // （`record_new = false`，见 [`sync_ledger`]）。
+    let old = fs::read_to_string(path).ok();
+    let next = sync_ledger(old.as_deref(), text, false)?;
+    validate_config_text(&next)?;
+    write_config_raw_locked(path, &next)
 }
 
 /// 上游认的 config 形状：JSON 可解析、顶层有 `exe`、`args` 是数组。
@@ -2574,6 +2611,9 @@ where
     let _guard = strata_lock().lock().unwrap_or_else(|e| e.into_inner());
     let text = fs::read_to_string(path).with_context(|| format!("读 config 失败: {}", path.display()))?;
     let next = build(&text)?;
+    // 调优 / 端口 / api key 这些 app 自写的改动：对齐 `args_written`，`user_args` 里已有的
+    // 同名 flag 一起改成新值，免得下次启动被旧账压回去（见 [`sync_ledger`]）。
+    let next = sync_ledger(Some(&text), &next, false)?;
     validate_config_text(&next)?;
     write_config_raw_locked(path, &next)
 }
@@ -2612,6 +2652,8 @@ where
 
 /// 已持锁时的落盘：备份 → 写临时文件 → rename。
 fn write_config_raw_locked(path: &Path, text: &str) -> Result<()> {
+    // 账本（`args_written` / `user_args` 的对齐）由调用方的 [`sync_ledger`] 在锁内做完，
+    // 这里只管落盘，避免同一份文本被记两次账。
     // W3：备份固定一份 `<config>.json.bak`，每次覆盖（用户 m03392：不要堆积带时间戳的多份，
     // 与 `model_config::write_config` / `settings` 的备份策略一致）。
     //
@@ -2838,26 +2880,255 @@ pub fn adopt_missing_api_keys(root: &Path, key: Option<&str>) -> Vec<String> {
 /// 把 config 顶层的 `args` 整体换成 `args`（调优结果落盘用，用户 m01544）。
 ///
 /// 只换数组中括号那一段，其余字节原样保留（同 [`top_level_values`] 的理由）。
+/// `args_written` 由 [`update_config`] 里的 [`sync_ledger`] 跟着对齐：调优是 app 自己改的，
+/// **不新增** `user_args` 条目，只把里面已有的同名 flag 同步成新值（否则下次启动 `merge()`
+/// 会用用户旧值把调优结果压回去）；上游 `user_args.py` 模块注释点名的三类写者之一。
 pub fn write_config_args(path: &Path, args: &[String]) -> Result<()> {
+    let rendered = render_json_array(
+        &args
+            .iter()
+            .cloned()
+            .map(serde_json::Value::String)
+            .collect::<Vec<_>>(),
+    )?;
     update_config(path, |text| {
         let (start, end) = top_level_values(text)
             .into_iter()
             .find(|(name, ..)| name == "args")
             .map(|(_, start, end)| (start, end))
             .context("config 缺少顶层 args 数组，已取消写入")?;
-        let mut rendered = String::from("[");
-        if args.is_empty() {
-            rendered.push_str("\n ]");
-        } else {
-            for (index, item) in args.iter().enumerate() {
-                // 与上游 `json.dumps(cfg, indent=1)` 一致：数组元素缩进 2 空格、闭合括号 1 空格。
-                rendered.push_str(if index == 0 { "\n  " } else { ",\n  " });
-                rendered.push_str(&serde_json::to_string(item)?);
-            }
-            rendered.push_str("\n ]");
-        }
         Ok(format!("{}{}{}", &text[..start], rendered, &text[end..]))
     })
+}
+
+// ---------------------------------------------------------------------------
+// args 的「用户设置账」：上游 `strata_control/user_args.py` 的移植（用户 m00341）
+// ---------------------------------------------------------------------------
+
+/// GUI 自己维护的参数：不写进 `user_args`。
+///
+/// 写进去等于把它们钉成「用户手设」，之后再自动改（端口重分配、换控制器版本时
+/// `--expert-profile` 跟版本走）反而会被 `user_args` 压回去。
+const APP_MANAGED_FLAGS: [&str; 3] = ["--port", "--api-key", "--expert-profile"];
+
+fn is_app_managed(flag: &str) -> bool {
+    APP_MANAGED_FLAGS.contains(&flag)
+}
+
+/// 把参数数组拆成「选项 + 它的值」组，同上游 `user_args.groups()`：
+/// `--x` 开新组，其后不带 `--` 的串都是它的值（`-1` 这种单横线是值，不是选项）。
+fn arg_groups(items: &[serde_json::Value]) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    for item in items {
+        let token = match item {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        if token.starts_with("--") || out.is_empty() {
+            out.push(vec![token]);
+        } else if let Some(last) = out.last_mut() {
+            last.push(token);
+        }
+    }
+    out
+}
+
+/// 按 flag 归并组，保持首次出现的顺序；不以 `--` 开头的首组记作 `""`。
+fn groups_by_flag(groups: &[Vec<String>]) -> Vec<(String, Vec<Vec<String>>)> {
+    let mut out: Vec<(String, Vec<Vec<String>>)> = Vec::new();
+    for group in groups {
+        let flag = group
+            .first()
+            .filter(|token| token.starts_with("--"))
+            .cloned()
+            .unwrap_or_default();
+        match out.iter_mut().find(|(seen, _)| *seen == flag) {
+            Some((_, list)) => list.push(group.clone()),
+            None => out.push((flag, vec![group.clone()])),
+        }
+    }
+    out
+}
+
+fn groups_of<'a>(list: &'a [(String, Vec<Vec<String>>)], flag: &str) -> Option<&'a Vec<Vec<String>>> {
+    list.iter().find(|(seen, _)| seen == flag).map(|(_, groups)| groups)
+}
+
+fn put_groups(list: &mut Vec<(String, Vec<Vec<String>>)>, flag: &str, groups: Vec<Vec<String>>) {
+    match list.iter_mut().find(|(seen, _)| seen == flag) {
+        Some((_, slot)) => *slot = groups,
+        None => list.push((flag.to_string(), groups)),
+    }
+}
+
+fn drop_groups(list: &mut Vec<(String, Vec<Vec<String>>)>, flag: &str) {
+    list.retain(|(seen, _)| seen != flag);
+}
+
+/// 按上游 `json.dumps(..., indent=1)` 的样子渲染一个 JSON 数组：
+/// 元素缩进 2 空格、闭合方括号 1 空格。
+fn render_json_array(items: &[serde_json::Value]) -> Result<String> {
+    let mut out: Vec<u8> = Vec::new();
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(b" ");
+    let mut serializer = serde_json::Serializer::with_formatter(&mut out, formatter);
+    serde_json::Value::Array(items.to_vec()).serialize(&mut serializer)?;
+    String::from_utf8(out).context("渲染 JSON 数组失败")
+}
+
+/// 把顶层某个键的值换成 `rendered`；键不存在时追加到对象末尾（上游 `stamp` 也是新增键）。
+fn set_top_level_value(text: &str, key: &str, rendered: &str) -> Result<String> {
+    if let Some((_, start, end)) = top_level_values(text).into_iter().find(|(name, ..)| name == key) {
+        return Ok(format!("{}{}{}", &text[..start], rendered, &text[end..]));
+    }
+    let end = text.rfind('}').context("config 原文不是 JSON 对象，已取消写入")?;
+    let head = text[..end].trim_end();
+    let head = head.strip_suffix(',').unwrap_or(head);
+    Ok(format!("{head},\n \"{key}\": {rendered}\n{}", &text[end..]))
+}
+
+/// 把 `args_written` 对齐成当前的 `args`（上游 `user_args.stamp`）。
+///
+/// 只在 config 本来就有 `args_written` 时动手：没有这个键的是老版本 Strata 写的文件，
+/// 上游靠 `dropped_by_setup` 兼容（缺这份快照时按「setup 不写的选项才算手改」推断），
+/// 我们补盖一个章会把老文件里的手改当成 app 写的抹掉。
+fn stamp_written(text: &str) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(text)?;
+    let Some(args) = value.get("args").and_then(|item| item.as_array()) else {
+        return Ok(text.to_string());
+    };
+    match value.get("args_written") {
+        None => Ok(text.to_string()),
+        Some(written) if written.as_array() == Some(args) => Ok(text.to_string()),
+        Some(_) => set_top_level_value(text, "args_written", &render_json_array(args)?),
+    }
+}
+
+/// 把上游 `strata_control/user_args.py` 的 `capture()` + `stamp()` 搬到 GUI 的所有写盘路径上
+/// （用户 m00341「需要统一改」）。
+///
+/// 上游语义（模块注释）：`user_args` = 用户设的选项，每次启动与 setup 都以它为准
+/// （`merge()` 用用户组整组替换同名 flag 组），**「app 的设置窗写它显示的那些选项」**；
+/// `args_written` = setup 或 app 上次写盘时的整份 `args`，与 `args` 的差异会被 `capture()`
+/// 当成用户手改。
+///
+/// 所以这里一次干三件事：
+/// 1. `capture()`：`args` 已偏离 `args_written` 的选项是用户手改，先收进 `user_args` 留住；
+/// 2. 本次 `args` 的差异：**已在 `user_args` 里的 flag 一律同步成新值**（否则下次启动
+///    `merge()` 会把旧值压回来，表现成「改了没生效」）；不在里面的只有 `record_new` 才新增；
+/// 3. `args_written` stamp 成新的 `args`。
+///
+/// `record_new` 区分写者：`true` = 设置窗（那份文本就是用户看到的选项，改了就记账）；
+/// `false` = GUI 自己写（调优、端口、api key、引擎/控制器路径、控制器升级），只在 flag
+/// **本来就在** `user_args` 里时同步值，绝不新增 —— app 自己的选择不该变成「用户设置」。
+///
+/// 没有旧文件（首建 / 读不到）时不猜改了什么，只 stamp。老 config 没有 `args_written` 键时
+/// 不补这个键（与上游「没 capture 过就没有账」一致），但 `user_args` 照记。
+fn sync_ledger(old: Option<&str>, next: &str, record_new: bool) -> Result<String> {
+    let new_value: serde_json::Value = serde_json::from_str(next).context("新 config 不是合法 JSON")?;
+    let Some(new_args) = new_value.get("args").and_then(|item| item.as_array()) else {
+        return Ok(next.to_string());
+    };
+    // 没有旧文件（首建 / 读不到）：不猜改了什么，只对齐快照。
+    let Some(old_value) = old.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok()) else {
+        return stamp_written(next);
+    };
+    let old_args = old_value.get("args").and_then(|item| item.as_array()).cloned().unwrap_or_default();
+    let old_written = old_value.get("args_written").and_then(|item| item.as_array()).cloned();
+    let old_user = old_value.get("user_args").and_then(|item| item.as_array()).cloned();
+    let had_written = old_written.is_some() || new_value.get("args_written").is_some();
+
+    // 起点是**这次要写的文本**里的 `user_args`：写者可能已经改过它（控制器升级时直接把旧
+    // 路径换成新路径），拿磁盘旧账当起点会把那份修改丢掉。文本里没有这个键才退回磁盘旧账。
+    let incoming_user = new_value.get("user_args").and_then(|item| item.as_array()).cloned();
+    let base_user = incoming_user.as_deref().or(old_user.as_deref()).unwrap_or_default();
+
+    // 1) capture()：`args` 与 `args_written` 不同的选项 = 已经生效的用户手改，先留住。
+    let mut mine = groups_by_flag(&arg_groups(base_user));
+    if let Some(written) = &old_written {
+        let cur = groups_by_flag(&arg_groups(&old_args));
+        let was = groups_by_flag(&arg_groups(written));
+        for (flag, groups) in &cur {
+            if flag.is_empty() || is_app_managed(flag) {
+                continue;
+            }
+            if groups_of(&was, flag) != Some(groups) {
+                put_groups(&mut mine, flag, groups.clone());
+            }
+        }
+        // 手改删掉的选项：`args_written` 里有、`args` 里没有 → 用户不要了。
+        let flags: Vec<String> = mine.iter().map(|(flag, _)| flag.clone()).collect();
+        for flag in flags {
+            if flag.is_empty() {
+                continue;
+            }
+            if groups_of(&was, &flag).is_some() && groups_of(&cur, &flag).is_none() {
+                drop_groups(&mut mine, &flag);
+            }
+        }
+    }
+
+    // 2) 本次写盘的差异：已在 `user_args` 里的 flag 一律同步成新值（包括 app 改的 --port /
+    //    --expert-profile：不跟就会在下次启动被旧账压回去）；不在里面的，只有设置窗
+    //    （record_new）且不是 app 自管的 flag 才收成新条目。
+    let old_cur = groups_by_flag(&arg_groups(&old_args));
+    let new_cur = groups_by_flag(&arg_groups(new_args));
+    let mut flags: Vec<String> = old_cur.iter().map(|(flag, _)| flag.clone()).collect();
+    for (flag, _) in &new_cur {
+        if !flags.contains(flag) {
+            flags.push(flag.clone());
+        }
+    }
+    for flag in flags {
+        if flag.is_empty() {
+            continue;
+        }
+        let before = groups_of(&old_cur, &flag);
+        let now = groups_of(&new_cur, &flag);
+        if before == now {
+            continue;
+        }
+        if groups_of(&mine, &flag).is_none() && (!record_new || is_app_managed(&flag)) {
+            continue;
+        }
+        match now {
+            Some(list) => put_groups(&mut mine, &flag, list.clone()),
+            None => drop_groups(&mut mine, &flag),
+        }
+    }
+
+    // 3) 落盘：`user_args` 与 `args` 同样扁平；`args_written` 与 `args` 对齐。
+    let user_items: Vec<serde_json::Value> = mine
+        .iter()
+        .flat_map(|(_, groups)| groups.iter().flatten())
+        .map(|token| serde_json::Value::String(token.clone()))
+        .collect();
+    let mut text = next.to_string();
+    // 只在真的变了才重写：`render_json_array` 用 1 空格缩进，与上游原文（2 空格）不同，
+    // 没变也写会让「只切了个控制器」的 config 整份重排、diff 噪声铺满。
+    let current_user = new_value.get("user_args").and_then(|item| item.as_array());
+    if (new_value.get("user_args").is_some() || !user_items.is_empty()) && current_user != Some(&user_items) {
+        text = set_top_level_value(&text, "user_args", &render_json_array(&user_items)?)?;
+    }
+    if had_written && new_value.get("args_written").and_then(|item| item.as_array()) != Some(new_args) {
+        text = set_top_level_value(&text, "args_written", &render_json_array(new_args)?)?;
+    }
+    Ok(text)
+}
+
+/// 参数编辑弹层写回 config（`strata_config_write`）。
+///
+/// 与 [`write_config_raw`] 的差别只有一处：这份文本是「用户在设置窗里看到的那些选项」，
+/// 所以 `args` 的差异要记进 `user_args`（`record_new = true`，见 [`sync_ledger`]）。返回**真正
+/// 落盘**的文本 —— 调用方拿它做「读回一致」比对，别用提交上来的那份（`user_args` /
+/// `args_written` 是这次写盘补的，提交的那份里可能还是旧值）。
+pub fn write_config_user(path: &Path, text: &str) -> Result<String> {
+    validate_config_text(text)?;
+    let _guard = strata_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let old = fs::read_to_string(path).ok();
+    let next = sync_ledger(old.as_deref(), text, true)?;
+    validate_config_text(&next)?;
+    write_config_raw_locked(path, &next)?;
+    Ok(next)
 }
 
 // ---------------------------------------------------------------------------
@@ -3355,6 +3626,270 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         assert_eq!(configs_dir_with(&dir, false), dir);
         assert_eq!(configs_dir_with(&dir, true), dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 切控制器版本时 `args_written` / `user_args` 里的 `--expert-profile` 必须跟 `args` 一起换。
+    ///
+    /// 上游 `strata_control/user_args.py` 的 `capture()` 把「`args` 与 `args_written` 不同」
+    /// 的选项当成用户手改收进 `user_args`，之后每次启动 / setup 都以它为准；只改 `args`
+    /// 就会把旧控制器路径钉死（升级后参数不跟着控制器变化的实际成因）。
+    #[test]
+    fn apply_controller_retargets_expert_profile_everywhere() {
+        let root = std::env::temp_dir().join(format!("dsh-strata-apply-written-{}", now_ms()));
+        let _ = fs::remove_dir_all(&root);
+        let next = root.join("control").join("0.1.61");
+        for sub in ["serve", "python", "data"] {
+            fs::create_dir_all(next.join(sub)).unwrap();
+        }
+        fs::write(next.join("serve").join("server.py"), "").unwrap();
+        fs::write(next.join("python").join(crate::strata_tune::python_name()), "").unwrap();
+        fs::write(next.join("data").join("expert-profile.bin"), "").unwrap();
+        let next_profile = next.join("data").join("expert-profile.bin");
+        let next_text = next_profile.to_string_lossy().to_string();
+        let stale = r"E:\AI\strata\control\0.1.58\data\expert-profile.bin".to_string();
+        let cfg = serde_json::json!({
+            "exe": "engine.exe",
+            "args": ["--serve", "--expert-profile", next_text, "--spec", "6"],
+            "args_written": ["--serve", "--expert-profile", stale, "--spec", "6"],
+            "user_args": ["--expert-profile", stale],
+            "cwd": next.to_string_lossy(),
+        });
+        let path = root.join("strata-m.json");
+        fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+        let result = apply_controller(&root, "0.1.61").unwrap();
+        assert_eq!(result.configs, vec!["strata-m.json".to_string()]);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("0.1.58"),
+            "args_written / user_args 里还留着旧控制器路径：\n{text}"
+        );
+        // args / args_written / user_args 三处都是同一个新路径
+        let quoted = serde_json::to_string(&next_text).unwrap();
+        assert_eq!(
+            text.matches(&quoted).count(),
+            3,
+            "三处都该指向新控制器：\n{text}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 设置窗写回：面板里改的选项进 `user_args`，`args_written` 被 stamp 成新的 `args`。
+    ///
+    /// 上游 `strata_control/user_args.py` 模块注释的口径：「app's settings window writes the
+    /// options it shows here」—— GUI 是那个设置窗，所以这里必须同时维护两份账。
+    #[test]
+    fn write_config_user_records_edits_and_stamps_written() {
+        let dir = std::env::temp_dir().join(format!("dsh-strata-user-edit-{}", now_ms()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("strata-m.json");
+        let old = r#"{
+ "exe": "engine.exe",
+ "args": [
+  "--kv",
+  "int8",
+  "--max-context",
+  "2048",
+  "--expert-profile",
+  "E:\\AI\\Strata\\control\\0.1.61\\data\\expert-profile.bin"
+ ],
+ "args_written": [
+  "--kv",
+  "int8",
+  "--max-context",
+  "2048"
+ ]
+}"#;
+        fs::write(&path, old).unwrap();
+        // 只改 `args`（设置窗提交的形状：`args_written` 那段还是打开时的原文）
+        let next = old.replacen("\"int8\"", "\"q8\"", 1);
+        let written = write_config_user(&path, &next).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let strings = |key: &str| -> Vec<String> {
+            value[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} 不是数组：{written}"))
+                .iter()
+                .map(|item| item.as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        assert_eq!(strings("args")[1], "q8");
+        assert_eq!(strings("args_written")[1], "q8", "args_written 没被 stamp：{written}");
+        assert_eq!(
+            strings("user_args"),
+            vec!["--kv".to_string(), "q8".to_string()],
+            "面板改的选项没进 user_args：{written}"
+        );
+        // GUI 自己管的安装事实不该被钉成用户设置（否则换控制器版本时它压着旧路径不放）
+        assert!(
+            !strings("user_args").contains(&"--expert-profile".to_string()),
+            "安装事实进了 user_args：{written}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), written, "返回的文本与磁盘不一致");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// stamp 之前先把「已经生效但没记录」的手改收进 `user_args`（上游 `capture()`），
+    /// 别把用户的手改当成 app 写的直接抹掉。
+    #[test]
+    fn write_config_user_keeps_pending_hand_edits() {
+        let dir = std::env::temp_dir().join(format!("dsh-strata-user-capture-{}", now_ms()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("strata-m.json");
+        let old = r#"{
+ "exe": "engine.exe",
+ "args": [
+  "--vram-reserve-mib",
+  "0",
+  "--max-context",
+  "2048"
+ ],
+ "args_written": [
+  "--vram-reserve-mib",
+  "512",
+  "--max-context",
+  "2048"
+ ]
+}"#;
+        fs::write(&path, old).unwrap();
+        // 用户在面板里只改了 max-context；`--vram-reserve-mib 0` 是之前手改的
+        let next = old.replacen("\"2048\"", "\"4096\"", 1);
+        let written = write_config_user(&path, &next).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let user: Vec<String> = value["user_args"]
+            .as_array()
+            .unwrap_or_else(|| panic!("没有 user_args：{written}"))
+            .iter()
+            .map(|item| item.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            user,
+            vec!["--vram-reserve-mib", "0", "--max-context", "4096"],
+            "手改没被 capture 留住：{written}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 老 config（没有 `args_written`）写回时只记 `user_args`，不补 `args_written`：
+    /// 上游对这类文件走 `dropped_by_setup`，补个章会把老文件里的手改当成 app 写的。
+    #[test]
+    fn write_config_user_leaves_legacy_configs_without_written_snapshot() {
+        let dir = std::env::temp_dir().join(format!("dsh-strata-user-legacy-{}", now_ms()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("strata-m.json");
+        let old = "{\n \"exe\": \"engine.exe\",\n \"args\": [\n  \"--kv\",\n  \"int8\"\n ]\n}";
+        fs::write(&path, old).unwrap();
+        let written = write_config_user(&path, &old.replacen("\"int8\"", "\"q8\"", 1)).unwrap();
+        assert!(!written.contains("args_written"), "老 config 被补了 args_written：{written}");
+        assert!(written.contains("\"--kv\""), "user_args 没写进去：{written}");
+        assert!(written.contains("\"q8\""), "user_args 里没有改后的值：{written}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// app 自己改 `args`（调优 / 端口 / 引擎改写）走 stamp：`args_written` 对齐，
+    /// 但**不**进 `user_args`（上游点名的三类写者：setup、app 的资源档、调优）。
+    #[test]
+    fn app_writes_stamp_written_without_touching_user_args() {
+        let dir = std::env::temp_dir().join(format!("dsh-strata-app-stamp-{}", now_ms()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("strata-m.json");
+        let old = r#"{
+ "exe": "engine.exe",
+ "args": [
+  "--kv",
+  "int8",
+  "--spec",
+  "4"
+ ],
+ "args_written": [
+  "--kv",
+  "int8"
+ ],
+ "user_args": [
+  "--spec",
+  "4"
+ ]
+}"#;
+        fs::write(&path, old).unwrap();
+        let args: Vec<String> = ["--kv", "q8", "--spec", "4"].iter().map(|t| t.to_string()).collect();
+        write_config_args(&path, &args).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let written: Vec<String> = value["args_written"]
+            .as_array()
+            .unwrap_or_else(|| panic!("没有 args_written：{text}"))
+            .iter()
+            .map(|item| item.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(written, args, "args_written 没对齐（stamp 没生效）：{text}");
+        let user: Vec<String> = value["user_args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(user, vec!["--spec", "4"], "app 自己写的选项被记成了用户设置：{text}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// app 自己写的路径（调优）改到 `user_args` 里**已有**的 flag 时，用户账要跟着改成新值：
+    /// 否则下次启动 `merge()` 用用户旧值覆盖，表现成「调优改了却没生效」。同时它不该给
+    /// 新写的 flag 建用户条目（那是 app 的选择，不是用户设的）。
+    #[test]
+    fn app_writes_sync_existing_user_args_without_adding_entries() {
+        let dir = std::env::temp_dir().join(format!("llama-cpp-gui-ledger-sync-{}", now_ms()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("strata-sync.json");
+        let old = r#"{
+ "exe": "engine.exe",
+ "args": [
+  "--kv",
+  "int8",
+  "--spec",
+  "4"
+ ],
+ "args_written": [
+  "--kv",
+  "int8",
+  "--spec",
+  "4"
+ ],
+ "user_args": [
+  "--kv",
+  "int8"
+ ]
+}"#;
+        fs::write(&path, old).unwrap();
+        let args: Vec<String> = ["--kv", "q8", "--spec", "4", "--flash-attn", "on"]
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        write_config_args(&path, &args).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let user: Vec<String> = value["user_args"]
+            .as_array()
+            .unwrap_or_else(|| panic!("user_args 丢了：{text}"))
+            .iter()
+            .map(|item| item.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            user,
+            vec!["--kv", "q8"],
+            "已在 user_args 里的 flag 没同步成新值（下次启动会被旧账压回）：{text}"
+        );
+        let written: Vec<String> = value["args_written"]
+            .as_array()
+            .unwrap_or_else(|| panic!("没有 args_written：{text}"))
+            .iter()
+            .map(|item| item.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(written, args, "args_written 没对齐：{text}");
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -917,7 +917,9 @@ async fn strata_config_write(
     // 写之前不扫描：扫描会做引擎版本对齐改写，等于在用户提交的内容之外再动一次文件；
     // 路径直接由文件名解析（`config_path_for` 挡路径穿越）。
     let path = strata::config_path_for(&root, &config_file).map_err(|err| format!("{err:#}"))?;
-    strata::write_config_raw(&path, &text).map_err(|err| {
+    // 设置窗写回：`args` 里用户在面板改的选项同时记进 `user_args`，并 stamp `args_written`
+    // （上游 `strata_control/user_args.py` 的语义，用户 m00341）。返回的是真正落盘的文本。
+    let written_text = strata::write_config_user(&path, &text).map_err(|err| {
         state
             .logs
             .push("system", format!("[gui] 写回 {config_file} 失败：{err:#}"));
@@ -927,7 +929,7 @@ async fn strata_config_write(
     // 不一致只可能是写完之后又被别的进程/别的写者改掉（端口同步、引擎改写、外部编辑器），
     // 这时直接报错，别让界面显示成功、用户重开却看到旧参数。
     let written = strata::read_config_raw(&path).map_err(|err| format!("{err:#}"))?;
-    if written != text {
+    if written != written_text {
         let msg = format!(
             "写回 {} 后读回的内容与提交的不一致（写入被其它进程改动了），请重试",
             path.display()
@@ -937,7 +939,12 @@ async fn strata_config_write(
     }
     state.logs.push(
         "system",
-        format!("[gui] 已写回 {}（{} 字节）", path.display(), text.len()),
+        format!(
+            "[gui] 已写回 {}（提交 {} 字节，落盘 {} 字节）",
+            path.display(),
+            text.len(),
+            written_text.len()
+        ),
     );
     // 写回后重新解析，让前端立刻拿到新的生效值（含"需重启生效"对比所需字段）。
     find_strata_entry(&state, &config_file)

@@ -514,11 +514,20 @@ function StrataConfigSheet({
     // 写盘成功就把基线挪到当前表单，否则之后点「取消」还要被问一次
     if (ok) {
       initialFormRef.current = JSON.stringify(formState);
-      setRawText(JSON.stringify(next, null, 1));
       setRawError("");
       // 落盘成功 → 基线换成刚写的那份：之后右栏再改、再写回时，未知顶层键以最新落盘内容为底，
       // 不会拿打开弹层时的旧对象反复重建（视觉/采样块里的派生字段尤其明显）。
       setFormConfig(next);
+      // 后端写盘时会补账（`user_args` / `args_written`，上游 user_args.py 的 capture/stamp），
+      // 提交的这份里没有这些键 —— 重读一次磁盘，左栏原文才是真正落盘的样子
+      // （用户 m00001 在左栏读到旧 `--expert-profile` 就是看了一份过期的快照）。
+      try {
+        const obj = JSON.parse(await ipc.strataConfigRead(file)) as Record<string, unknown>;
+        setFormConfig(obj);
+        setRawText(JSON.stringify(obj, null, 1));
+      } catch {
+        setRawText(JSON.stringify(next, null, 1));
+      }
     }
     return ok;
   };
